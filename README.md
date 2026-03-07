@@ -142,24 +142,6 @@ Typical setup:
 
 User-level state can also live under `~/.ddudu/`.
 
-## Current Status
-
-What is solid now:
-
-- native TUI boot and request loop
-- Claude/Codex/Gemini auth discovery
-- provider switching
-- canonical session continuity
-- tool execution and tool activity display
-- context compaction
-- project init and session persistence
-
-Still maturing:
-
-- some management surfaces are summary-oriented rather than full editors
-- native TUI is currently centered on a single active session
-- terminal raw-mode quirks still depend on the host terminal
-
 ## License
 
 MIT
