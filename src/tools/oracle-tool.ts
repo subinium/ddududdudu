@@ -1,0 +1,125 @@
+import { readFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+
+import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
+import { AnthropicClient } from '../api/anthropic-client.js';
+import type { Tool } from './index.js';
+
+const DEFAULT_ORACLE_MODEL = 'claude-opus-4-5';
+
+const resolveToken = (): string => {
+  return process.env.ANTHROPIC_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
+};
+
+const resolveBaseUrl = (): string => {
+  if (process.env.ANTHROPIC_BASE_URL) {
+    return process.env.ANTHROPIC_BASE_URL;
+  }
+
+  if (process.env.OPENROUTER_API_KEY && !process.env.ANTHROPIC_API_KEY) {
+    return DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL;
+  }
+
+  return DEFAULT_ANTHROPIC_BASE_URL;
+};
+
+const buildFileContext = async (cwd: string, files: string[]): Promise<string> => {
+  const chunks: string[] = [];
+
+  for (const file of files) {
+    const resolvedPath = resolve(cwd, file);
+    try {
+      const content = await readFile(resolvedPath, 'utf8');
+      chunks.push(`--- FILE: ${file} ---\n${content}`);
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      chunks.push(`--- FILE: ${file} ---\n[read error] ${message}`);
+    }
+  }
+
+  return chunks.join('\n\n');
+};
+
+export const oracleTool: Tool = {
+  definition: {
+    name: 'oracle',
+    description: 'Route a question to a stronger model with optional file context.',
+    parameters: {
+      question: { type: 'string', description: 'Question to ask the oracle.', required: true },
+      files: {
+        type: 'array',
+        description: 'Optional file paths to include as context.',
+        items: { type: 'string', description: 'Relative file path.' },
+      },
+    },
+  },
+  async execute(args, ctx) {
+    if (typeof args.question !== 'string' || args.question.trim().length === 0) {
+      return { output: 'Missing required argument: question', isError: true };
+    }
+
+    const token = ctx.authToken || resolveToken();
+    if (!token) {
+      return {
+        output: 'No API token found. Set ANTHROPIC_API_KEY or OPENROUTER_API_KEY.',
+        isError: true,
+      };
+    }
+
+    const files = Array.isArray(args.files)
+      ? args.files.filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+      : [];
+    const fileContext = files.length > 0 ? await buildFileContext(ctx.cwd, files) : '';
+
+    const question = fileContext
+      ? `Question:\n${args.question}\n\nContext files:\n${fileContext}`
+      : args.question;
+
+    const client = new AnthropicClient({
+      token,
+      baseUrl: ctx.authBaseUrl || resolveBaseUrl(),
+      model: process.env.DDUDU_ORACLE_MODEL ?? DEFAULT_ORACLE_MODEL,
+      maxTokens: 8192,
+    });
+
+    let output = '';
+    let usage = { input: 0, output: 0 };
+
+    try {
+      await client.stream(
+        'You are an expert oracle model. Answer clearly with strong technical judgment.',
+        [{ role: 'user', content: question }],
+        {
+          onText: (text: string) => {
+            output += text;
+            ctx.onProgress?.(text);
+          },
+          onError: () => {},
+          onDone: (_text: string, finalUsage: { input: number; output: number }) => {
+            usage = finalUsage;
+          },
+        },
+        ctx.abortSignal,
+      );
+
+      return {
+        output,
+        metadata: {
+          usage,
+          model: process.env.DDUDU_ORACLE_MODEL ?? DEFAULT_ORACLE_MODEL,
+          files,
+        },
+      };
+    } catch (err: unknown) {
+      return {
+        output: err instanceof Error ? err.message : String(err),
+        isError: true,
+        metadata: {
+          usage,
+          model: process.env.DDUDU_ORACLE_MODEL ?? DEFAULT_ORACLE_MODEL,
+          files,
+        },
+      };
+    }
+  },
+};

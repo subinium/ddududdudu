@@ -1,0 +1,68 @@
+import { mkdir } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { resolve } from 'node:path';
+
+export interface DduduPaths {
+  globalDir: string;
+  globalConfig: string;
+  globalPrompts: string;
+  globalRules: string;
+  globalSkills: string;
+  globalSessions: string;
+  globalAuth: string;
+  globalInstructions: string;
+  projectDir: string;
+  projectConfig: string;
+  projectPrompts: string;
+  projectRules: string;
+  projectInstructions: string;
+  projectSessions: string;
+}
+
+export const getDduduPaths = (cwd?: string): DduduPaths => {
+  const home = homedir();
+  const projectRoot = cwd ?? process.cwd();
+
+  const globalDir = resolve(home, '.ddudu');
+  const projectDir = resolve(projectRoot, '.ddudu');
+
+  return {
+    globalDir,
+    globalConfig: resolve(globalDir, 'config.yaml'),
+    globalPrompts: resolve(globalDir, 'prompts'),
+    globalRules: resolve(globalDir, 'rules'),
+    globalSkills: resolve(globalDir, 'skills'),
+    globalSessions: resolve(globalDir, 'sessions'),
+    globalAuth: resolve(globalDir, 'auth.json'),
+    globalInstructions: resolve(globalDir, 'DDUDU.md'),
+    projectDir,
+    projectConfig: resolve(projectDir, 'config.yaml'),
+    projectPrompts: resolve(projectDir, 'prompts'),
+    projectRules: resolve(projectDir, 'rules'),
+    projectInstructions: resolve(projectDir, 'DDUDU.md'),
+    projectSessions: resolve(projectDir, 'sessions'),
+  };
+};
+
+export const ensureGlobalDirs = async (): Promise<void> => {
+  const paths = getDduduPaths();
+
+  await Promise.all([
+    mkdir(paths.globalDir, { recursive: true }),
+    mkdir(paths.globalPrompts, { recursive: true }),
+    mkdir(paths.globalRules, { recursive: true }),
+    mkdir(paths.globalSkills, { recursive: true }),
+    mkdir(paths.globalSessions, { recursive: true }),
+  ]);
+};
+
+export const ensureProjectDirs = async (cwd?: string): Promise<void> => {
+  const paths = getDduduPaths(cwd);
+
+  await Promise.all([
+    mkdir(paths.projectDir, { recursive: true }),
+    mkdir(paths.projectPrompts, { recursive: true }),
+    mkdir(paths.projectRules, { recursive: true }),
+    mkdir(paths.projectSessions, { recursive: true }),
+  ]);
+};

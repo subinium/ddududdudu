@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1800 430" role="img" aria-labelledby="title desc">
+  <title id="title">ddudu logo</title>
+  <desc id="desc">ASCII wordmark for ddudu in pink on a black background.</desc>
+  <g transform="translate(0, 12)">
+    <text
+      x="52"
+      y="58"
+      fill="#d46c8c"
+      font-family="'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace"
+      font-size="29"
+      xml:space="preserve"
+      opacity="0.35"
+    >
+      <tspan x="56" y="66">      d8b       d8b                d8b                    d8b       d8b                d8b</tspan>
+      <tspan x="56" dy="44">      88P       88P                88P                    88P       88P                88P</tspan>
+      <tspan x="56" dy="44">     d88       d88                d88                    d88       d88                d88</tspan>
+      <tspan x="56" dy="44"> d888888   d888888  ?88   d8P d888888  ?88   d8P     d888888   d888888  ?88   d8P d888888  ?88   d8P</tspan>
+      <tspan x="56" dy="44">d8P' ?88  d8P' ?88  d88   88 d8P' ?88  d88   88     d8P' ?88  d8P' ?88  d88   88 d8P' ?88  d88   88</tspan>
+      <tspan x="56" dy="44">88b  ,88b 88b  ,88b ?8(  d88 88b  ,88b ?8(  d88     88b  ,88b 88b  ,88b ?8(  d88 88b  ,88b ?8(  d88</tspan>
+      <tspan x="56" dy="44">`?88P'`88b`?88P'`88b`?88P'?8b`?88P'`88b`?88P'?8b    `?88P'`88b`?88P'`88b`?88P'?8b`?88P'`88b`?88P'?8b</tspan>
+    </text>
+    <text
+      x="48"
+      y="62"
+      fill="#f7a7bb"
+      font-family="'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace"
+      font-size="29"
+      xml:space="preserve"
+    >
+      <tspan x="52" y="62">      d8b       d8b                d8b                    d8b       d8b                d8b</tspan>
+      <tspan x="52" dy="44">      88P       88P                88P                    88P       88P                88P</tspan>
+      <tspan x="52" dy="44">     d88       d88                d88                    d88       d88                d88</tspan>
+      <tspan x="52" dy="44"> d888888   d888888  ?88   d8P d888888  ?88   d8P     d888888   d888888  ?88   d8P d888888  ?88   d8P</tspan>
+      <tspan x="52" dy="44">d8P' ?88  d8P' ?88  d88   88 d8P' ?88  d88   88     d8P' ?88  d8P' ?88  d88   88 d8P' ?88  d88   88</tspan>
+      <tspan x="52" dy="44">88b  ,88b 88b  ,88b ?8(  d88 88b  ,88b ?8(  d88     88b  ,88b 88b  ,88b ?8(  d88 88b  ,88b ?8(  d88</tspan>
+      <tspan x="52" dy="44">`?88P'`88b`?88P'`88b`?88P'?8b`?88P'`88b`?88P'?8b    `?88P'`88b`?88P'`88b`?88P'?8b`?88P'`88b`?88P'?8b</tspan>
+    </text>
+  </g>
+</svg>

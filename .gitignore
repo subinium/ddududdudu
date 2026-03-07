@@ -1,0 +1,30 @@
+# Build output
+dist/
+native/ddudu-tui/target/
+tsconfig.tsbuildinfo
+
+# Dependencies
+node_modules/
+
+# Local project state
+.ddudu/
+
+# Internal docs (keep README.md public)
+SPEC.md
+PLAN.md
+SESSION-CONTEXT.md
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Environment
+.env
+.env.local
