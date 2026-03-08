@@ -18,11 +18,11 @@
 ## Current Capabilities
 
 - Native Rust TUI with a TypeScript harness engine
-- Canonical local sessions with `resume`, `hydrate`, and saved session reopening
+- Canonical sessions with `resume`, `hydrate`, and saved session reopening
 - Mode-aware delegation across `JENNIE`, `LISA`, `ROSÉ`, and `JISOO`
 - Team orchestration with parallel, sequential, and delegated runs
-- Isolated delegated runs with git worktrees for CLI-backed agent sessions
-- Workflow state with todos, permission profiles, remote CLI session state, detached background jobs, and automatic verification
+- Isolated delegated runs with git worktrees for provider-backed agent sessions
+- Workflow state with todos, permission profiles, remote provider session state, detached background jobs, and automatic verification
 - Sidebar rails for subagents, detached background work, MCP servers, and LSP status
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
@@ -80,6 +80,9 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `write_file`   | create or overwrite files                           |
 | `edit_file`    | patch existing files                                |
 | `list_dir`     | inspect directory contents                          |
+| `git_status`   | inspect repository status                           |
+| `git_diff`     | inspect working tree or staged diffs                |
+| `patch_apply`  | validate or apply unified diff patches              |
 | `bash`         | run shell commands                                  |
 | `grep`         | search file contents                                |
 | `glob`         | match paths by pattern                              |
@@ -91,6 +94,7 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `changed_files` | list git-changed files for active-context retrieval |
 | `file_importance` | rank likely relevant files for the current request |
 | `codebase_search` | score files and lines against a natural-language query |
+| `web_search`   | search the web with concise ranked results          |
 | `web_fetch`    | fetch and summarize remote pages                    |
 | `task`         | delegate work to a sub-agent                        |
 | `oracle`       | ask a stronger secondary model for a focused answer |
@@ -148,18 +152,20 @@ Start or refresh login from ddudu:
 ddudu auth login
 ddudu auth login claude
 ddudu auth login codex
+ddudu auth login codex --api-key
 ```
 
-`ddudu auth login` opens an interactive picker. You can register a vendor login or store an API key in `~/.ddudu/auth.yaml`, depending on the provider.
+`ddudu auth login` opens an interactive Arrow-key picker. You can choose a vendor login flow or register an API key in `~/.ddudu/auth.yaml`, depending on the provider.
 
 After login, ddudu rechecks local credentials and shows how the current four-mode lineup resolves against the providers you actually have available.
 
 ## Workflow
 
-ddudu keeps one canonical local session and layers provider-specific CLI sessions on top of it.
+ddudu keeps one canonical session and layers provider-specific sessions on top of it.
 
 - `session list`, `session last`, and `session resume <id>` reopen saved sessions
-- CLI-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
+- `session pick` opens an interactive saved-session picker with Arrow-key selection
+- provider runtimes keep remote session IDs so the harness can `resume` or `hydrate` when context advances
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - background runs can continue as detached workers, keep inspectable job state, and can be retried, promoted, cancelled, or reopened later
 - `/plan` and `/todo` manage the shared execution plan
@@ -177,24 +183,16 @@ ddudu init            # initialize .ddudu/ in current project
 ddudu doctor          # basic environment check
 ddudu config show     # print merged config
 ddudu session list    # list saved sessions
-ddudu session last    # reopen the most recent saved local session
-ddudu session resume <id>  # reopen a saved local session in the native TUI
+ddudu session pick    # choose a saved session interactively
+ddudu session last    # reopen the most recent saved session
+ddudu session resume <id>  # reopen a saved session in the native TUI
 ```
 
 ## Benchmarks
 
-ddudu includes a minimal benchmark skeleton so you can compare the same task set across different harnesses or vendor CLIs.
+WIP.
 
-```bash
-npm run bench:run -- \
-  --tasks bench/tasks.example.yaml \
-  --command-template 'ddudu run "{prompt}"' \
-  --out bench/results/ddudu.jsonl
-
-npm run bench:report -- bench/results/ddudu.jsonl
-```
-
-The runner copies each task repo into a temporary workspace, runs the command template with the task prompt, then runs the task's `success_command` and records pass/fail, duration, and clipped stdout/stderr.
+The current repository includes early benchmark scaffolding, but the task packs and comparison workflow are not stable enough to treat as a polished public feature yet.
 
 ## TUI Shortcuts
 
