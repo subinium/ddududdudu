@@ -89,6 +89,7 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `reference_search` | find likely cross-file references and usages       |
 | `reference_hotspots` | group likely implementation hotspots by file       |
 | `changed_files` | list git-changed files for active-context retrieval |
+| `file_importance` | rank likely relevant files for the current request |
 | `codebase_search` | score files and lines against a natural-language query |
 | `web_fetch`    | fetch and summarize remote pages                    |
 | `task`         | delegate work to a sub-agent                        |
@@ -97,7 +98,11 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `memory`       | read or write persistent memory                     |
 | `update_plan`  | manage the shared execution plan / todo list        |
 
-## Quick Start
+## Installation
+
+Today the supported install path is from source.
+
+Because the TUI is a native Rust binary, a portable `npm install -g ddududdudu` release needs platform-specific packaged binaries first. Until that release pipeline exists, install from source on the target machine.
 
 ### Prerequisites
 
@@ -151,7 +156,7 @@ After login, ddudu rechecks local credentials and shows how the current four-mod
 
 ddudu keeps one canonical local session and layers provider-specific CLI sessions on top of it.
 
-- `session list`, `session last`, and `session resume <id>` reopen saved local sessions
+- `session list`, `session last`, and `session resume <id>` reopen saved sessions
 - CLI-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - background runs can continue as detached workers, keep inspectable job state, and can be retried, promoted, cancelled, or reopened later
@@ -217,8 +222,10 @@ The runner copies each task repo into a temporary workspace, runs the command te
 | `/config` | show runtime config summary |
 | `/help` | show available commands |
 | `/doctor` | show runtime health and context info |
+| `/context` | inspect the active prompt context snapshot |
 | `/queue` | inspect, run, promote, drop, or clear queued prompts |
-| `/jobs` | inspect, result, retry, promote, or cancel detached background jobs |
+| `/jobs` | inspect, logs, result, retry, promote, or cancel detached background jobs |
+| `/artifacts` | inspect recent typed artifacts |
 | `/review` | run review checks against the current diff |
 | `/checkpoint` | create a git checkpoint commit |
 | `/undo` | revert the last ddudu checkpoint |

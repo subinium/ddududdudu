@@ -14,6 +14,8 @@ import {
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
 
+const DISPLAY_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
+
 const printUsage = (): void => {
   const isTTY = process.stdout.isTTY ?? false;
   const P = isTTY ? '\x1b[38;2;249;76;132m' : '';
@@ -23,7 +25,7 @@ const printUsage = (): void => {
 
   const usage = [
     '',
-    `  ${P}♪ DDUDUDDUDU${X}  ${D}v0.1.0${X}`,
+    `  ${P}♪ DDUDUDDUDU${X}  ${D}v${DISPLAY_VERSION}${X}`,
     `  ${D}Multi-Agent Orchestration CLI${X}`,
     '',
     `${PL}Usage${X}`,
