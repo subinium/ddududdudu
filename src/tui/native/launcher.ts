@@ -24,9 +24,9 @@ const resolveBridgeEntrypoint = (): string => {
 const resolveNativeBinary = async (): Promise<string | null> => {
   const currentDir = dirname(fileURLToPath(import.meta.url));
   const candidates = [
-    resolve(currentDir, '../../native/ddudu-tui'),
-    resolve(currentDir, '../../../native/ddudu-tui/target/release/ddudu-tui'),
-    resolve(currentDir, '../../../native/ddudu-tui/target/debug/ddudu-tui'),
+    resolve(currentDir, '../ddudu-tui'),
+    resolve(currentDir, '../../../tui/target/release/ddudu-tui'),
+    resolve(currentDir, '../../../tui/target/debug/ddudu-tui'),
   ];
 
   for (const candidate of candidates) {

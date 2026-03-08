@@ -1,6 +1,6 @@
 # Build output
 dist/
-native/ddudu-tui/target/
+tui/target/
 tsconfig.tsbuildinfo
 
 # Dependencies

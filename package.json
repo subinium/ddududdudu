@@ -10,7 +10,7 @@
     "ddudu": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc && cargo build --manifest-path native/ddudu-tui/Cargo.toml --release && mkdir -p dist/native && cp native/ddudu-tui/target/release/ddudu-tui dist/native/ddudu-tui && chmod +x dist/native/ddudu-tui && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
+    "build": "tsc && cargo build --manifest-path tui/Cargo.toml --release && mkdir -p dist/tui && cp tui/target/release/ddudu-tui dist/tui/ddudu-tui && chmod +x dist/tui/ddudu-tui && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
     "dev": "tsc --watch",
     "start": "node dist/index.js",
     "lint": "tsc --noEmit",
