@@ -13,6 +13,25 @@ import { getDduduPaths } from './dirs.js';
 
 const DEFAULT_SESSION_DIR = getDduduPaths().globalSessions;
 
+const previewText = (value: string, maxLength: number = 72): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const readString = (value: unknown): string | undefined =>
+  typeof value === 'string' && value.trim().length > 0 ? value.trim() : undefined;
+
+const isNamedMode = (value: unknown): value is SessionListItem['mode'] =>
+  value === 'jennie' || value === 'lisa' || value === 'rosé' || value === 'jisoo';
+
 const parseLine = (line: string): SessionEntry | null => {
   if (!line.trim()) {
     return null;
@@ -139,6 +158,27 @@ export class SessionManager {
         }
 
         const sessionHeader = headerRecord.data as unknown as SessionHeader;
+        const latestMessage = records
+          .slice()
+          .reverse()
+          .find((record: SessionEntry) => {
+            const user = readString(record.data.user);
+            const assistant = readString(record.data.assistant);
+            return Boolean(user || assistant);
+          });
+
+        const latestUser = latestMessage ? readString(latestMessage.data.user) : undefined;
+        const latestAssistant = latestMessage ? readString(latestMessage.data.assistant) : undefined;
+        const provider = readString(sessionHeader.provider)
+          ?? (latestMessage ? readString(latestMessage.data.provider) : undefined);
+        const model = readString(sessionHeader.model)
+          ?? (latestMessage ? readString(latestMessage.data.model) : undefined);
+        const mode =
+          latestMessage && isNamedMode(latestMessage.data.mode)
+            ? latestMessage.data.mode
+            : undefined;
+        const preview = previewText(latestUser ?? latestAssistant ?? '');
+        const title = sessionHeader.title?.trim() || preview || undefined;
 
         return {
           id: sessionHeader.id,
@@ -147,7 +187,11 @@ export class SessionManager {
           updatedAt: fileStat.mtime.toISOString(),
           entryCount: Math.max(records.length - 1, 0),
           parentId: sessionHeader.parentId,
-          title: sessionHeader.title,
+          title,
+          provider,
+          model,
+          mode,
+          preview: preview || undefined,
         };
       })
     );

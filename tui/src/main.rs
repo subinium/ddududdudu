@@ -1923,6 +1923,18 @@ impl App {
             });
         }
 
+        if q.is_empty()
+            || "resume session".contains(&q)
+            || "saved session".contains(&q)
+            || "/session pick".contains(&q)
+        {
+            items.push(PaletteItem {
+                label: "Resume saved session".to_string(),
+                description: "sessions".to_string(),
+                action: PaletteAction::InsertSlash("/session pick".to_string()),
+            });
+        }
+
         for (index, job) in self.state.background_jobs.iter().enumerate().take(6) {
             let label = format!("Inspect job · {}", preview_line(&job.label, 28));
             if q.is_empty() || label.to_lowercase().contains(&q) {
@@ -2039,6 +2051,12 @@ impl App {
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
             self.bridge.send(BridgeCommand::ClearMessages)?;
+            return Ok(());
+        }
+
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('y') {
+            self.execute_slash_command("/session pick")?;
+            self.push_notice("session picker".to_string(), NoticeTone::Info);
             return Ok(());
         }
 

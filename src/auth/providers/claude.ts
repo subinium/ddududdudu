@@ -4,6 +4,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { getStoredProviderAuth } from '../store.js';
+
 const execFileAsync = promisify(execFile);
 const KEYCHAIN_TIMEOUT_MS = 3000;
 
@@ -113,6 +115,11 @@ export const discoverClaudeToken = async (): Promise<{ token: string; source: st
   const envToken = process.env.ANTHROPIC_API_KEY?.trim();
   if (envToken) {
     return { token: envToken, source: 'env:ANTHROPIC_API_KEY' };
+  }
+
+  const stored = await getStoredProviderAuth('claude');
+  if (stored?.token) {
+    return { token: stored.token, source: stored.source };
   }
 
   const subprocessToken = await discoverFromSubprocess();

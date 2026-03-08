@@ -2,6 +2,8 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import { getStoredProviderAuth } from '../store.js';
+
 const GEMINI_OAUTH_CLIENT_ID = process.env.GEMINI_OAUTH_CLIENT_ID?.trim() ?? '';
 const GEMINI_OAUTH_CLIENT_SECRET = process.env.GEMINI_OAUTH_CLIENT_SECRET?.trim() ?? '';
 
@@ -125,6 +127,15 @@ export const discoverGeminiToken = async (): Promise<{
       token: geminiApiKey,
       source: 'env:GEMINI_API_KEY',
       tokenType: 'apikey',
+    };
+  }
+
+  const stored = await getStoredProviderAuth('gemini');
+  if (stored?.token) {
+    return {
+      token: stored.token,
+      source: stored.source,
+      tokenType: stored.tokenType === 'oauth' ? 'oauth' : 'apikey',
     };
   }
 

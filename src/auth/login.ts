@@ -10,9 +10,15 @@ const MODE_LABELS: Record<HarnessModeName, string> = {
 };
 
 export const AUTH_SETUP_HINTS: Record<AuthProviderName, string> = {
-  claude: "Run 'claude auth login' or set ANTHROPIC_API_KEY",
-  codex: "Run 'codex login' or set OPENAI_API_KEY",
-  gemini: 'Set GEMINI_API_KEY or configure ~/.gemini/oauth_creds.json',
+  claude: 'Claude Code login or ANTHROPIC_API_KEY',
+  codex: 'Codex login or OPENAI_API_KEY',
+  gemini: 'GEMINI_API_KEY or ~/.gemini/oauth_creds.json',
+};
+
+export const AUTH_PROVIDER_DESCRIPTIONS: Record<AuthProviderName, string> = {
+  claude: 'orchestration',
+  codex: 'execution',
+  gemini: 'design',
 };
 
 export const normalizeAuthProviderName = (value: string | null | undefined): AuthProviderName | null => {
@@ -98,4 +104,22 @@ export const buildResolvedModeSummary = (
     const resolved = MODE_BINDINGS[mode].find((binding) => hasProvider(binding.provider)) ?? MODE_BINDINGS[mode][0];
     return `  ${MODE_LABELS[mode]} -> ${resolved.model} (${resolved.provider})`;
   });
+};
+
+export const buildAuthModeHighlights = (
+  hasProvider: (provider: AuthProviderName) => boolean,
+): string[] => {
+  const lines: string[] = [];
+
+  if (hasProvider('claude')) {
+    lines.push('  Claude unlocks JENNIE (Opus 4.6) and ROSÉ (Sonnet 4.6).');
+  }
+  if (hasProvider('codex')) {
+    lines.push('  Codex unlocks LISA and acts as fallback for all modes with GPT-5.4.');
+  }
+  if (hasProvider('gemini')) {
+    lines.push('  Gemini unlocks JISOO for design and multimodal work.');
+  }
+
+  return lines;
 };

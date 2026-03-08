@@ -46,7 +46,7 @@ import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } f
 import { TokenCounter } from '../../core/token-counter.js';
 import { analyzeToolRisk, shouldPromptForRisk, type ToolRiskAssessment } from '../../core/trust.js';
 import { getDduduPaths } from '../../core/dirs.js';
-import type { DduduConfig, LoadedSession, NamedMode, SessionEntry, ToolPolicy } from '../../core/types.js';
+import type { DduduConfig, LoadedSession, NamedMode, SessionEntry, SessionListItem, ToolPolicy } from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
 import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
 import type {
@@ -2707,6 +2707,10 @@ export class NativeBridgeController {
               kind: isArtifactKind(item.kind) ? item.kind : 'answer',
               title: typeof item.title === 'string' ? item.title.trim() : '',
               summary: typeof item.summary === 'string' ? item.summary.trim() : '',
+              payload:
+                typeof item.payload === 'object' && item.payload !== null
+                  ? (item.payload as WorkflowArtifact['payload'])
+                  : undefined,
               source,
               mode,
               createdAt: typeof item.createdAt === 'string' ? item.createdAt : entry.timestamp,
@@ -3450,6 +3454,62 @@ export class NativeBridgeController {
     return MEMORY_SCOPES.includes(value as MemoryScope) ? (value as MemoryScope) : null;
   }
 
+  private formatSessionTitle(session: SessionListItem): string {
+    return session.title ?? session.preview ?? `session #${session.id.slice(0, 8)}`;
+  }
+
+  private formatSessionListItem(session: SessionListItem): string {
+    const runtime = [session.provider, session.model].filter((part): part is string => Boolean(part)).join(' · ');
+    const updated = session.updatedAt.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    const parts = [
+      this.formatSessionTitle(session),
+      runtime || null,
+      `${session.entryCount} entries`,
+      updated,
+      `#${session.id.slice(0, 8)}`,
+    ].filter((part): part is string => Boolean(part));
+    return parts.join(' · ');
+  }
+
+  private resolveSessionReference(
+    sessions: SessionListItem[],
+    reference: string,
+  ): SessionListItem | null {
+    const byIndex = Number.parseInt(reference, 10);
+    if (Number.isFinite(byIndex) && byIndex >= 1 && byIndex <= sessions.length) {
+      return sessions[byIndex - 1] ?? null;
+    }
+
+    return sessions.find((session) => session.id === reference || session.id.startsWith(reference)) ?? null;
+  }
+
+  private async promptForChoice(question: string, options: string[]): Promise<string> {
+    return await new Promise<string>((resolve) => {
+      this.pendingAskUser = {
+        resolve,
+        reject: () => undefined,
+      };
+      this.state.askUser = {
+        question,
+        options,
+      };
+      this.scheduleStatePush();
+    });
+  }
+
+  private async resumeSessionById(sessionId: string): Promise<void> {
+    if (!this.sessionManager) {
+      throw new Error('Session manager unavailable.');
+    }
+
+    const loaded = await this.sessionManager.load(sessionId);
+    this.restoreSession(loaded);
+    await this.refreshSystemPrompt();
+    this.reconfigureClient();
+    await this.pollBackgroundJobs();
+    this.scheduleStatePush();
+  }
+
   private async runSessionCommand(args: string[]): Promise<string> {
     const command = args[0]?.trim().toLowerCase() ?? '';
     if (!command || command === 'status') {
@@ -3468,7 +3528,7 @@ export class NativeBridgeController {
       return [
         'Sessions',
         ...sessions.slice(0, 12).map((session, index) =>
-          `${index + 1}. ${session.id.slice(0, 8)} · ${session.entryCount} entries · ${session.updatedAt}`),
+          `${index + 1}. ${this.formatSessionListItem(session)}`),
       ].join('\n');
     }
 
@@ -3478,35 +3538,43 @@ export class NativeBridgeController {
       if (!latest) {
         return 'No saved sessions yet.';
       }
-      const loaded = await this.sessionManager.load(latest.id);
-      this.restoreSession(loaded);
-      await this.refreshSystemPrompt();
-      this.reconfigureClient();
-      await this.pollBackgroundJobs();
-      this.scheduleStatePush();
-      return `Resumed session ${latest.id.slice(0, 8)}.`;
+      await this.resumeSessionById(latest.id);
+      return `Resumed ${this.formatSessionTitle(latest)}.`;
+    }
+
+    if (command === 'pick') {
+      const sessions = await this.sessionManager.list();
+      if (sessions.length === 0) {
+        return 'No saved sessions yet.';
+      }
+
+      const options = sessions.slice(0, 12).map((session) => this.formatSessionListItem(session));
+      const answer = await this.promptForChoice('Choose a session to resume', options);
+      const selectedIndex = options.indexOf(answer);
+      const selected = selectedIndex >= 0 ? sessions[selectedIndex] : null;
+      if (!selected) {
+        return 'Session selection cancelled.';
+      }
+
+      await this.resumeSessionById(selected.id);
+      return `Resumed ${this.formatSessionTitle(selected)}.`;
     }
 
     if (command === 'resume') {
-      const id = args[1]?.trim();
-      if (!id) {
-        return 'Usage: /session resume <id>';
+      const reference = args[1]?.trim();
+      if (!reference) {
+        return 'Usage: /session resume <id|index> or /session pick';
       }
       const sessions = await this.sessionManager.list();
-      const resolved = sessions.find((session) => session.id === id || session.id.startsWith(id));
+      const resolved = this.resolveSessionReference(sessions, reference);
       if (!resolved) {
-        return `Session not found: ${id}`;
+        return `Session not found: ${reference}`;
       }
-      const loaded = await this.sessionManager.load(resolved.id);
-      this.restoreSession(loaded);
-      await this.refreshSystemPrompt();
-      this.reconfigureClient();
-      await this.pollBackgroundJobs();
-      this.scheduleStatePush();
-      return `Resumed session ${resolved.id.slice(0, 8)}.`;
+      await this.resumeSessionById(resolved.id);
+      return `Resumed ${this.formatSessionTitle(resolved)}.`;
     }
 
-    return 'Usage: /session [list|last|resume <id>]';
+    return 'Usage: /session [list|last|pick|resume <id|index>]';
   }
 
   private async runMemoryCommand(args: string[]): Promise<string> {

@@ -150,6 +150,8 @@ ddudu auth login claude
 ddudu auth login codex
 ```
 
+`ddudu auth login` opens an interactive picker. You can register a vendor login or store an API key in `~/.ddudu/auth.yaml`, depending on the provider.
+
 After login, ddudu rechecks local credentials and shows how the current four-mode lineup resolves against the providers you actually have available.
 
 ## Workflow

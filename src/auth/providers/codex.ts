@@ -5,6 +5,8 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { getStoredProviderAuth } from '../store.js';
+
 const execFileAsync = promisify(execFile);
 const KEYCHAIN_TIMEOUT_MS = 3000;
 
@@ -229,6 +231,15 @@ export const discoverCodexToken = async (): Promise<{
       token: envToken,
       source: 'env:OPENAI_API_KEY',
       tokenType: 'apikey',
+    };
+  }
+
+  const stored = await getStoredProviderAuth('codex');
+  if (stored?.token) {
+    return {
+      token: stored.token,
+      source: stored.source,
+      tokenType: stored.tokenType === 'bearer' ? 'bearer' : 'apikey',
     };
   }
 

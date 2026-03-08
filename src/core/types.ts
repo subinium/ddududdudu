@@ -207,6 +207,10 @@ export interface SessionListItem {
   entryCount: number;
   parentId?: string;
   title?: string;
+  provider?: string;
+  model?: string;
+  mode?: NamedMode;
+  preview?: string;
 }
 
 export interface ProviderTask {

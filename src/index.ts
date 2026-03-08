@@ -4,17 +4,62 @@ import { parseArgs, type ParsedCommand } from './cli.js';
 import { discoverAllProviders } from './auth/discovery.js';
 import {
   AUTH_PROVIDERS,
+  AUTH_PROVIDER_DESCRIPTIONS,
   AUTH_SETUP_HINTS,
+  buildAuthModeHighlights,
   buildGeminiLoginHelp,
   buildResolvedModeSummary,
-  normalizeAuthProviderName,
   resolveRequestedAuthProvider,
   type AuthProviderName,
 } from './auth/login.js';
+import { getAuthStorePath, setStoredProviderAuth } from './auth/store.js';
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
 
 const DISPLAY_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
+
+const previewText = (value: string, maxLength: number = 68): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const formatSessionLabel = (session: {
+  id: string;
+  updatedAt: string;
+  entryCount: number;
+  title?: string;
+  provider?: string;
+  model?: string;
+  preview?: string;
+}): string => {
+  const title = session.title || session.preview || 'untitled session';
+  const runtime = [session.provider, session.model].filter((part): part is string => Boolean(part)).join(' · ');
+  const updated = session.updatedAt.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+  const parts = [
+    previewText(title, 56),
+    runtime ? previewText(runtime, 40) : null,
+    `${session.entryCount} entries`,
+    updated,
+    `#${session.id.slice(0, 8)}`,
+  ].filter((part): part is string => Boolean(part));
+  return parts.join('  ·  ');
+};
+
+const formatProviderChoice = (
+  provider: AuthProviderName,
+  connected: boolean,
+): string => {
+  const status = connected ? 'connected' : 'new';
+  return `${provider.toUpperCase()}  ${DIM}${status}${RESET}`;
+};
 
 const printUsage = (): void => {
   const isTTY = process.stdout.isTTY ?? false;
@@ -37,7 +82,7 @@ const printUsage = (): void => {
     `  ${P}ddudu doctor${X}                ${D}Check environment${X}`,
     `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
     `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
-    `  ${P}ddudu session${X} list|resume|last ${D}Session management${X}`,
+    `  ${P}ddudu session${X} list|pick|resume|last ${D}Session management${X}`,
     '',
     `${PL}Shortcuts (TUI)${X}`,
     `  Shift+Tab  cycle mode   Esc  interrupt`,
@@ -224,6 +269,14 @@ interface ProviderCheckResult {
   available: boolean;
 }
 
+type AuthLoginMethod = 'vendor' | 'apikey' | 'local';
+
+interface PickerChoice<T> {
+  value: T;
+  label: string;
+  detail?: string;
+}
+
 const getProviderChecks = async (): Promise<ProviderCheckResult[]> => {
   const configModule = await import('./core/config.js');
   const config = await configModule.loadConfig();
@@ -276,15 +329,14 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
   const sessionDir = await resolveSessionDir();
   const manager = new SessionManager(sessionDir);
   const sessions = await manager.list();
-  const sessionIds = sessions.map((session) => session.id);
 
   if (parsed.subcommand === 'list') {
     if (sessions.length === 0) {
       process.stdout.write('No sessions\n');
       return;
     }
-    for (const session of sessions) {
-      process.stdout.write(`${session.id}\n`);
+    for (const [index, session] of sessions.entries()) {
+      process.stdout.write(`${index + 1}. ${formatSessionLabel(session)}\n`);
     }
     return;
   }
@@ -301,17 +353,44 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
     return;
   }
 
+  if (parsed.subcommand === 'pick') {
+    if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
+      throw new Error('session pick requires an interactive terminal');
+    }
+
+    const latest = sessions.slice(0, 12);
+    if (latest.length === 0) {
+      process.stdout.write('No sessions\n');
+      return;
+    }
+
+    const resolved = await promptWithArrowPicker(
+      'Resume a saved session',
+      latest.map((session) => ({
+        value: session,
+        label: session.title || session.preview || 'untitled session',
+        detail: formatSessionLabel(session),
+      })),
+      '↑/↓ move · Enter resume · Esc cancel',
+    );
+
+    const { startNativeTui } = await import('./tui/native/launcher.js');
+    await startNativeTui({ resumeSessionId: resolved.id });
+    return;
+  }
+
   if (parsed.subcommand === 'resume') {
     const [id] = parsed.args;
     if (!id) {
-      throw new Error('session resume requires ID');
+      throw new Error('session resume requires ID. Use `ddudu session list` to inspect recent sessions.');
     }
-    if (!sessionIds.includes(id)) {
+    const resolved = sessions.find((session) => session.id === id || session.id.startsWith(id));
+    if (!resolved) {
       throw new Error(`Session not found: ${id}`);
     }
 
     const { startNativeTui } = await import('./tui/native/launcher.js');
-    await startNativeTui({ resumeSessionId: id });
+    await startNativeTui({ resumeSessionId: resolved.id });
     return;
   }
 
@@ -386,6 +465,168 @@ const runVendorLogin = async (command: string, args: string[]): Promise<void> =>
   });
 };
 
+const withRawMode = async <T>(
+  handler: (
+    stdin: NodeJS.ReadStream,
+    stdout: NodeJS.WriteStream,
+    readline: typeof import('node:readline'),
+  ) => Promise<T>,
+): Promise<T> => {
+  if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
+    throw new Error('interactive selection requires a TTY');
+  }
+
+  const readline = await import('node:readline');
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  const setRawMode = typeof stdin.setRawMode === 'function';
+  readline.emitKeypressEvents(stdin);
+  if (setRawMode) {
+    stdin.setRawMode(true);
+  }
+
+  try {
+    return await handler(stdin, stdout, readline);
+  } finally {
+    if (setRawMode) {
+      stdin.setRawMode(false);
+    }
+  }
+};
+
+const promptWithArrowPicker = async <T>(
+  title: string,
+  choices: PickerChoice<T>[],
+  footer: string,
+): Promise<T> => {
+  if (choices.length === 0) {
+    throw new Error('no choices available');
+  }
+
+  return withRawMode<T>((stdin, stdout) => new Promise<T>((resolve, reject) => {
+    let activeIndex = 0;
+    let renderedLines = 0;
+
+    const render = (): void => {
+      if (renderedLines > 0) {
+        stdout.write(`\x1b[${renderedLines}A`);
+      }
+
+      const lines = [
+        `${PINK}♪ ${title}${RESET}`,
+        '',
+        ...choices.flatMap((choice, index) => {
+          const selected = index === activeIndex;
+          const marker = selected ? `${PINK}›${RESET}` : ' ';
+          const label = selected ? `${PINK}${choice.label}${RESET}` : choice.label;
+          const detail = choice.detail ? `${selected ? PINK : DIM}${choice.detail}${RESET}` : null;
+          return [
+            `  ${marker} ${label}`,
+            ...(detail ? [`      ${detail}`] : []),
+            '',
+          ];
+        }),
+        '',
+        `${DIM}${footer}${RESET}`,
+      ];
+
+      stdout.write(lines.map((line) => `\x1b[2K${line}`).join('\n'));
+      stdout.write('\n');
+      renderedLines = lines.length;
+    };
+
+    const cleanup = (): void => {
+      stdin.off('keypress', onKeypress);
+      stdout.write('\x1b[?25h');
+    };
+
+    const finish = (value: T): void => {
+      cleanup();
+      resolve(value);
+    };
+
+    const fail = (error: Error): void => {
+      cleanup();
+      reject(error);
+    };
+
+    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean; meta?: boolean; sequence?: string }): void => {
+      if (key.ctrl && key.name === 'c') {
+        fail(new Error('cancelled'));
+        return;
+      }
+
+      if (key.name === 'escape') {
+        fail(new Error('cancelled'));
+        return;
+      }
+
+      if (key.name === 'up' || key.name === 'k') {
+        activeIndex = activeIndex === 0 ? choices.length - 1 : activeIndex - 1;
+        render();
+        return;
+      }
+
+      if (key.name === 'down' || key.name === 'j') {
+        activeIndex = activeIndex === choices.length - 1 ? 0 : activeIndex + 1;
+        render();
+        return;
+      }
+
+      if (key.name === 'return' || key.name === 'enter') {
+        finish(choices[activeIndex]!.value);
+      }
+    };
+
+    stdout.write('\x1b[?25l');
+    render();
+    stdin.on('keypress', onKeypress);
+  }));
+};
+
+const promptForSecret = async (label: string): Promise<string> => {
+  return withRawMode<string>((stdin, stdout) => new Promise<string>((resolve, reject) => {
+    let value = '';
+
+    const cleanup = (): void => {
+      stdin.off('keypress', onKeypress);
+      stdout.write('\x1b[?25h');
+    };
+
+    const onKeypress = (chunk: string, key: { name?: string; ctrl?: boolean; sequence?: string }): void => {
+      if (key.ctrl && key.name === 'c') {
+        cleanup();
+        reject(new Error('cancelled'));
+        return;
+      }
+
+      if (key.name === 'return' || key.name === 'enter') {
+        cleanup();
+        stdout.write('\n');
+        resolve(value.trim());
+        return;
+      }
+
+      if (key.name === 'backspace') {
+        if (value.length > 0) {
+          value = value.slice(0, -1);
+          stdout.write('\b \b');
+        }
+        return;
+      }
+
+      if (typeof chunk === 'string' && chunk.length > 0 && !key.ctrl) {
+        value += chunk;
+        stdout.write('*');
+      }
+    };
+
+    stdout.write('\x1b[?25l');
+    stdout.write(`${PINK}♪ ${label}${RESET}: `);
+    stdin.on('keypress', onKeypress);
+  }));
+};
+
 const promptForAuthProvider = async (): Promise<AuthProviderName> => {
   if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
     throw new Error('auth login without a provider requires an interactive terminal');
@@ -397,38 +638,134 @@ const promptForAuthProvider = async (): Promise<AuthProviderName> => {
     ...AUTH_PROVIDERS.filter((provider) => discovered.has(provider)),
   ];
 
-  process.stdout.write('Select a provider to authenticate:\n');
-  orderedProviders.forEach((provider, index) => {
-    const status = discovered.has(provider) ? 'connected' : 'not configured';
-    process.stdout.write(`  ${index + 1}. ${provider} (${status})\n`);
-  });
-
-  const { createInterface } = await import('node:readline/promises');
-  const rl = createInterface({
-    input: process.stdin,
-    output: process.stdout,
-  });
-
-  try {
-    const answer = (await rl.question('Provider [1-3 or name]: ')).trim().toLowerCase();
-    const byIndex = Number(answer);
-    if (Number.isInteger(byIndex) && byIndex >= 1 && byIndex <= orderedProviders.length) {
-      return orderedProviders[byIndex - 1];
-    }
-
-    const named = normalizeAuthProviderName(answer);
-    if (named) {
-      return named;
-    }
-  } finally {
-    rl.close();
-  }
-
-  throw new Error('Unknown provider. Use claude, codex, or gemini.');
+  return promptWithArrowPicker(
+    'Choose a provider to authenticate',
+    orderedProviders.map((provider) => ({
+      value: provider,
+      label: formatProviderChoice(provider, discovered.has(provider)),
+      detail: `${AUTH_PROVIDER_DESCRIPTIONS[provider]} · ${AUTH_SETUP_HINTS[provider]}`,
+    })),
+    '↑/↓ move · Enter select · Esc cancel',
+  );
 };
 
-const completeAuthLogin = async (provider: AuthProviderName): Promise<void> => {
-  if (provider === 'claude') {
+const resolveRequestedAuthMethod = (
+  provider: AuthProviderName,
+  flags: Record<string, string | boolean>,
+): AuthLoginMethod | null => {
+  if (flags['api-key'] === true) {
+    return 'apikey';
+  }
+
+  const rawMethod =
+    typeof flags.method === 'string'
+      ? flags.method.trim().toLowerCase()
+      : typeof flags.m === 'string'
+        ? flags.m.trim().toLowerCase()
+        : '';
+
+  if (!rawMethod) {
+    return null;
+  }
+
+  if (rawMethod === 'api' || rawMethod === 'apikey' || rawMethod === 'api-key') {
+    return 'apikey';
+  }
+
+  if (rawMethod === 'vendor' || rawMethod === 'auth' || rawMethod === 'login') {
+    return 'vendor';
+  }
+
+  if (provider === 'gemini' && (rawMethod === 'local' || rawMethod === 'existing')) {
+    return 'local';
+  }
+
+  throw new Error(`Unknown auth method: ${rawMethod}`);
+};
+
+const promptForAuthMethod = async (provider: AuthProviderName): Promise<AuthLoginMethod> => {
+  const choices: PickerChoice<AuthLoginMethod>[] =
+    provider === 'claude'
+        ? [
+          {
+            value: 'vendor',
+            label: 'Claude Code login',
+            detail: 'reuse local Claude auth',
+          },
+          {
+            value: 'apikey',
+            label: 'Anthropic API key',
+            detail: 'store in ~/.ddudu/auth.yaml',
+          },
+        ]
+      : provider === 'codex'
+        ? [
+            {
+              value: 'vendor',
+              label: 'Codex login',
+              detail: 'reuse local Codex auth',
+            },
+            {
+              value: 'apikey',
+              label: 'OpenAI API key',
+              detail: 'store in ~/.ddudu/auth.yaml',
+            },
+          ]
+        : [
+            {
+              value: 'apikey',
+              label: 'Gemini API key',
+              detail: 'store in ~/.ddudu/auth.yaml',
+            },
+            {
+              value: 'local',
+              label: 'Reuse local Gemini credentials',
+              detail: 'use ~/.gemini/oauth_creds.json',
+            },
+          ];
+
+  return promptWithArrowPicker(
+    `Choose how to authenticate ${provider}`,
+    choices,
+    '↑/↓ move · Enter select · Esc cancel',
+  );
+};
+
+const registerApiKey = async (provider: AuthProviderName): Promise<void> => {
+  const secretLabel =
+    provider === 'claude'
+      ? 'Anthropic API key'
+      : provider === 'codex'
+        ? 'OpenAI API key'
+        : 'Gemini API key';
+  const token = await promptForSecret(secretLabel);
+  if (!token) {
+    throw new Error('empty API key');
+  }
+
+  const path = await setStoredProviderAuth(provider, {
+    token,
+    tokenType: 'apikey',
+    source: 'ddudu-auth-store',
+    label: secretLabel,
+  });
+  process.stdout.write(`\nStored ${provider} API key in ${path}\n`);
+};
+
+const completeAuthLogin = async (
+  provider: AuthProviderName,
+  method: AuthLoginMethod | null = null,
+): Promise<void> => {
+  const selectedMethod =
+    method ??
+    (process.stdin.isTTY && process.stdout.isTTY ? await promptForAuthMethod(provider) : 'vendor');
+
+  if (selectedMethod === 'apikey') {
+    if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
+      throw new Error('API key registration requires an interactive terminal');
+    }
+    await registerApiKey(provider);
+  } else if (provider === 'claude') {
     if (!(await checkCommandAvailable('claude'))) {
       throw new Error("Claude CLI not found. Install it first, then run 'ddudu auth login claude'.");
     }
@@ -440,6 +777,8 @@ const completeAuthLogin = async (provider: AuthProviderName): Promise<void> => {
     }
 
     await runVendorLogin('codex', ['login']);
+  } else if (selectedMethod === 'local') {
+    process.stdout.write(`${DIM}Checking existing local Gemini credentials...${RESET}\n`);
   } else {
     process.stdout.write(`${buildGeminiLoginHelp().join('\n')}\n`);
     return;
@@ -448,13 +787,30 @@ const completeAuthLogin = async (provider: AuthProviderName): Promise<void> => {
   const discovered = await discoverAllProviders();
   const auth = discovered.get(provider);
   if (!auth) {
+    if (provider === 'gemini' && selectedMethod === 'local') {
+      throw new Error('No local Gemini credentials found yet. Set GEMINI_API_KEY or configure ~/.gemini/oauth_creds.json.');
+    }
     throw new Error(`${provider} login completed, but ddudu could not rediscover credentials yet.`);
   }
 
   process.stdout.write(`\nAuthenticated ${provider} via ${auth.source}\n`);
+  process.stdout.write(`${AUTH_PROVIDER_DESCRIPTIONS[provider]}\n`);
+  const highlights = buildAuthModeHighlights((name) => discovered.has(name));
+  if (highlights.length > 0) {
+    process.stdout.write('\nMode highlights:\n');
+    for (const line of highlights) {
+      process.stdout.write(`${line}\n`);
+    }
+  }
   process.stdout.write('\nResolved mode lineup:\n');
   for (const line of buildResolvedModeSummary((name) => discovered.has(name))) {
     process.stdout.write(`${line}\n`);
+  }
+  process.stdout.write('\nNext steps:\n');
+  process.stdout.write('  ddudu\n');
+  process.stdout.write('  ddudu auth status\n');
+  if (selectedMethod === 'apikey') {
+    process.stdout.write(`  stored in ${getAuthStorePath()}\n`);
   }
 };
 
@@ -466,6 +822,7 @@ const handleAuth = async (parsed: ParsedCommand): Promise<void> => {
 
   if (parsed.subcommand === 'login') {
     const requested = resolveRequestedAuthProvider(parsed.args, parsed.flags);
+    const requestedMethod = requested && requested !== 'all' ? resolveRequestedAuthMethod(requested, parsed.flags) : null;
     if (requested === 'all') {
       for (const provider of AUTH_PROVIDERS) {
         await completeAuthLogin(provider);
@@ -476,14 +833,14 @@ const handleAuth = async (parsed: ParsedCommand): Promise<void> => {
     }
 
     if (requested) {
-      await completeAuthLogin(requested);
+      await completeAuthLogin(requested, requestedMethod);
       process.stdout.write('\n');
       await handleAuthOutput(false);
       return;
     }
 
     const provider = await promptForAuthProvider();
-    await completeAuthLogin(provider);
+    await completeAuthLogin(provider, resolveRequestedAuthMethod(provider, parsed.flags));
     process.stdout.write('\n');
     await handleAuthOutput(false);
     return;
