@@ -68,6 +68,8 @@ A practical harness is less about adding more prompt text and more about balanci
 
 Recommended setup: run this default four-mode lineup together and let ddudu route or delegate between them as needed.
 
+If only one provider is authenticated, ddudu still keeps the four-mode surface and resolves each mode to the best available fallback. In practice that means a Claude-only setup still gives you `Opus 4.6` for orchestration and `Sonnet 4.6` for planning/execution fallbacks, while a Codex-only setup collapses the modes onto `GPT-5.4`.
+
 `Shift+Tab` cycles modes inside the TUI.
 
 ## Built-In Tools
@@ -133,6 +135,14 @@ Check what ddudu sees:
 
 ```bash
 ddudu auth
+```
+
+Start or refresh login from ddudu:
+
+```bash
+ddudu auth login
+ddudu auth login claude
+ddudu auth login codex
 ```
 
 ## Workflow

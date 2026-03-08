@@ -2,6 +2,14 @@
 
 import { parseArgs, type ParsedCommand } from './cli.js';
 import { discoverAllProviders } from './auth/discovery.js';
+import {
+  AUTH_PROVIDERS,
+  AUTH_SETUP_HINTS,
+  buildGeminiLoginHelp,
+  normalizeAuthProviderName,
+  resolveRequestedAuthProvider,
+  type AuthProviderName,
+} from './auth/login.js';
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
 
@@ -22,6 +30,7 @@ const printUsage = (): void => {
     `  ${P}ddudu init${X}                  ${D}Initialize project${X}`,
     `  ${P}ddudu run${X} "PROMPT"           ${D}Run single prompt${X}`,
     `  ${P}ddudu run${X} --provider NAME    ${D}Use specific provider${X}`,
+    `  ${P}ddudu auth${X} [login|status]    ${D}Inspect or refresh provider auth${X}`,
     `  ${P}ddudu doctor${X}                ${D}Check environment${X}`,
     `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
     `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
@@ -320,16 +329,6 @@ const handleJob = async (parsed: ParsedCommand): Promise<void> => {
   await runDetachedBackgroundJob(jobId);
 };
 
-type AuthProviderName = 'claude' | 'codex' | 'gemini';
-
-const AUTH_PROVIDERS: AuthProviderName[] = ['claude', 'codex', 'gemini'];
-
-const AUTH_SETUP_HINTS: Record<AuthProviderName, string> = {
-  claude: "Run 'claude auth login' or set ANTHROPIC_API_KEY",
-  codex: "Run 'codex login' or set OPENAI_API_KEY",
-  gemini: 'Set GEMINI_API_KEY or configure ~/.gemini/oauth_creds.json',
-};
-
 const handleAuthOutput = async (showSetupHints: boolean): Promise<void> => {
   const isTTY = process.stdout.isTTY ?? false;
   const pink = isTTY ? PINK : '';
@@ -359,9 +358,127 @@ const handleAuthOutput = async (showSetupHints: boolean): Promise<void> => {
   process.stdout.write(`\n${configuredCount}/3 providers configured\n`);
 };
 
+const runVendorLogin = async (command: string, args: string[]): Promise<void> => {
+  const { spawn } = await import('node:child_process');
+
+  await new Promise<void>((resolve, reject) => {
+    const proc = spawn(command, args, {
+      stdio: 'inherit',
+    });
+
+    proc.on('error', reject);
+    proc.on('close', (code: number | null, signal: NodeJS.Signals | null) => {
+      if (signal) {
+        reject(new Error(`${command} login terminated by signal ${signal}`));
+        return;
+      }
+
+      if ((code ?? 0) !== 0) {
+        reject(new Error(`${command} login exited with code ${code ?? 0}`));
+        return;
+      }
+
+      resolve();
+    });
+  });
+};
+
+const promptForAuthProvider = async (): Promise<AuthProviderName> => {
+  if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
+    throw new Error('auth login without a provider requires an interactive terminal');
+  }
+
+  const discovered = await discoverAllProviders();
+  const orderedProviders = [
+    ...AUTH_PROVIDERS.filter((provider) => !discovered.has(provider)),
+    ...AUTH_PROVIDERS.filter((provider) => discovered.has(provider)),
+  ];
+
+  process.stdout.write('Select a provider to authenticate:\n');
+  orderedProviders.forEach((provider, index) => {
+    const status = discovered.has(provider) ? 'connected' : 'not configured';
+    process.stdout.write(`  ${index + 1}. ${provider} (${status})\n`);
+  });
+
+  const { createInterface } = await import('node:readline/promises');
+  const rl = createInterface({
+    input: process.stdin,
+    output: process.stdout,
+  });
+
+  try {
+    const answer = (await rl.question('Provider [1-3 or name]: ')).trim().toLowerCase();
+    const byIndex = Number(answer);
+    if (Number.isInteger(byIndex) && byIndex >= 1 && byIndex <= orderedProviders.length) {
+      return orderedProviders[byIndex - 1];
+    }
+
+    const named = normalizeAuthProviderName(answer);
+    if (named) {
+      return named;
+    }
+  } finally {
+    rl.close();
+  }
+
+  throw new Error('Unknown provider. Use claude, codex, or gemini.');
+};
+
+const completeAuthLogin = async (provider: AuthProviderName): Promise<void> => {
+  if (provider === 'claude') {
+    if (!(await checkCommandAvailable('claude'))) {
+      throw new Error("Claude CLI not found. Install it first, then run 'ddudu auth login claude'.");
+    }
+
+    await runVendorLogin('claude', ['auth', 'login']);
+  } else if (provider === 'codex') {
+    if (!(await checkCommandAvailable('codex'))) {
+      throw new Error("Codex CLI not found. Install it first, then run 'ddudu auth login codex'.");
+    }
+
+    await runVendorLogin('codex', ['login']);
+  } else {
+    process.stdout.write(`${buildGeminiLoginHelp().join('\n')}\n`);
+    return;
+  }
+
+  const discovered = await discoverAllProviders();
+  const auth = discovered.get(provider);
+  if (!auth) {
+    throw new Error(`${provider} login completed, but ddudu could not rediscover credentials yet.`);
+  }
+
+  process.stdout.write(`\nAuthenticated ${provider} via ${auth.source}\n`);
+};
+
 const handleAuth = async (parsed: ParsedCommand): Promise<void> => {
-  if (!parsed.subcommand || parsed.subcommand === 'login') {
+  if (!parsed.subcommand) {
     await handleAuthOutput(true);
+    return;
+  }
+
+  if (parsed.subcommand === 'login') {
+    const requested = resolveRequestedAuthProvider(parsed.args, parsed.flags);
+    if (requested === 'all') {
+      for (const provider of AUTH_PROVIDERS) {
+        await completeAuthLogin(provider);
+      }
+      process.stdout.write('\n');
+      await handleAuthOutput(false);
+      return;
+    }
+
+    if (requested) {
+      await completeAuthLogin(requested);
+      process.stdout.write('\n');
+      await handleAuthOutput(false);
+      return;
+    }
+
+    const provider = await promptForAuthProvider();
+    await completeAuthLogin(provider);
+    process.stdout.write('\n');
+    await handleAuthOutput(false);
     return;
   }
 

@@ -1,5 +1,6 @@
 import type { ApiMessage, ToolStateUpdate } from '../api/anthropic-client.js';
 import { createClient } from '../api/client-factory.js';
+import { resolveModeBinding } from './mode-resolution.js';
 import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
@@ -71,8 +72,6 @@ export interface DelegationResult {
 
 interface DelegationModeProfile {
   mode: NamedMode;
-  provider: 'anthropic' | 'openai' | 'gemini';
-  defaultModel: string;
   systemPrompt: string;
 }
 
@@ -87,29 +86,21 @@ interface DelegationRuntimeConfig {
 const MODE_PROFILES: Record<NamedMode, DelegationModeProfile> = {
   jennie: {
     mode: 'jennie',
-    provider: 'anthropic',
-    defaultModel: 'claude-opus-4-6',
     systemPrompt:
       'You are JENNIE inside ddudu. Coordinate, verify, and synthesize. Return crisp decisions and merged conclusions.',
   },
   lisa: {
     mode: 'lisa',
-    provider: 'openai',
-    defaultModel: 'gpt-5.4',
     systemPrompt:
       'You are LISA inside ddudu. Execute quickly, minimize deliberation, and return direct implementation-ready results.',
   },
   'rosé': {
     mode: 'rosé',
-    provider: 'anthropic',
-    defaultModel: 'claude-sonnet-4-6',
     systemPrompt:
       'You are ROSÉ inside ddudu. Plan carefully, reason about architecture, and call out tradeoffs and failure modes.',
   },
   jisoo: {
     mode: 'jisoo',
-    provider: 'gemini',
-    defaultModel: 'gemini-2.5-pro',
     systemPrompt:
       'You are JISOO inside ddudu. Focus on UX, interface quality, visual direction, and accessibility.',
   },
@@ -265,8 +256,11 @@ export class DelegationRuntime {
 
   public listAvailableModes(): NamedMode[] {
     return (Object.keys(MODE_PROFILES) as NamedMode[]).filter((mode) => {
-      const provider = MODE_PROFILES[mode].provider;
-      const auth = this.providers.get(provider);
+      const binding = resolveModeBinding(mode, (provider) => {
+        const auth = this.providers.get(provider);
+        return Boolean(auth && !auth.source.includes(':stale'));
+      });
+      const auth = this.providers.get(binding.provider);
       return Boolean(auth && !auth.source.includes(':stale'));
     });
   }
@@ -278,14 +272,18 @@ export class DelegationRuntime {
     const purpose = request.purpose ?? inferPurposeFromPrompt(request.prompt);
     const mode = this.resolveMode(request.preferredMode, purpose);
     const profile = MODE_PROFILES[mode];
-    const provider = profile.provider;
+    const binding = resolveModeBinding(mode, (provider) => {
+      const auth = this.providers.get(provider);
+      return Boolean(auth && !auth.source.includes(':stale'));
+    });
+    const provider = binding.provider;
     const auth = this.providers.get(provider);
 
     if (!auth) {
       throw new Error(`No auth available for delegated mode ${mode} (${provider}).`);
     }
 
-    const model = request.preferredModel ?? this.config.resolveModel?.(mode) ?? profile.defaultModel;
+    const model = request.preferredModel ?? this.config.resolveModel?.(mode) ?? binding.model;
     const baseCwd = request.cwd ?? this.config.cwd;
     const workspace = await this.maybeCreateWorkspace({
       auth,

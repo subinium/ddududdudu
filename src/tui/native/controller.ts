@@ -32,6 +32,7 @@ import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
 import { appendMemory, clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
+import { resolveModeBinding, type HarnessProviderName } from '../../core/mode-resolution.js';
 import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
@@ -3147,13 +3148,30 @@ export class NativeBridgeController {
     });
   }
 
+  private hasResolvedProvider(provider: HarnessProviderName): boolean {
+    const auth = this.availableProviders.get(provider);
+    return Boolean(auth && !auth.source.includes(':stale'));
+  }
+
+  private getModeBinding(mode: NamedMode = this.currentMode) {
+    return resolveModeBinding(mode, (provider) => this.hasResolvedProvider(provider));
+  }
+
   private getCurrentProvider(): string {
-    const mode = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
-    return mode.provider;
+    return this.getModeBinding().provider;
   }
 
   private getCurrentModel(): string {
-    return this.selectedModels[this.currentMode] ?? HARNESS_MODES[this.currentMode].model;
+    const binding = this.getModeBinding();
+    const selected = this.selectedModels[this.currentMode];
+    if (!selected) {
+      return binding.model;
+    }
+
+    const providerName = resolveProviderConfigName(binding.provider);
+    const providerConfig = this.config?.providers[providerName];
+    const availableModels = providerConfig?.models.map((model) => model.id) ?? [];
+    return availableModels.includes(selected) ? selected : binding.model;
   }
 
   private resolveCurrentProviderModels(): string[] {
@@ -3176,12 +3194,20 @@ export class NativeBridgeController {
     this.state.models = this.resolveCurrentProviderModels();
     this.state.modes = MODE_ORDER.map((modeName) => {
       const modeEntry = HARNESS_MODES[modeName];
+      const binding = this.getModeBinding(modeName);
+      const providerName = resolveProviderConfigName(binding.provider);
+      const providerConfig = this.config?.providers[providerName];
+      const selectedModel = this.selectedModels[modeName];
+      const resolvedModel =
+        selectedModel && providerConfig?.models.some((candidate) => candidate.id === selectedModel)
+          ? selectedModel
+          : binding.model;
       return {
         name: modeName,
         label: modeEntry.label,
         tagline: modeEntry.tagline,
-        provider: modeEntry.provider,
-        model: this.selectedModels[modeName] ?? modeEntry.model,
+        provider: binding.provider,
+        model: resolvedModel,
         active: modeName === this.currentMode,
       };
     });
@@ -3268,7 +3294,15 @@ export class NativeBridgeController {
       sessionManager: this.sessionManager,
       worktreeManager: this.worktreeManager,
       resolveModel: (mode: NamedMode): string => {
-        return this.selectedModels[mode] ?? HARNESS_MODES[mode].model;
+        const binding = this.getModeBinding(mode);
+        const selected = this.selectedModels[mode];
+        if (!selected) {
+          return binding.model;
+        }
+
+        const providerName = resolveProviderConfigName(binding.provider);
+        const providerConfig = this.config?.providers[providerName];
+        return providerConfig?.models.some((model) => model.id === selected) ? selected : binding.model;
       },
     });
   }
