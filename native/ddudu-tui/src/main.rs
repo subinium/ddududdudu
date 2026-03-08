@@ -107,6 +107,16 @@ struct NativeAskUserState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct NativePlanItemState {
+    id: String,
+    step: String,
+    status: String,
+    owner: Option<String>,
+    updated_at: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct NativeRequestEstimateState {
     system: u64,
     history: u64,
@@ -131,6 +141,7 @@ struct NativeTuiState {
     models: Vec<String>,
     auth_type: Option<String>,
     auth_source: Option<String>,
+    permission_profile: String,
     loading: bool,
     loading_label: String,
     loading_since: Option<u64>,
@@ -147,6 +158,7 @@ struct NativeTuiState {
     session_id: Option<String>,
     remote_session_id: Option<String>,
     remote_session_count: u64,
+    todos: Vec<NativePlanItemState>,
     error: Option<String>,
 }
 
@@ -362,6 +374,7 @@ impl App {
                 models: Vec::new(),
                 auth_type: None,
                 auth_source: None,
+                permission_profile: "workspace-write".into(),
                 loading: false,
                 loading_label: String::new(),
                 loading_since: None,
@@ -378,6 +391,7 @@ impl App {
                 session_id: None,
                 remote_session_id: None,
                 remote_session_count: 0,
+                todos: Vec::new(),
                 error: None,
             },
             composer: ComposerState::default(),
@@ -661,21 +675,53 @@ impl App {
         }
         push_sidebar_rail_item(
             &mut lines,
-            if self.state.playing_with_fire { "✦" } else { "·" },
-            if self.state.playing_with_fire {
+            if self.state.permission_profile == "permissionless" { "✦" } else { "·" },
+            if self.state.permission_profile == "permissionless" {
                 ERROR
             } else {
                 ACCENT_DIM
             },
-            if self.state.playing_with_fire {
-                "fire on (permissionless)".to_string()
-            } else {
-                "fire off".to_string()
-            },
+            format!("permissions {}", self.state.permission_profile),
             None,
             FG,
             ACCENT_DIM,
         );
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(sidebar_header("Plan"));
+        if self.state.todos.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "no active plan".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
+        } else {
+            for item in self.state.todos.iter().take(6) {
+                let (marker, color) = match item.status.as_str() {
+                    "completed" => ("✓", SUCCESS),
+                    "in_progress" => ("→", ACCENT),
+                    _ => ("·", ACCENT_DIM),
+                };
+                let detail = item
+                    .owner
+                    .as_ref()
+                    .map(|owner| format!("{} · {}", owner, preview_line(&item.id, 6)))
+                    .or_else(|| Some(preview_line(&item.id, 6)));
+                push_sidebar_rail_item(
+                    &mut lines,
+                    marker,
+                    color,
+                    preview_line(&item.step, 28),
+                    detail,
+                    FG,
+                    ACCENT_DIM,
+                );
+            }
+        }
         lines.push(Line::from(Span::raw("")));
 
         lines.push(sidebar_header("Background"));

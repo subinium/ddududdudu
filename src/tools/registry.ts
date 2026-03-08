@@ -1,11 +1,13 @@
 import { askQuestionTool } from './ask-question-tool.js';
 import { bashTool } from './bash-tool.js';
+import { codebaseSearchTool, repoMapTool, symbolSearchTool } from './context-tools.js';
 import { editFileTool, listDirTool, readFileTool, writeFileTool } from './file-tools.js';
 import type { Tool, ToolDefinition, ToolParameter } from './index.js';
 import { memoryTool } from './memory-tool.js';
 import { oracleTool } from './oracle-tool.js';
 import { globTool, grepTool } from './search-tools.js';
 import { taskTool } from './task-tool.js';
+import { updatePlanTool } from './update-plan-tool.js';
 import { webFetchTool } from './web-tool.js';
 
 interface JsonSchema {
@@ -87,11 +89,15 @@ const BUILTIN_TOOLS: Tool[] = [
   bashTool,
   grepTool,
   globTool,
+  repoMapTool,
+  symbolSearchTool,
+  codebaseSearchTool,
   webFetchTool,
   taskTool,
   oracleTool,
   askQuestionTool,
   memoryTool,
+  updatePlanTool,
 ];
 
 export class ToolRegistry {

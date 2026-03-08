@@ -1,4 +1,5 @@
 import type { NamedMode } from '../../core/types.js';
+import type { PermissionProfile, PlanItem, PlanItemStatus } from '../../core/workflow-state.js';
 
 export type NativeMessageRole = 'user' | 'assistant' | 'system' | 'tool';
 export type NativeToolStatus = 'pending' | 'running' | 'done' | 'error';
@@ -48,6 +49,10 @@ export interface NativeAskUserState {
   options: string[];
 }
 
+export interface NativePlanItemState extends Omit<PlanItem, 'status'> {
+  status: PlanItemStatus;
+}
+
 export interface NativeRequestEstimateState {
   system: number;
   history: number;
@@ -69,6 +74,7 @@ export interface NativeTuiState {
   models: string[];
   authType: string | null;
   authSource: string | null;
+  permissionProfile: PermissionProfile;
   loading: boolean;
   loadingLabel: string;
   loadingSince: number | null;
@@ -85,6 +91,7 @@ export interface NativeTuiState {
   sessionId: string | null;
   remoteSessionId: string | null;
   remoteSessionCount: number;
+  todos: NativePlanItemState[];
   error: string | null;
 }
 

@@ -9,7 +9,10 @@ import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
 import { ChecksRunner } from '../../core/checks.js';
 import { loadConfig } from '../../core/config.js';
-import { CompactionEngine } from '../../core/compaction.js';
+import { CompactionEngine, type CompactionMessage } from '../../core/compaction.js';
+import { DriftDetector } from '../../core/drift-detector.js';
+import { EpistemicStateManager } from '../../core/epistemic-state.js';
+import { formatBriefing, generateBriefing, loadBriefing, saveBriefing } from '../../core/briefing.js';
 import { deriveContextProfile, type ContextProfile } from '../../core/context-profile.js';
 import { DelegationRuntime, type DelegationPurpose } from '../../core/delegation.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../../core/default-prompts.js';
@@ -24,6 +27,12 @@ import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import type { DduduConfig, LoadedSession, NamedMode, SessionEntry } from '../../core/types.js';
+import type {
+  PermissionProfile,
+  PlanItem,
+  PlanItemStatus,
+  WorkflowStateSnapshot,
+} from '../../core/workflow-state.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
 import type { ToolContext } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
@@ -78,6 +87,7 @@ type AskUserResolver = {
 const MAX_TOOL_TURNS_FALLBACK = 25;
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
 const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
+const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 
 const normalizeProviders = (
   providers: Map<string, ProviderAuth>,
@@ -174,6 +184,37 @@ const serializeError = (error: unknown): string => {
   return String(error);
 };
 
+const isPlanStatus = (value: unknown): value is PlanItemStatus => {
+  return value === 'pending' || value === 'in_progress' || value === 'completed';
+};
+
+const isPermissionProfile = (value: unknown): value is PermissionProfile => {
+  return value === 'plan' || value === 'ask' || value === 'workspace-write' || value === 'permissionless';
+};
+
+const normalizePermissionProfile = (value: unknown): PermissionProfile => {
+  if (isPermissionProfile(value)) {
+    return value;
+  }
+
+  if (value === 'auto') {
+    return 'workspace-write';
+  }
+
+  if (value === 'deny') {
+    return 'plan';
+  }
+
+  return value === 'ask' ? 'ask' : DEFAULT_PERMISSION_PROFILE;
+};
+
+const toCompactionMessages = (messages: NativeMessageState[]): CompactionMessage[] => {
+  return buildCompactionMessages(messages).map((message) => ({
+    role: message.role,
+    content: message.content,
+  }));
+};
+
 const toErrorMessage = (error: unknown): string => {
   const message = serializeError(error);
   return message.startsWith('[error]') ? message : `[error] ${message}`;
@@ -264,6 +305,18 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
 
       return 'glob search';
     }
+    case 'repo_map': {
+      const path = readString(input.path);
+      return path ? `map ${path}` : 'map repository';
+    }
+    case 'symbol_search': {
+      const query = previewText(readString(input.query), 48);
+      return query ? `symbol ${query}` : 'symbol search';
+    }
+    case 'codebase_search': {
+      const query = previewText(readString(input.query), 48);
+      return query ? `search ${query}` : 'codebase search';
+    }
     case 'web_fetch':
     case 'WebFetch': {
       const url = previewText(readString(input.url), 72);
@@ -296,6 +349,11 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
       const action = readString(input.action) || 'read';
       const scope = readString(input.scope);
       return scope ? `memory ${action} ${scope}` : `memory ${action}`;
+    }
+    case 'update_plan': {
+      const action = readString(input.action) || 'list';
+      const step = previewText(readString(input.step), 60);
+      return step ? `plan ${action} ${step}` : `plan ${action}`;
     }
     case 'ToolSearch': {
       const query = previewText(readString(input.query), 60);
@@ -472,6 +530,7 @@ export class NativeBridgeController {
     models: [],
     authType: null,
     authSource: null,
+    permissionProfile: DEFAULT_PERMISSION_PROFILE,
     loading: false,
     loadingLabel: '',
     loadingSince: null,
@@ -492,6 +551,7 @@ export class NativeBridgeController {
     sessionId: null,
     remoteSessionId: null,
     remoteSessionCount: 0,
+    todos: [],
     error: null,
   };
 
@@ -510,6 +570,10 @@ export class NativeBridgeController {
   private readonly loadedSkills = new Map<string, LoadedSkill>();
   private tokenCounter = new TokenCounter(BLACKPINK_MODES.jennie.model);
   private systemPrompt = buildFallbackSystemPrompt('jennie');
+  private permissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
+  private lastSafePermissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
+  private todos: PlanItem[] = [];
+  private readonly epistemicState = new EpistemicStateManager();
   private abortController: AbortController | null = null;
   private activeOperation: 'request' | 'team' | null = null;
   private activeAssistantMessageId: string | null = null;
@@ -532,7 +596,11 @@ export class NativeBridgeController {
     this.config = await loadConfig();
     this.currentMode = clampMode(this.config.mode);
     this.state.mode = this.currentMode;
-    this.state.playingWithFire = this.config.tools.permission === 'auto';
+    this.permissionProfile = normalizePermissionProfile(this.config.tools.permission);
+    this.lastSafePermissionProfile =
+      this.permissionProfile === 'permissionless' ? DEFAULT_PERMISSION_PROFILE : this.permissionProfile;
+    this.state.permissionProfile = this.permissionProfile;
+    this.state.playingWithFire = this.permissionProfile === 'permissionless';
     this.systemPrompt = buildFallbackSystemPrompt(
       this.currentMode,
       this.selectedModels[this.currentMode],
@@ -590,6 +658,7 @@ export class NativeBridgeController {
 
     await this.refreshSystemPrompt();
     this.reconfigureClient();
+    await this.restoreEpistemicState();
     this.state.ready = true;
     this.emitStateNow();
   }
@@ -623,6 +692,16 @@ export class NativeBridgeController {
       content: trimmed,
       timestamp: Date.now(),
     });
+    if (this.sessionManager && this.state.sessionId) {
+      void this.sessionManager.append(this.state.sessionId, {
+        type: 'message',
+        timestamp: new Date().toISOString(),
+        data: {
+          system: trimmed,
+          mode: this.currentMode,
+        },
+      });
+    }
     this.scheduleStatePush();
   }
 
@@ -671,8 +750,17 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /memory, /session, /config, /help, /doctor, /review, /quit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /review, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
         );
+        return;
+      case '/plan':
+        this.appendSystemMessage(this.formatPlanSummary());
+        return;
+      case '/todo':
+        this.appendSystemMessage(await this.runTodoCommand(rest));
+        return;
+      case '/permissions':
+        this.appendSystemMessage(await this.runPermissionsCommand(rest));
         return;
       case '/config':
         this.appendSystemMessage(this.formatConfigSummary());
@@ -682,6 +770,24 @@ export class NativeBridgeController {
         return;
       case '/review':
         this.appendSystemMessage(await this.runReviewSummary());
+        return;
+      case '/checkpoint':
+        this.appendSystemMessage(await this.runCheckpointCommand(rest.join(' ')));
+        return;
+      case '/undo':
+        this.appendSystemMessage(await this.runUndoCommand());
+        return;
+      case '/handoff':
+        this.appendSystemMessage(await this.runHandoffCommand(rest.join(' ')));
+        return;
+      case '/fork':
+        this.appendSystemMessage(await this.runForkCommand(rest.join(' ')));
+        return;
+      case '/briefing':
+        this.appendSystemMessage(await this.runBriefingCommand());
+        return;
+      case '/drift':
+        this.appendSystemMessage(await this.runDriftCommand());
         return;
       case '/session':
         this.appendSystemMessage(await this.formatSessionSummary());
@@ -735,6 +841,7 @@ export class NativeBridgeController {
       provider: this.getCurrentProvider(),
       model: this.getCurrentModel(),
     });
+    void this.persistWorkflowState('mode_switch');
     this.scheduleStatePush();
   }
 
@@ -748,12 +855,16 @@ export class NativeBridgeController {
     this.selectedModels[this.currentMode] = model;
     this.reconfigureClient();
     void this.refreshSystemPrompt();
+    void this.persistWorkflowState('model_switch');
     this.scheduleStatePush();
   }
 
   public toggleFire(): void {
-    this.state.playingWithFire = !this.state.playingWithFire;
-    this.scheduleStatePush();
+    const nextProfile =
+      this.permissionProfile === 'permissionless'
+        ? this.lastSafePermissionProfile
+        : 'permissionless';
+    void this.setPermissionProfile(nextProfile);
   }
 
   public answerAskUser(answer: string): void {
@@ -1430,6 +1541,67 @@ export class NativeBridgeController {
     };
   }
 
+  private classifyToolRisk(name: string, input: Record<string, unknown>): 'read' | 'write' | 'dangerous' {
+    if (name === 'read_file' || name === 'list_dir' || name === 'grep' || name === 'glob' || name === 'web_fetch' || name === 'repo_map' || name === 'symbol_search' || name === 'codebase_search' || name === 'ask_question' || name === 'oracle') {
+      return 'read';
+    }
+
+    if (name === 'memory') {
+      const action = readString(input.action) || 'read';
+      return action === 'read' ? 'read' : 'write';
+    }
+
+    if (name === 'write_file' || name === 'edit_file' || name === 'update_plan') {
+      return 'write';
+    }
+
+    if (name.startsWith('mcp__') || name === 'bash' || name === 'task') {
+      return 'dangerous';
+    }
+
+    return 'dangerous';
+  }
+
+  private async authorizeToolExecution(
+    block: ToolUseBlock,
+    toolContext: ToolContext,
+  ): Promise<{ allowed: boolean; reason?: string }> {
+    const input = typeof block.input === 'object' && block.input !== null ? block.input as Record<string, unknown> : {};
+    const risk = this.classifyToolRisk(block.name, input);
+
+    if (this.permissionProfile === 'permissionless') {
+      return { allowed: true };
+    }
+
+    if (this.permissionProfile === 'plan') {
+      if (risk === 'read') {
+        return { allowed: true };
+      }
+      return { allowed: false, reason: `Blocked ${block.name}: current permission profile is plan (read-only).` };
+    }
+
+    if (this.permissionProfile === 'workspace-write') {
+      if (risk !== 'dangerous') {
+        return { allowed: true };
+      }
+    } else if (this.permissionProfile === 'ask' && risk === 'read') {
+      return { allowed: true };
+    }
+
+    const summary = summarizeToolInput(block.name, input);
+    const answer = toolContext.askUser
+      ? await toolContext.askUser(
+        `Allow ${summary}?`,
+        ['Allow once', `Deny (${this.permissionProfile})`],
+      )
+      : 'Deny';
+
+    return {
+      allowed: answer.toLowerCase().includes('allow'),
+      reason: `Denied ${block.name}: approval was not granted.`,
+    };
+  }
+
   private async executeToolCalls(
     blocks: ToolUseBlock[],
     context: { assistantMessageId: string; signal: AbortSignal },
@@ -1445,100 +1617,134 @@ export class NativeBridgeController {
     }
 
     const anthropicAuth = this.availableProviders.get('anthropic') ?? this.availableProviders.get('claude');
+    const results: ToolResultBlock[] = [];
 
-    return Promise.all(
-      blocks.map(async (block): Promise<ToolResultBlock> => {
-        const tool = registry.get(block.name);
-        if (!tool) {
-          this.setToolStatus(context.assistantMessageId, block.id, 'error', `Unknown tool: ${block.name}`);
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: `Unknown tool: ${block.name}`,
-            is_error: true,
-          };
-        }
+    for (const block of blocks) {
+      const tool = registry.get(block.name);
+      if (!tool) {
+        this.setToolStatus(context.assistantMessageId, block.id, 'error', `Unknown tool: ${block.name}`);
+        results.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: `Unknown tool: ${block.name}`,
+          is_error: true,
+        });
+        continue;
+      }
 
-        let progress = '';
-        const toolContext: ToolContext = {
-          cwd: process.cwd(),
-          abortSignal: context.signal,
-          authToken: anthropicAuth?.token,
-          authBaseUrl: process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
-          delegation: this.createDelegationRuntime(),
-          sessionId: this.state.sessionId ?? undefined,
-          currentMode: this.currentMode,
-          askUser: (question: string, options?: string[]): Promise<string> => {
-            return new Promise<string>((resolve, reject) => {
-              this.pendingAskUser = { resolve, reject };
-              this.state.askUser = {
-                question,
-                options: options ?? [],
-              };
-              this.scheduleStatePush();
-            });
+      let progress = '';
+      const toolContext: ToolContext = {
+        cwd: process.cwd(),
+        abortSignal: context.signal,
+        authToken: anthropicAuth?.token,
+        authBaseUrl: process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
+        delegation: this.createDelegationRuntime(),
+        sessionId: this.state.sessionId ?? undefined,
+        currentMode: this.currentMode,
+        permissionProfile: this.permissionProfile,
+        setPermissionProfile: async (profile): Promise<void> => {
+          await this.setPermissionProfile(profile);
+        },
+        plan: {
+          list: (): PlanItem[] => [...this.todos],
+          replace: async (items): Promise<void> => {
+            await this.replacePlan(items);
           },
-          onProgress: (text: string): void => {
-            progress += text;
-            this.setToolStatus(
-              context.assistantMessageId,
-              block.id,
-              'running',
-              summarizeToolResult(progress),
-            );
+          add: async (step, status, owner): Promise<void> => {
+            await this.addPlanItem(step, status, owner);
           },
-        };
-
-        try {
-          await this.hookRegistry.emit('beforeToolCall', {
-            tool: block.name,
-            input: block.input,
-            sessionId: this.state.sessionId,
+          update: async (stepOrId, updates): Promise<void> => {
+            await this.updatePlanItem(stepOrId, updates);
+          },
+          clear: async (): Promise<void> => {
+            await this.clearPlan();
+          },
+        },
+        askUser: (question: string, options?: string[]): Promise<string> => {
+          return new Promise<string>((resolve, reject) => {
+            this.pendingAskUser = { resolve, reject };
+            this.state.askUser = {
+              question,
+              options: options ?? [],
+            };
+            this.scheduleStatePush();
           });
-          const result = await tool.execute(block.input, toolContext);
+        },
+        onProgress: (text: string): void => {
+          progress += text;
           this.setToolStatus(
             context.assistantMessageId,
             block.id,
-            result.isError ? 'error' : 'done',
-            summarizeToolResult(result.output),
+            'running',
+            summarizeToolResult(progress),
           );
-          await this.hookRegistry.emit('afterToolCall', {
-            tool: block.name,
-            input: block.input,
-            output: result.output,
-            isError: result.isError ?? false,
-            sessionId: this.state.sessionId,
-          });
+        },
+      };
 
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: result.output,
-            is_error: result.isError || undefined,
-          };
-        } catch (error: unknown) {
-          const message = serializeError(error);
-          this.setToolStatus(
-            context.assistantMessageId,
-            block.id,
-            'error',
-            summarizeToolResult(message),
-          );
-          await this.hookRegistry.emit('onError', {
-            tool: block.name,
-            input: block.input,
-            error: message,
-            sessionId: this.state.sessionId,
-          });
-          return {
-            type: 'tool_result',
-            tool_use_id: block.id,
-            content: message,
-            is_error: true,
-          };
-        }
-      }),
-    );
+      const authorization = await this.authorizeToolExecution(block, toolContext);
+      if (!authorization.allowed) {
+        const message = authorization.reason ?? `Tool blocked by permission profile ${this.permissionProfile}`;
+        this.setToolStatus(context.assistantMessageId, block.id, 'error', summarizeToolResult(message));
+        results.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: message,
+          is_error: true,
+        });
+        continue;
+      }
+
+      try {
+        await this.hookRegistry.emit('beforeToolCall', {
+          tool: block.name,
+          input: block.input,
+          sessionId: this.state.sessionId,
+        });
+        const result = await tool.execute(block.input, toolContext);
+        this.setToolStatus(
+          context.assistantMessageId,
+          block.id,
+          result.isError ? 'error' : 'done',
+          summarizeToolResult(result.output),
+        );
+        await this.hookRegistry.emit('afterToolCall', {
+          tool: block.name,
+          input: block.input,
+          output: result.output,
+          isError: result.isError ?? false,
+          sessionId: this.state.sessionId,
+        });
+
+        results.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: result.output,
+          is_error: result.isError || undefined,
+        });
+      } catch (error: unknown) {
+        const message = serializeError(error);
+        this.setToolStatus(
+          context.assistantMessageId,
+          block.id,
+          'error',
+          summarizeToolResult(message),
+        );
+        await this.hookRegistry.emit('onError', {
+          tool: block.name,
+          input: block.input,
+          error: message,
+          sessionId: this.state.sessionId,
+        });
+        results.push({
+          type: 'tool_result',
+          tool_use_id: block.id,
+          content: message,
+          is_error: true,
+        });
+      }
+    }
+
+    return results;
   }
 
   private async refreshSystemPrompt(): Promise<void> {
@@ -1580,12 +1786,196 @@ export class NativeBridgeController {
         // Memory is optional; keep prompt generation resilient.
       }
 
+      const planSummary = this.formatPlanSummary();
+      prompt += `\n\n<workflow>\npermission_profile: ${this.permissionProfile}\n${planSummary}\n</workflow>`;
+
       this.systemPrompt = prompt;
     } catch {
       this.systemPrompt = buildFallbackSystemPrompt(mode, model);
     }
 
     this.syncUsageState();
+  }
+
+  private getWorkflowSnapshot(): WorkflowStateSnapshot {
+    return {
+      mode: this.currentMode,
+      selectedModels: { ...this.selectedModels },
+      permissionProfile: this.permissionProfile,
+      todos: this.todos.map((item) => ({ ...item })),
+      remoteSessions: Array.from(this.remoteSessions.values()).map((session) => ({ ...session })),
+    };
+  }
+
+  private async persistWorkflowState(
+    reason: string,
+    sessionId: string = this.state.sessionId ?? '',
+    snapshot: WorkflowStateSnapshot = this.getWorkflowSnapshot(),
+  ): Promise<void> {
+    if (!this.sessionManager || !sessionId) {
+      return;
+    }
+
+    await this.sessionManager.append(sessionId, {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      data: {
+        kind: 'controller_state',
+        reason,
+        controllerState: snapshot,
+      },
+    });
+  }
+
+  private parseWorkflowSnapshot(entry: SessionEntry): WorkflowStateSnapshot | null {
+    const snapshot = entry.data.controllerState;
+    if (typeof snapshot !== 'object' || snapshot === null) {
+      return null;
+    }
+
+    const record = snapshot as Record<string, unknown>;
+    const mode =
+      record.mode === 'jennie' || record.mode === 'lisa' || record.mode === 'rosé' || record.mode === 'jisoo'
+        ? record.mode
+        : this.currentMode;
+    const permissionProfile = normalizePermissionProfile(record.permissionProfile);
+    const selectedModelsRecord = typeof record.selectedModels === 'object' && record.selectedModels !== null
+      ? (record.selectedModels as Record<string, unknown>)
+      : {};
+    const selectedModels: Record<NamedMode, string> = {
+      jennie: typeof selectedModelsRecord.jennie === 'string' ? selectedModelsRecord.jennie : this.selectedModels.jennie,
+      lisa: typeof selectedModelsRecord.lisa === 'string' ? selectedModelsRecord.lisa : this.selectedModels.lisa,
+      'rosé': typeof selectedModelsRecord['rosé'] === 'string' ? selectedModelsRecord['rosé'] : this.selectedModels['rosé'],
+      jisoo: typeof selectedModelsRecord.jisoo === 'string' ? selectedModelsRecord.jisoo : this.selectedModels.jisoo,
+    };
+    const todos = Array.isArray(record.todos)
+      ? record.todos
+          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+          .map((item) => ({
+            id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
+            step: typeof item.step === 'string' ? item.step.trim() : '',
+            status: isPlanStatus(item.status) ? item.status : 'pending',
+            owner: typeof item.owner === 'string' && item.owner.trim() ? item.owner.trim() : undefined,
+            updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : entry.timestamp,
+          }))
+          .filter((item) => item.step.length > 0)
+      : [];
+    const remoteSessions = Array.isArray(record.remoteSessions)
+      ? record.remoteSessions
+          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+          .map((item) => ({
+            provider: typeof item.provider === 'string' ? item.provider : '',
+            sessionId: typeof item.sessionId === 'string' ? item.sessionId : '',
+            syncedMessageCount: typeof item.syncedMessageCount === 'number' ? item.syncedMessageCount : 0,
+            lastModel: typeof item.lastModel === 'string' ? item.lastModel : '',
+            lastUsedAt: typeof item.lastUsedAt === 'number' ? item.lastUsedAt : Date.parse(entry.timestamp),
+          }))
+          .filter((item) => item.provider && item.sessionId)
+      : [];
+
+    return {
+      mode,
+      selectedModels,
+      permissionProfile,
+      todos,
+      remoteSessions,
+    };
+  }
+
+  private async setPermissionProfile(profile: PermissionProfile): Promise<void> {
+    this.permissionProfile = profile;
+    if (profile !== 'permissionless') {
+      this.lastSafePermissionProfile = profile;
+    }
+    this.state.permissionProfile = profile;
+    this.state.playingWithFire = profile === 'permissionless';
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('permission_profile');
+  }
+
+  private formatPlanSummary(): string {
+    if (this.todos.length === 0) {
+      return 'plan: none';
+    }
+
+    return [
+      'plan:',
+      ...this.todos.map((item, index) => `${index + 1}. [${item.status}] ${item.step}${item.owner ? ` · ${item.owner}` : ''}`),
+    ].join('\n');
+  }
+
+  private async replacePlan(items: PlanItem[]): Promise<void> {
+    this.todos = items.map((item) => ({ ...item }));
+    this.state.todos = this.todos.map((item) => ({ ...item }));
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('plan_replace');
+  }
+
+  private async addPlanItem(
+    step: string,
+    status: PlanItemStatus = 'pending',
+    owner?: string,
+  ): Promise<void> {
+    this.todos.push({
+      id: randomUUID(),
+      step: step.trim(),
+      status,
+      owner,
+      updatedAt: new Date().toISOString(),
+    });
+    this.state.todos = this.todos.map((item) => ({ ...item }));
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('plan_add');
+  }
+
+  private async updatePlanItem(
+    stepOrId: string,
+    updates: { status?: PlanItemStatus; owner?: string },
+  ): Promise<void> {
+    const match = this.todos.find((item) => item.id === stepOrId || item.step === stepOrId);
+    if (!match) {
+      throw new Error(`Plan item not found: ${stepOrId}`);
+    }
+
+    if (updates.status) {
+      match.status = updates.status;
+    }
+    if (updates.owner !== undefined) {
+      match.owner = updates.owner;
+    }
+    match.updatedAt = new Date().toISOString();
+    this.state.todos = this.todos.map((item) => ({ ...item }));
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('plan_update');
+  }
+
+  private async clearPlan(): Promise<void> {
+    this.todos = [];
+    this.state.todos = [];
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('plan_clear');
+  }
+
+  private getSessionArtifactDirectory(sessionId: string = this.state.sessionId ?? ''): string | null {
+    if (!this.sessionManager || !sessionId) {
+      return null;
+    }
+
+    return this.sessionManager.getArtifactDirectory(sessionId);
+  }
+
+  private async restoreEpistemicState(): Promise<void> {
+    const artifactDir = this.getSessionArtifactDirectory();
+    if (!artifactDir) {
+      return;
+    }
+
+    await this.epistemicState.load(artifactDir);
   }
 
   private async resumeRequestedSession(): Promise<boolean> {
@@ -1609,6 +1999,7 @@ export class NativeBridgeController {
   private restoreSession(session: LoadedSession): void {
     let restoredMessages: NativeMessageState[] = [];
     let restoredMode: NamedMode | null = null;
+    let restoredSnapshot: WorkflowStateSnapshot | null = null;
 
     for (const entry of session.entries) {
       const timestamp = Date.parse(entry.timestamp);
@@ -1641,8 +2032,15 @@ export class NativeBridgeController {
         continue;
       }
 
+      const snapshot = this.parseWorkflowSnapshot(entry);
+      if (snapshot) {
+        restoredSnapshot = snapshot;
+        continue;
+      }
+
       const user = getEntryString(entry, 'user');
       const assistant = getEntryString(entry, 'assistant');
+      const system = getEntryString(entry, 'system');
       const mode = getEntryString(entry, 'mode');
       const entryMode =
         mode === 'jennie' || mode === 'lisa' || mode === 'rosé' || mode === 'jisoo'
@@ -1670,23 +2068,47 @@ export class NativeBridgeController {
           timestamp: baseTimestamp + 1,
         });
       }
+
+      if (system) {
+        restoredMessages.push({
+          id: randomUUID(),
+          role: 'system',
+          content: system,
+          timestamp: baseTimestamp + 2,
+        });
+      }
     }
 
     const inferredMode =
+      restoredSnapshot?.mode ??
       restoredMode ??
       findModeForProviderModel(session.header.provider, session.header.model) ??
       this.currentMode;
 
     this.currentMode = inferredMode;
     this.state.mode = inferredMode;
+    this.remoteSessions.clear();
 
-    if (session.header.model) {
+    if (restoredSnapshot) {
+      this.selectedModels = { ...restoredSnapshot.selectedModels };
+      this.permissionProfile = restoredSnapshot.permissionProfile;
+      this.lastSafePermissionProfile =
+        this.permissionProfile === 'permissionless' ? DEFAULT_PERMISSION_PROFILE : this.permissionProfile;
+      this.state.permissionProfile = this.permissionProfile;
+      this.state.playingWithFire = this.permissionProfile === 'permissionless';
+      this.todos = restoredSnapshot.todos.map((item) => ({ ...item }));
+      this.state.todos = this.todos.map((item) => ({ ...item }));
+      for (const remoteSession of restoredSnapshot.remoteSessions) {
+        this.remoteSessions.set(remoteSession.provider, { ...remoteSession });
+      }
+    }
+
+    if (session.header.model && !restoredSnapshot) {
       this.selectedModels[inferredMode] = session.header.model;
     }
 
     this.state.sessionId = session.header.id;
     this.state.messages = restoredMessages;
-    this.remoteSessions.clear();
     this.updateRemoteSessionState();
   }
 
@@ -1768,6 +2190,9 @@ export class NativeBridgeController {
     const providerAuth = this.availableProviders.get(provider);
     this.state.authType = providerAuth?.tokenType ?? null;
     this.state.authSource = providerAuth?.source ?? null;
+    this.state.permissionProfile = this.permissionProfile;
+    this.state.playingWithFire = this.permissionProfile === 'permissionless';
+    this.state.todos = this.todos.map((item) => ({ ...item }));
 
     if (providerAuth) {
       this.activeClient = createClient(provider, providerAuth.token, providerAuth.tokenType);
@@ -1907,8 +2332,9 @@ export class NativeBridgeController {
       `provider: ${this.state.provider}`,
       `model: ${this.state.model}`,
       `auth: ${authLabel}`,
-      `fire mode: ${this.state.playingWithFire ? 'on' : 'off'}`,
+      `permissions: ${this.permissionProfile}`,
       `session: ${this.state.sessionId ?? 'none'}`,
+      `plan items: ${this.todos.length}`,
       `skills loaded: ${this.loadedSkills.size}`,
       `tools: ${this.toolRegistry?.list().length ?? 0}`,
     ].join('\n');
@@ -1940,6 +2366,8 @@ export class NativeBridgeController {
       `working set: ${profile.canonicalWorkingSetTokens.toLocaleString()} · auto compact at ${profile.autoCompactAtTokens.toLocaleString()}`,
       `next ${estimate.mode}: system ${estimate.system.toLocaleString()} + history ${estimate.history.toLocaleString()} + tools ${estimate.tools.toLocaleString()} + prompt ${estimate.prompt.toLocaleString()} = ~${estimate.total.toLocaleString()}`,
       ...(estimate.note ? [`note: ${estimate.note}`] : []),
+      `permissions: ${this.permissionProfile}`,
+      `plan items: ${this.todos.length}`,
       `skills loaded: ${this.loadedSkills.size}`,
       `remote bridge sessions: ${this.remoteSessions.size}`,
       `background queue: ${queue}`,
@@ -2048,6 +2476,223 @@ export class NativeBridgeController {
     } catch (error: unknown) {
       return `Review failed: ${serializeError(error)}`;
     }
+  }
+
+  private async runPermissionsCommand(args: string[]): Promise<string> {
+    const requested = args[0]?.trim().toLowerCase();
+    if (!requested) {
+      return `Permissions\ncurrent: ${this.permissionProfile}\nprofiles: plan, ask, workspace-write, permissionless`;
+    }
+
+    const nextProfile =
+      requested === 'workspace' ? 'workspace-write'
+        : requested === 'full' ? 'permissionless'
+          : requested;
+
+    if (!isPermissionProfile(nextProfile)) {
+      return 'Usage: /permissions <plan|ask|workspace-write|permissionless>';
+    }
+
+    await this.setPermissionProfile(nextProfile);
+    return `Permissions updated: ${nextProfile}`;
+  }
+
+  private async runTodoCommand(args: string[]): Promise<string> {
+    const [action, ...rest] = args;
+    const trimmedAction = action?.trim().toLowerCase() ?? '';
+
+    if (!trimmedAction) {
+      return this.formatPlanSummary();
+    }
+
+    if (trimmedAction === 'clear') {
+      await this.clearPlan();
+      return 'Plan cleared.';
+    }
+
+    if (trimmedAction === 'add') {
+      const step = rest.join(' ').trim();
+      if (!step) {
+        return 'Usage: /todo add <step>';
+      }
+      await this.addPlanItem(step);
+      return this.formatPlanSummary();
+    }
+
+    if (trimmedAction === 'doing' || trimmedAction === 'done' || trimmedAction === 'pending') {
+      const stepOrId = rest.join(' ').trim();
+      if (!stepOrId) {
+        return `Usage: /todo ${trimmedAction} <step-or-id>`;
+      }
+      await this.updatePlanItem(stepOrId, {
+        status: trimmedAction === 'doing'
+          ? 'in_progress'
+          : trimmedAction === 'done'
+            ? 'completed'
+            : 'pending',
+      });
+      return this.formatPlanSummary();
+    }
+
+    return 'Usage: /todo [add|doing|done|pending|clear] ...';
+  }
+
+  private async runCheckpointCommand(message: string): Promise<string> {
+    if (!this.config?.git_checkpoint) {
+      return 'Checkpointing disabled in config.';
+    }
+
+    const git = new GitCheckpoint(process.cwd());
+    if (!(await git.isAvailable())) {
+      return 'Checkpoint unavailable: not a git repository.';
+    }
+
+    const hash = await git.checkpoint(message || 'checkpoint');
+    return hash ? `Checkpoint created: ${hash.slice(0, 8)}` : 'Checkpoint skipped: no changes to commit.';
+  }
+
+  private async runUndoCommand(): Promise<string> {
+    const git = new GitCheckpoint(process.cwd());
+    if (!(await git.isAvailable())) {
+      return 'Undo unavailable: not a git repository.';
+    }
+
+    const success = await git.undo();
+    return success ? 'Reverted last ddudu checkpoint.' : 'No ddudu checkpoint to undo.';
+  }
+
+  private async seedSessionMessages(
+    sessionId: string,
+    messages: NativeMessageState[],
+    mode: NamedMode = this.currentMode,
+  ): Promise<void> {
+    if (!this.sessionManager) {
+      return;
+    }
+
+    for (const message of messages) {
+      const data: Record<string, unknown> = { mode };
+      if (message.role === 'user') {
+        data.user = message.content;
+      } else if (message.role === 'assistant') {
+        data.assistant = message.content;
+      } else if (message.role === 'system') {
+        data.system = message.content;
+      } else {
+        continue;
+      }
+
+      await this.sessionManager.append(sessionId, {
+        type: 'message',
+        timestamp: new Date(message.timestamp).toISOString(),
+        data,
+      });
+    }
+
+    await this.persistWorkflowState('seed_session', sessionId);
+  }
+
+  private async runForkCommand(name: string): Promise<string> {
+    if (!this.sessionManager) {
+      return 'Fork unavailable: no session manager.';
+    }
+
+    const parentId = this.state.sessionId ?? undefined;
+    const session = await this.sessionManager.create({
+      parentId,
+      provider: this.getCurrentProvider(),
+      model: this.getCurrentModel(),
+      title: name.trim() || `fork:${this.currentMode}`,
+    });
+    await this.seedSessionMessages(session.id, this.state.messages);
+    this.state.sessionId = session.id;
+    await this.restoreEpistemicState();
+    this.appendSystemMessage(`Forked session ${session.id.slice(0, 8)} from parent ${parentId?.slice(0, 8) ?? 'none'}.`);
+    void this.persistWorkflowState('fork');
+    return `Forked to new session: ${session.id}`;
+  }
+
+  private async runHandoffCommand(goal: string): Promise<string> {
+    if (!this.sessionManager) {
+      return 'Handoff unavailable: no session manager.';
+    }
+
+    const trimmedGoal = goal.trim();
+    if (!trimmedGoal) {
+      return 'Usage: /handoff <goal>';
+    }
+
+    const handoff = await this.compactionEngine.handoff(trimmedGoal, toCompactionMessages(this.state.messages));
+    const session = await this.sessionManager.create({
+      parentId: this.state.sessionId ?? undefined,
+      provider: this.getCurrentProvider(),
+      model: this.getCurrentModel(),
+      title: `handoff:${trimmedGoal.slice(0, 48)}`,
+    });
+
+    const now = Date.now();
+    const nextMessages: NativeMessageState[] = [
+      {
+        id: randomUUID(),
+        role: 'system',
+        content: `Handoff created from previous session. Goal: ${trimmedGoal}`,
+        timestamp: now,
+      },
+      {
+        id: randomUUID(),
+        role: 'user',
+        content: handoff.summary,
+        timestamp: now + 1,
+      },
+      {
+        id: randomUUID(),
+        role: 'assistant',
+        content: 'Handoff loaded. Continue from this compact context.',
+        timestamp: now + 2,
+      },
+    ];
+
+    await this.seedSessionMessages(session.id, nextMessages);
+    this.state.sessionId = session.id;
+    this.state.messages = nextMessages;
+    this.remoteSessions.clear();
+    this.updateRemoteSessionState();
+    await this.restoreEpistemicState();
+    void this.persistWorkflowState('handoff');
+    this.scheduleStatePush();
+    return [
+      `Handoff created: ${session.id}`,
+      `Relevant files: ${handoff.relevantFiles.join(', ') || 'none'}`,
+      '',
+      handoff.summary,
+    ].join('\n');
+  }
+
+  private async runBriefingCommand(): Promise<string> {
+    const artifactDir = this.getSessionArtifactDirectory();
+    if (!artifactDir) {
+      return 'Briefing unavailable: no active session.';
+    }
+
+    const briefing = generateBriefing(toCompactionMessages(this.state.messages), this.epistemicState.getState());
+    await saveBriefing(briefing, artifactDir);
+    await this.epistemicState.save(artifactDir);
+    return formatBriefing(briefing);
+  }
+
+  private async runDriftCommand(): Promise<string> {
+    const artifactDir = this.getSessionArtifactDirectory();
+    if (!artifactDir) {
+      return 'Drift check unavailable: no active session.';
+    }
+
+    const briefing = await loadBriefing(artifactDir);
+    if (!briefing) {
+      return 'Drift check unavailable: run /briefing first.';
+    }
+
+    const detector = new DriftDetector(process.cwd());
+    return detector.formatReport(await detector.detect(briefing));
   }
 
   private formatMcpSummary(): string {
@@ -2466,12 +3111,14 @@ export class NativeBridgeController {
   private rememberRemoteSession(session: BridgeSessionState): void {
     this.remoteSessions.set(session.provider, session);
     this.updateRemoteSessionState();
+    void this.persistWorkflowState('remote_session_update');
     this.scheduleStatePush();
   }
 
   private invalidateRemoteSession(provider: string): void {
     this.remoteSessions.delete(provider);
     this.updateRemoteSessionState();
+    void this.persistWorkflowState('remote_session_invalidate');
   }
 
   private async prepareRequestPlan(
@@ -2656,6 +3303,7 @@ export class NativeBridgeController {
         providers: this.state.providers.map((provider) => ({ ...provider })),
         modes: this.state.modes.map((mode) => ({ ...mode })),
         slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
+        todos: this.state.todos.map((item) => ({ ...item })),
         askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
       },
     });

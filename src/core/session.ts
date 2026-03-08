@@ -158,6 +158,14 @@ export class SessionManager {
       );
   }
 
+  public getSessionDirectory(): string {
+    return this.sessionDirectory;
+  }
+
+  public getArtifactDirectory(sessionId: string): string {
+    return resolve(this.sessionDirectory, sessionId);
+  }
+
   private getSessionFilePath(sessionId: string): string {
     return resolve(this.sessionDirectory, `${sessionId}.jsonl`);
   }
