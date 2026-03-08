@@ -35,6 +35,8 @@ import type {
   PermissionProfile,
   PlanItem,
   PlanItemStatus,
+  WorkflowArtifact,
+  WorkflowArtifactKind,
   WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
@@ -103,6 +105,11 @@ interface BackgroundJobState {
   detail: string | null;
   startedAt: number;
   updatedAt: number;
+  prompt?: string;
+  purpose?: DelegationPurpose | 'general';
+  preferredMode?: NamedMode | null;
+  strategy?: 'parallel' | 'sequential' | 'delegate';
+  controller?: AbortController | null;
 }
 
 type EmitFn = (event: NativeBridgeEvent) => void;
@@ -222,6 +229,16 @@ const isPlanStatus = (value: unknown): value is PlanItemStatus => {
 
 const isPermissionProfile = (value: unknown): value is PermissionProfile => {
   return value === 'plan' || value === 'ask' || value === 'workspace-write' || value === 'permissionless';
+};
+
+const isArtifactKind = (value: unknown): value is WorkflowArtifactKind => {
+  return value === 'answer'
+    || value === 'plan'
+    || value === 'review'
+    || value === 'design'
+    || value === 'patch'
+    || value === 'briefing'
+    || value === 'research';
 };
 
 const normalizePermissionProfile = (value: unknown): PermissionProfile => {
@@ -597,6 +614,7 @@ export class NativeBridgeController {
     todos: [],
     agentActivities: [],
     backgroundJobs: [],
+    artifacts: [],
     workspace: null,
     verification: null,
     error: null,
@@ -622,6 +640,7 @@ export class NativeBridgeController {
   private todos: PlanItem[] = [];
   private agentActivities: AgentActivityState[] = [];
   private backgroundJobs: BackgroundJobState[] = [];
+  private artifacts: WorkflowArtifact[] = [];
   private readonly epistemicState = new EpistemicStateManager();
   private abortController: AbortController | null = null;
   private activeOperation: 'request' | 'team' | null = null;
@@ -801,7 +820,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
         );
         return;
       case '/plan':
@@ -824,6 +843,15 @@ export class NativeBridgeController {
         return;
       case '/review':
         this.appendSystemMessage(await this.runReviewSummary());
+        return;
+      case '/queue':
+        this.appendSystemMessage(await this.runQueueCommand(rest));
+        return;
+      case '/jobs':
+        this.appendSystemMessage(await this.runJobsCommand(rest));
+        return;
+      case '/artifacts':
+        this.appendSystemMessage(this.formatArtifactSummary());
         return;
       case '/checkpoint':
         this.appendSystemMessage(await this.runCheckpointCommand(rest.join(' ')));
@@ -1427,6 +1455,9 @@ export class NativeBridgeController {
         : `delegate ${decision.purpose ?? 'general'}`,
       status: 'running',
       detail: previewText(userMessage.content, 72),
+      prompt: userMessage.content,
+      purpose: decision.purpose ?? 'general',
+      preferredMode: decision.preferredMode ?? null,
     });
     this.updateAgentActivity({
       id: routeActivityId,
@@ -1440,6 +1471,19 @@ export class NativeBridgeController {
     this.scheduleStatePush();
 
     const controller = new AbortController();
+    this.updateBackgroundJob({
+      id: backgroundJobId,
+      kind: 'delegate',
+      label: decision.preferredMode
+        ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+        : `delegate ${decision.purpose ?? 'general'}`,
+      status: 'running',
+      detail: previewText(userMessage.content, 72),
+      prompt: userMessage.content,
+      purpose: decision.purpose ?? 'general',
+      preferredMode: decision.preferredMode ?? null,
+      controller,
+    });
     void (async () => {
       try {
         const contextSnapshot = await this.buildPromptContextSnapshot(
@@ -1539,12 +1583,21 @@ export class NativeBridgeController {
 
         const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
         this.finishMessage(assistantMessage.id, finalText);
+        this.rememberDelegationArtifact({
+          purpose: result.purpose,
+          mode: result.mode,
+          text: finalText,
+        });
         this.updateBackgroundJob({
           id: backgroundJobId,
           kind: 'delegate',
           label: `${BLACKPINK_MODES[result.mode].label} ${result.purpose ?? 'general'}`,
           status: 'done',
           detail: result.verification?.summary ?? previewText(finalText, 72),
+          prompt: userMessage.content,
+          purpose: result.purpose,
+          preferredMode: result.mode,
+          controller: null,
         });
         this.updateAgentActivity({
           id: routeActivityId,
@@ -1602,6 +1655,10 @@ export class NativeBridgeController {
             : `delegate ${decision.purpose ?? 'general'}`,
           status: 'error',
           detail,
+          prompt: userMessage.content,
+          purpose: decision.purpose ?? 'general',
+          preferredMode: decision.preferredMode ?? null,
+          controller: null,
         });
         this.updateAgentActivity({
           id: routeActivityId,
@@ -1742,6 +1799,11 @@ export class NativeBridgeController {
 
       const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
       this.finishMessage(assistantMessage.id, finalText);
+      this.rememberDelegationArtifact({
+        purpose: result.purpose,
+        mode: result.mode,
+        text: finalText,
+      });
       this.setWorkspaceState(result.workspace ?? null);
       if (result.verification) {
         this.setVerificationState({
@@ -2289,6 +2351,7 @@ export class NativeBridgeController {
       permissionProfile: this.permissionProfile,
       todos: this.todos.map((item) => ({ ...item })),
       remoteSessions: Array.from(this.remoteSessions.values()).map((session) => ({ ...session })),
+      artifacts: this.artifacts.map((artifact) => ({ ...artifact })),
     };
   }
 
@@ -2357,6 +2420,30 @@ export class NativeBridgeController {
           }))
           .filter((item) => item.provider && item.sessionId)
       : [];
+    const artifacts = Array.isArray(record.artifacts)
+      ? record.artifacts
+          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+          .map((item) => {
+            const source: WorkflowArtifact['source'] =
+              item.source === 'delegate' || item.source === 'team' || item.source === 'session'
+                ? item.source
+                : 'session';
+            const mode: WorkflowArtifact['mode'] =
+              item.mode === 'jennie' || item.mode === 'lisa' || item.mode === 'rosé' || item.mode === 'jisoo'
+                ? item.mode
+                : undefined;
+            return {
+              id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
+              kind: isArtifactKind(item.kind) ? item.kind : 'answer',
+              title: typeof item.title === 'string' ? item.title.trim() : '',
+              summary: typeof item.summary === 'string' ? item.summary.trim() : '',
+              source,
+              mode,
+              createdAt: typeof item.createdAt === 'string' ? item.createdAt : entry.timestamp,
+            };
+          })
+          .filter((item) => item.title.length > 0 && item.summary.length > 0)
+      : [];
 
     return {
       mode,
@@ -2364,6 +2451,7 @@ export class NativeBridgeController {
       permissionProfile,
       todos,
       remoteSessions,
+      artifacts,
     };
   }
 
@@ -2585,6 +2673,8 @@ export class NativeBridgeController {
       this.state.playingWithFire = this.permissionProfile === 'permissionless';
       this.todos = restoredSnapshot.todos.map((item) => ({ ...item }));
       this.state.todos = this.todos.map((item) => ({ ...item }));
+      this.artifacts = restoredSnapshot.artifacts.map((artifact) => ({ ...artifact }));
+      this.syncArtifacts();
       for (const remoteSession of restoredSnapshot.remoteSessions) {
         this.remoteSessions.set(remoteSession.provider, { ...remoteSession });
       }
@@ -2830,19 +2920,6 @@ export class NativeBridgeController {
 
   private formatDoctorSummary(): string {
     const profile = this.getContextProfile();
-    const estimate =
-      this.state.requestEstimate ??
-      createRequestEstimate({
-        system: this.tokenCounter.countTokens(this.systemPrompt),
-        history: 0,
-        tools: this.isBridgeBackedProvider()
-          ? 0
-          : this.toolRegistry
-          ? this.tokenCounter.countTokens(JSON.stringify(formatToolsForApi(this.toolRegistry)))
-          : 0,
-        prompt: 0,
-        mode: 'full',
-      });
     const queue = this.queuedPrompts.length > 0 ? this.queuedPrompts.length.toString() : '0';
 
     return [
@@ -2852,12 +2929,11 @@ export class NativeBridgeController {
       `auth: ${this.state.authType ?? 'missing'}${this.state.authSource ? ` via ${this.state.authSource}` : ''}`,
       `context: ${this.state.contextTokens.toLocaleString()} / ${this.state.contextLimit.toLocaleString()} (${(this.state.contextPercent * 100).toFixed(1)}%)`,
       `working set: ${profile.canonicalWorkingSetTokens.toLocaleString()} · auto compact at ${profile.autoCompactAtTokens.toLocaleString()}`,
-      `next ${estimate.mode}: system ${estimate.system.toLocaleString()} + history ${estimate.history.toLocaleString()} + tools ${estimate.tools.toLocaleString()} + prompt ${estimate.prompt.toLocaleString()} = ~${estimate.total.toLocaleString()}`,
-      ...(estimate.note ? [`note: ${estimate.note}`] : []),
       `permissions: ${this.permissionProfile}`,
       `plan items: ${this.todos.length}`,
+      `artifacts: ${this.artifacts.length}`,
       `skills loaded: ${this.loadedSkills.size}`,
-      `remote bridge sessions: ${this.remoteSessions.size}`,
+      `provider sessions: ${this.remoteSessions.size}`,
       `background queue: ${queue}`,
     ].join('\n');
   }
@@ -3032,6 +3108,15 @@ export class NativeBridgeController {
         );
       }
     }
+    const recentArtifacts = this.artifacts.slice(0, 3);
+    if (recentArtifacts.length > 0) {
+      parts.push(
+        ...recentArtifacts.map((artifact) => {
+          const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+          return `artifact: [${artifact.kind}] ${artifact.title}${mode} · ${previewText(artifact.summary, 140)}`;
+        }),
+      );
+    }
     const changedFiles = await this.getChangedFiles(8);
     if (changedFiles.length > 0) {
       parts.push(
@@ -3140,6 +3225,12 @@ export class NativeBridgeController {
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, 4)
       .map((job) => `${job.label} · ${job.status}${job.detail ? ` · ${previewText(job.detail, 120)}` : ''}`);
+    const artifacts = this.artifacts
+      .slice(0, 6)
+      .map((artifact) => {
+        const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+        return `[${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
+      });
 
     return [
       'Context Snapshot',
@@ -3164,6 +3255,9 @@ export class NativeBridgeController {
       ...(backgroundJobs.length > 0
         ? ['Background jobs:', ...backgroundJobs.map((entry) => `- ${entry}`)]
         : ['Background jobs: none']),
+      ...(artifacts.length > 0
+        ? ['Artifacts:', ...artifacts.map((entry) => `- ${entry}`)]
+        : ['Artifacts: none']),
       `Uncertainties: ${this.epistemicState.getStats().uncertainties}`,
     ].join('\n');
   }
@@ -3283,7 +3377,23 @@ export class NativeBridgeController {
         return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
       })
       .slice(0, 8)
-      .map((job) => ({ ...job }));
+      .map((job) => ({
+        id: job.id,
+        kind: job.kind,
+        label: job.label,
+        status: job.status,
+        detail: job.detail,
+        startedAt: job.startedAt,
+        updatedAt: job.updatedAt,
+      }));
+  }
+
+  private syncArtifacts(): void {
+    this.state.artifacts = this.artifacts
+      .slice()
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .slice(0, 10)
+      .map((artifact) => ({ ...artifact }));
   }
 
   private updateAgentActivity(update: {
@@ -3333,6 +3443,11 @@ export class NativeBridgeController {
     status: BackgroundJobState['status'];
     detail?: string | null;
     startedAt?: number;
+    prompt?: string;
+    purpose?: DelegationPurpose | 'general';
+    preferredMode?: NamedMode | null;
+    strategy?: 'parallel' | 'sequential' | 'delegate';
+    controller?: AbortController | null;
   }): void {
     const existing = this.backgroundJobs.find((job) => job.id === update.id);
     if (existing) {
@@ -3340,6 +3455,11 @@ export class NativeBridgeController {
       existing.label = update.label;
       existing.status = update.status;
       existing.detail = update.detail ?? existing.detail;
+      existing.prompt = update.prompt ?? existing.prompt;
+      existing.purpose = update.purpose ?? existing.purpose;
+      existing.preferredMode = update.preferredMode ?? existing.preferredMode;
+      existing.strategy = update.strategy ?? existing.strategy;
+      existing.controller = update.controller ?? existing.controller;
       existing.updatedAt = Date.now();
     } else {
       const now = Date.now();
@@ -3351,11 +3471,86 @@ export class NativeBridgeController {
         detail: update.detail ?? null,
         startedAt: update.startedAt ?? now,
         updatedAt: now,
+        prompt: update.prompt,
+        purpose: update.purpose,
+        preferredMode: update.preferredMode ?? null,
+        strategy: update.strategy,
+        controller: update.controller ?? null,
       });
     }
 
     this.syncBackgroundJobs();
     this.scheduleStatePush();
+  }
+
+  private rememberArtifact(artifact: {
+    kind: WorkflowArtifactKind;
+    title: string;
+    summary: string;
+    source: 'delegate' | 'team' | 'session';
+    mode?: NamedMode;
+  }): void {
+    this.artifacts.unshift({
+      id: randomUUID(),
+      kind: artifact.kind,
+      title: artifact.title.trim(),
+      summary: previewText(artifact.summary, 220),
+      source: artifact.source,
+      mode: artifact.mode,
+      createdAt: new Date().toISOString(),
+    });
+    this.artifacts = this.artifacts.slice(0, 20);
+    this.syncArtifacts();
+    void this.persistWorkflowState('artifact_update');
+    this.scheduleStatePush();
+  }
+
+  private artifactKindForPurpose(purpose?: DelegationPurpose): WorkflowArtifactKind {
+    switch (purpose) {
+      case 'planning':
+        return 'plan';
+      case 'review':
+      case 'oracle':
+        return 'review';
+      case 'design':
+        return 'design';
+      case 'research':
+        return 'research';
+      case 'execution':
+        return 'patch';
+      default:
+        return 'answer';
+    }
+  }
+
+  private rememberDelegationArtifact(result: {
+    purpose?: DelegationPurpose;
+    mode: NamedMode;
+    text: string;
+  }): void {
+    const kind = this.artifactKindForPurpose(result.purpose);
+    const title = `${BLACKPINK_MODES[result.mode].label} ${kind}`;
+    this.rememberArtifact({
+      kind,
+      title,
+      summary: result.text,
+      source: 'delegate',
+      mode: result.mode,
+    });
+  }
+
+  private rememberTeamArtifact(
+    strategy: 'parallel' | 'sequential' | 'delegate',
+    task: string,
+    output: string,
+  ): void {
+    this.rememberArtifact({
+      kind: 'briefing',
+      title: `team ${strategy}`,
+      summary: `${previewText(task, 120)} · ${previewText(output, 220)}`,
+      source: 'team',
+      mode: this.currentMode,
+    });
   }
 
   private async runAutoVerification(
@@ -3449,6 +3644,222 @@ export class NativeBridgeController {
     }
 
     return 'Usage: /todo [add|doing|done|pending|clear] ...';
+  }
+
+  private formatArtifactSummary(): string {
+    if (this.artifacts.length === 0) {
+      return 'Artifacts: none';
+    }
+
+    return [
+      'Artifacts',
+      ...this.artifacts.slice(0, 8).map((artifact, index) => {
+        const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+        return `${index + 1}. [${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
+      }),
+    ].join('\n');
+  }
+
+  private formatQueueSummary(): string {
+    if (this.queuedPrompts.length === 0) {
+      return 'Queue: empty';
+    }
+
+    return [
+      'Queue',
+      ...this.queuedPrompts.map((prompt, index) => `${index + 1}. ${previewText(prompt, 180)}`),
+    ].join('\n');
+  }
+
+  private resolveQueueIndex(value: string): number {
+    const index = Number.parseInt(value, 10);
+    if (!Number.isFinite(index) || index < 1 || index > this.queuedPrompts.length) {
+      throw new Error(`Queue item not found: ${value}`);
+    }
+
+    return index - 1;
+  }
+
+  private async runQueueCommand(args: string[]): Promise<string> {
+    const [action, ...rest] = args;
+    const command = action?.trim().toLowerCase() ?? '';
+
+    if (!command) {
+      return this.formatQueueSummary();
+    }
+
+    if (command === 'clear') {
+      this.queuedPrompts = [];
+      this.state.queuedPrompts = [];
+      this.scheduleStatePush();
+      return 'Queue cleared.';
+    }
+
+    if (command === 'drop') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /queue drop <index>';
+      }
+      const index = this.resolveQueueIndex(ref);
+      const [removed] = this.queuedPrompts.splice(index, 1);
+      this.state.queuedPrompts = [...this.queuedPrompts];
+      this.scheduleStatePush();
+      return `Dropped queue item ${index + 1}: ${previewText(removed ?? '', 120)}`;
+    }
+
+    if (command === 'promote') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /queue promote <index>';
+      }
+      const index = this.resolveQueueIndex(ref);
+      const [prompt] = this.queuedPrompts.splice(index, 1);
+      if (prompt) {
+        this.queuedPrompts.unshift(prompt);
+      }
+      this.state.queuedPrompts = [...this.queuedPrompts];
+      this.scheduleStatePush();
+      return this.formatQueueSummary();
+    }
+
+    if (command === 'run') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /queue run <index>';
+      }
+      const index = this.resolveQueueIndex(ref);
+      const [prompt] = this.queuedPrompts.splice(index, 1);
+      this.state.queuedPrompts = [...this.queuedPrompts];
+      this.scheduleStatePush();
+      if (!prompt) {
+        return `Queue item not found: ${ref}`;
+      }
+      if (this.state.loading && this.abortController) {
+        this.queuedPrompts.unshift(prompt);
+        this.state.queuedPrompts = [...this.queuedPrompts];
+        this.scheduleStatePush();
+        return `Queue item ${ref} promoted to run next.`;
+      }
+      await this.submit(prompt);
+      return `Queue item ${ref} started.`;
+    }
+
+    return 'Usage: /queue [run|promote|drop|clear] ...';
+  }
+
+  private formatJobsSummary(): string {
+    if (this.state.backgroundJobs.length === 0) {
+      return 'Jobs: none';
+    }
+
+    return [
+      'Jobs',
+      ...this.state.backgroundJobs.map((job, index) => {
+        const detail = job.detail ? ` · ${job.detail}` : '';
+        return `${index + 1}. ${job.label} [${job.status}]${detail}`;
+      }),
+    ].join('\n');
+  }
+
+  private resolveBackgroundJob(reference: string): BackgroundJobState {
+    const visibleJobs = this.backgroundJobs
+      .slice()
+      .sort((a, b) => {
+        const priority = (job: BackgroundJobState): number => {
+          if (job.status === 'running') {
+            return 0;
+          }
+          if (job.status === 'error') {
+            return 1;
+          }
+          return 2;
+        };
+        return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
+      });
+
+    const numeric = Number.parseInt(reference, 10);
+    if (Number.isFinite(numeric) && numeric >= 1 && numeric <= visibleJobs.length) {
+      return visibleJobs[numeric - 1];
+    }
+
+    const direct = visibleJobs.find((job) => job.id === reference || job.id.startsWith(reference));
+    if (direct) {
+      return direct;
+    }
+
+    throw new Error(`Job not found: ${reference}`);
+  }
+
+  private async runJobsCommand(args: string[]): Promise<string> {
+    const [action, ...rest] = args;
+    const command = action?.trim().toLowerCase() ?? '';
+
+    if (!command) {
+      return this.formatJobsSummary();
+    }
+
+    if (command === 'cancel') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs cancel <index-or-id>';
+      }
+      const job = this.resolveBackgroundJob(ref);
+      if (job.status !== 'running' || !job.controller) {
+        return `Job ${ref} is not cancellable.`;
+      }
+      job.controller.abort();
+      this.updateBackgroundJob({
+        id: job.id,
+        kind: job.kind,
+        label: job.label,
+        status: 'error',
+        detail: 'cancelled by user',
+        prompt: job.prompt,
+        purpose: job.purpose,
+        preferredMode: job.preferredMode,
+        strategy: job.strategy,
+        controller: null,
+      });
+      return `Cancelled job ${ref}.`;
+    }
+
+    if (command === 'retry') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs retry <index-or-id>';
+      }
+      const job = this.resolveBackgroundJob(ref);
+      if (!this.canStartBackgroundJob()) {
+        return 'Retry unavailable: background capacity full.';
+      }
+      if (!job.prompt) {
+        return `Job ${ref} cannot be retried.`;
+      }
+      if (job.kind === 'team') {
+        await this.startBackgroundTeamRun(job.strategy ?? 'parallel', job.prompt, {
+          routeNote: `Team run retry · ${job.strategy ?? 'parallel'}`,
+        });
+      } else {
+        const decision: AutoRouteDecision = {
+          kind: 'delegate',
+          purpose: job.purpose && job.purpose !== 'general' ? job.purpose : 'general',
+          preferredMode: job.preferredMode ?? undefined,
+          reason: 'manual retry',
+        };
+        await this.startBackgroundDelegatedRoute(
+          {
+            id: randomUUID(),
+            role: 'user',
+            content: job.prompt,
+            timestamp: Date.now(),
+          },
+          decision,
+        );
+      }
+      return `Retried job ${ref} in background.`;
+    }
+
+    return 'Usage: /jobs [cancel|retry] ...';
   }
 
   private async runCheckpointCommand(message: string): Promise<string> {
@@ -3665,10 +4076,6 @@ export class NativeBridgeController {
       return 'Usage: /team run [parallel|sequential|delegate] <task>';
     }
 
-    if (this.state.loading || this.abortController) {
-      return 'Team run unavailable while another request is active.';
-    }
-
     const strategyToken = args[1];
     const strategy =
       strategyToken === 'parallel' || strategyToken === 'sequential' || strategyToken === 'delegate'
@@ -3782,6 +4189,7 @@ export class NativeBridgeController {
       );
       this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
       this.finishMessage(assistantMessageId, formatted);
+      this.rememberTeamArtifact(strategy, task, result.output);
       if (this.sessionManager && this.state.sessionId) {
         await this.sessionManager.append(this.state.sessionId, {
           type: 'message',
@@ -3874,10 +4282,22 @@ export class NativeBridgeController {
       label: `team ${strategy}`,
       status: 'running',
       detail: previewText(task, 72),
+      prompt: task,
+      strategy,
     });
     this.scheduleStatePush();
 
     const controller = new AbortController();
+    this.updateBackgroundJob({
+      id: backgroundJobId,
+      kind: 'team',
+      label: `team ${strategy}`,
+      status: 'running',
+      detail: previewText(task, 72),
+      prompt: task,
+      strategy,
+      controller,
+    });
     void (async () => {
       try {
         const orchestrator = new TeamOrchestrator({
@@ -3913,12 +4333,16 @@ export class NativeBridgeController {
         );
         this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
         this.finishMessage(assistantMessageId, formatted);
+        this.rememberTeamArtifact(strategy, task, result.output);
         this.updateBackgroundJob({
           id: backgroundJobId,
           kind: 'team',
           label: `team ${strategy}`,
           status: 'done',
           detail: this.teamLastSummary,
+          prompt: task,
+          strategy,
+          controller: null,
         });
 
         if (this.sessionManager && this.state.sessionId) {
@@ -3947,6 +4371,9 @@ export class NativeBridgeController {
           label: `team ${strategy}`,
           status: 'error',
           detail,
+          prompt: task,
+          strategy,
+          controller: null,
         });
         this.finishMessage(assistantMessageId, controller.signal.aborted ? '[background team aborted]' : `Team run failed: ${serializeError(error)}`);
       }
@@ -4492,6 +4919,7 @@ export class NativeBridgeController {
         slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
         todos: this.state.todos.map((item) => ({ ...item })),
         backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
+        artifacts: this.state.artifacts.map((artifact) => ({ ...artifact })),
         askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
       },
     });

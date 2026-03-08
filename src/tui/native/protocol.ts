@@ -1,5 +1,11 @@
 import type { NamedMode } from '../../core/types.js';
-import type { PermissionProfile, PlanItem, PlanItemStatus } from '../../core/workflow-state.js';
+import type {
+  PermissionProfile,
+  PlanItem,
+  PlanItemStatus,
+  WorkflowArtifact,
+  WorkflowArtifactKind,
+} from '../../core/workflow-state.js';
 
 export type NativeMessageRole = 'user' | 'assistant' | 'system' | 'tool';
 export type NativeToolStatus = 'pending' | 'running' | 'done' | 'error';
@@ -74,6 +80,10 @@ export interface NativeBackgroundJobState {
   updatedAt: number;
 }
 
+export interface NativeArtifactState extends Omit<WorkflowArtifact, 'kind'> {
+  kind: WorkflowArtifactKind;
+}
+
 export interface NativeWorkspaceState {
   label: string;
   path: string;
@@ -130,6 +140,7 @@ export interface NativeTuiState {
   todos: NativePlanItemState[];
   agentActivities: NativeAgentActivityState[];
   backgroundJobs: NativeBackgroundJobState[];
+  artifacts: NativeArtifactState[];
   workspace: NativeWorkspaceState | null;
   verification: NativeVerificationState | null;
   error: string | null;

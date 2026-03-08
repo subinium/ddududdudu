@@ -144,6 +144,18 @@ struct NativeBackgroundJobState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct NativeArtifactState {
+    id: String,
+    kind: String,
+    title: String,
+    summary: String,
+    source: String,
+    mode: Option<String>,
+    created_at: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct NativeWorkspaceState {
     label: String,
     path: String,
@@ -207,6 +219,7 @@ struct NativeTuiState {
     todos: Vec<NativePlanItemState>,
     agent_activities: Vec<NativeAgentActivityState>,
     background_jobs: Vec<NativeBackgroundJobState>,
+    artifacts: Vec<NativeArtifactState>,
     workspace: Option<NativeWorkspaceState>,
     verification: Option<NativeVerificationState>,
     error: Option<String>,
@@ -447,6 +460,7 @@ impl App {
                 todos: Vec::new(),
                 agent_activities: Vec::new(),
                 background_jobs: Vec::new(),
+                artifacts: Vec::new(),
                 workspace: None,
                 verification: None,
                 error: None,
@@ -709,27 +723,6 @@ impl App {
             FG,
             ACCENT_DIM,
         );
-        if let Some(remote_session_id) = &self.state.remote_session_id {
-            push_sidebar_rail_item(
-                &mut lines,
-                "◎",
-                SUCCESS,
-                format!("session {}", preview_line(remote_session_id, 16)),
-                Some("active provider session".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-        } else if self.state.remote_session_count > 0 {
-            push_sidebar_rail_item(
-                &mut lines,
-                "◎",
-                ACCENT_DIM,
-                format!("sessions {}", format_count(self.state.remote_session_count)),
-                Some("saved provider sessions".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-        }
         push_sidebar_rail_item(
             &mut lines,
             if self.state.permission_profile == "permissionless" { "✦" } else { "·" },
@@ -738,7 +731,11 @@ impl App {
             } else {
                 ACCENT_DIM
             },
-            format!("permissions {}", self.state.permission_profile),
+            if self.state.permission_profile == "permissionless" {
+                "fire on (permissionless)".to_string()
+            } else {
+                format!("fire off ({})", self.state.permission_profile)
+            },
             None,
             FG,
             ACCENT_DIM,
@@ -943,6 +940,50 @@ impl App {
                     color,
                     preview_line(&title, 28),
                     detail,
+                    FG,
+                    ACCENT_DIM,
+                );
+            }
+        }
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(sidebar_header("Artifacts"));
+        if self.state.artifacts.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "no recent artifacts".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
+        } else {
+            for artifact in self.state.artifacts.iter().take(5) {
+                let color = match artifact.kind.as_str() {
+                    "plan" => ACCENT,
+                    "review" => SUCCESS,
+                    "patch" => PATH,
+                    "design" => LINK,
+                    "briefing" => ACCENT_DIM,
+                    _ => FG,
+                };
+                let title = if let Some(mode) = &artifact.mode {
+                    format!(
+                        "[{}] {} · {}",
+                        artifact.kind,
+                        preview_line(&artifact.title, 16),
+                        title_case_label(mode)
+                    )
+                } else {
+                    format!("[{}] {}", artifact.kind, preview_line(&artifact.title, 22))
+                };
+                push_sidebar_rail_item(
+                    &mut lines,
+                    "□",
+                    color,
+                    title,
+                    Some(preview_line(&artifact.summary, 28)),
                     FG,
                     ACCENT_DIM,
                 );
