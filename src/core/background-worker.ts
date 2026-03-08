@@ -1,4 +1,5 @@
 import { discoverAllProviders } from '../auth/discovery.js';
+import { buildArtifactPayload } from './artifacts.js';
 import { loadConfig } from './config.js';
 import {
   BackgroundJobStore,
@@ -67,6 +68,8 @@ const previewText = (value: string, maxLength: number = 96): string => {
 
 const artifactKindForPurpose = (purpose?: DelegationPurpose | 'general'): WorkflowArtifactKind => {
   switch (purpose) {
+    case 'execution':
+      return 'patch';
     case 'planning':
       return 'plan';
     case 'review':
@@ -87,11 +90,13 @@ const buildArtifact = (input: {
   summary: string;
   source: 'delegate' | 'team' | 'session';
   mode?: NamedMode;
+  payload?: WorkflowArtifact['payload'];
 }): WorkflowArtifact => ({
   id: `job-artifact-${Date.now().toString(36)}`,
   kind: input.kind,
   title: input.title.trim(),
   summary: previewText(input.summary, 220),
+  payload: input.payload,
   source: input.source,
   mode: input.mode,
   createdAt: new Date().toISOString(),
@@ -341,6 +346,23 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
         summary: finalText,
         source: 'delegate',
         mode: result.mode,
+        payload: buildArtifactPayload({
+          kind: artifactKindForPurpose(result.purpose),
+          purpose: result.purpose,
+          task: current.prompt,
+          summary: finalText,
+          files: result.verification?.changedFiles,
+          verification: result.verification,
+          workspaceApply: result.workspaceApply
+            ? {
+                applied: result.workspaceApply.applied,
+                empty: result.workspaceApply.empty,
+                summary: result.workspaceApply.summary,
+                error: result.workspaceApply.error,
+                path: result.workspace?.path ?? null,
+              }
+            : null,
+        }),
       });
 
       await sessionManager.append(
@@ -625,10 +647,18 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
         result.rounds,
       );
       const artifact = buildArtifact({
-        kind: 'answer',
+        kind: 'briefing',
         title: `team ${current.strategy ?? 'parallel'}`,
         summary: result.output,
         source: 'team',
+        payload: buildArtifactPayload({
+          kind: 'briefing',
+          purpose: current.purpose ?? 'general',
+          task: current.prompt,
+          summary: result.output,
+          strategy: current.strategy ?? 'parallel',
+          notes: backgroundNotes,
+        }),
       });
 
       await sessionManager.append(

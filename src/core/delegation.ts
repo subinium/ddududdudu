@@ -1,5 +1,6 @@
 import type { ApiMessage, ToolStateUpdate } from '../api/anthropic-client.js';
 import { createClient } from '../api/client-factory.js';
+import { formatArtifactForHandoff } from './artifacts.js';
 import { resolveModeBinding } from './mode-resolution.js';
 import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
@@ -208,15 +209,6 @@ const buildSessionEntry = (
   };
 };
 
-const previewArtifactText = (value: string, maxLength: number = 320): string => {
-  const normalized = value.replace(/\s+/g, ' ').trim();
-  if (normalized.length <= maxLength) {
-    return normalized;
-  }
-
-  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
-};
-
 const buildDelegationPrompt = (
   request: DelegationRequest,
   purpose: DelegationPurpose,
@@ -226,17 +218,7 @@ const buildDelegationPrompt = (
   if (request.artifacts && request.artifacts.length > 0) {
     sections.push(
       '<handoff_artifacts>',
-      ...request.artifacts.map((artifact) => {
-        const attrs = [
-          `kind="${artifact.kind}"`,
-          `title="${artifact.title.replace(/"/g, '\'')}"`,
-          `source="${artifact.source}"`,
-          artifact.mode ? `mode="${artifact.mode}"` : null,
-        ]
-          .filter((part): part is string => Boolean(part))
-          .join(' ');
-        return `<artifact ${attrs}>\n${previewArtifactText(artifact.summary)}\n</artifact>`;
-      }),
+      ...request.artifacts.map((artifact) => formatArtifactForHandoff(artifact)),
       '</handoff_artifacts>',
     );
   }

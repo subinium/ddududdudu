@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 
+import { analyzeShellCommand } from '../core/trust.js';
 import type { Tool } from './index.js';
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -19,6 +20,18 @@ export const bashTool: Tool = {
       return { output: 'Missing required argument: command', isError: true };
     }
     const command = args.command;
+    const risk = analyzeShellCommand(command);
+
+    if (risk.hardBlockReason) {
+      return {
+        output: `${risk.hardBlockReason}\n[trust] concerns=${risk.concerns.join(', ')}`,
+        isError: true,
+        metadata: {
+          concerns: risk.concerns,
+          blocked: true,
+        },
+      };
+    }
 
     const timeout =
       typeof args.timeout === 'number' && Number.isFinite(args.timeout)
@@ -112,7 +125,7 @@ export const bashTool: Tool = {
         resolve({
           output,
           isError: exitCode !== 0,
-          metadata: { exitCode, signal, timeout },
+          metadata: { exitCode, signal, timeout, concerns: risk.concerns },
         });
       });
     });

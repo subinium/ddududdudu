@@ -5,6 +5,33 @@ export type PlanItemStatus = 'pending' | 'in_progress' | 'completed';
 export type PermissionProfile = 'plan' | 'ask' | 'workspace-write' | 'permissionless';
 export type WorkflowArtifactKind = 'answer' | 'plan' | 'review' | 'design' | 'patch' | 'briefing' | 'research';
 
+export interface WorkflowArtifactPayload {
+  purpose?: DelegationPurpose | 'general';
+  prompt?: string;
+  task?: string;
+  strategy?: 'parallel' | 'sequential' | 'delegate';
+  files?: string[];
+  planSteps?: string[];
+  findings?: string[];
+  risks?: string[];
+  decisions?: string[];
+  nextSteps?: string[];
+  notes?: string[];
+  verification?: {
+    status: 'passed' | 'failed' | 'skipped';
+    summary: string;
+    changedFiles?: string[];
+    commands?: string[];
+  };
+  workspaceApply?: {
+    applied: boolean;
+    empty: boolean;
+    summary: string;
+    error?: string;
+    path?: string;
+  };
+}
+
 export interface PlanItem {
   id: string;
   step: string;
@@ -26,6 +53,7 @@ export interface WorkflowArtifact {
   kind: WorkflowArtifactKind;
   title: string;
   summary: string;
+  payload?: WorkflowArtifactPayload;
   source: 'delegate' | 'team' | 'session';
   mode?: NamedMode;
   createdAt: string;

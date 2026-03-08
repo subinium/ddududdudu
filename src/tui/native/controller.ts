@@ -19,6 +19,12 @@ import {
   type BackgroundJobChecklistItem,
   type BackgroundJobRecord,
 } from '../../core/background-jobs.js';
+import {
+  buildArtifactPayload,
+  formatArtifactContextLine,
+  formatArtifactForHandoff,
+  formatArtifactForInspector,
+} from '../../core/artifacts.js';
 import { CompactionEngine, type CompactionMessage } from '../../core/compaction.js';
 import { DriftDetector } from '../../core/drift-detector.js';
 import { EpistemicStateManager } from '../../core/epistemic-state.js';
@@ -38,6 +44,7 @@ import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
+import { analyzeToolRisk, shouldPromptForRisk, type ToolRiskAssessment } from '../../core/trust.js';
 import { getDduduPaths } from '../../core/dirs.js';
 import type { DduduConfig, LoadedSession, NamedMode, SessionEntry, ToolPolicy } from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
@@ -48,6 +55,7 @@ import type {
   PlanItemStatus,
   WorkflowArtifact,
   WorkflowArtifactKind,
+  WorkflowArtifactPayload,
   WorkflowBackgroundJobSnapshot,
   WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
@@ -335,6 +343,14 @@ const previewText = (value: string, maxLength: number = 96): string => {
   }
 
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const formatRiskConcerns = (assessment: ToolRiskAssessment): string => {
+  if (assessment.concerns.length === 0) {
+    return assessment.level;
+  }
+
+  return `${assessment.level} · ${assessment.concerns.join(', ')}`;
 };
 
 const createChecklistItem = (
@@ -1490,7 +1506,7 @@ export class NativeBridgeController {
         }
 
         const directPurpose = this.inferPromptPurpose(trimmedContent);
-        this.rememberSessionArtifact(directPurpose, fullText);
+        this.rememberSessionArtifact(directPurpose, fullText, trimmedContent);
         this.state.loadingLabel = 'verifier';
         this.scheduleStatePush();
         const verification = await this.runAutoVerification(process.cwd(), 'full');
@@ -1917,6 +1933,17 @@ export class NativeBridgeController {
         purpose: result.purpose,
         mode: result.mode,
         text: finalText,
+        task: userMessage.content,
+        verification: result.verification,
+        workspaceApply: result.workspaceApply
+          ? {
+              applied: result.workspaceApply.applied,
+              empty: result.workspaceApply.empty,
+              summary: result.workspaceApply.summary,
+              error: result.workspaceApply.error,
+              path: result.workspace?.path ?? null,
+            }
+          : null,
       });
       if (result.workspaceApply?.attempted) {
         if (result.workspaceApply.applied) {
@@ -2169,40 +2196,8 @@ export class NativeBridgeController {
     };
   }
 
-  private classifyToolRisk(name: string, input: Record<string, unknown>): 'read' | 'write' | 'dangerous' {
-    if (
-      name === 'read_file' ||
-      name === 'list_dir' ||
-      name === 'grep' ||
-      name === 'glob' ||
-      name === 'web_fetch' ||
-      name === 'repo_map' ||
-      name === 'symbol_search' ||
-      name === 'definition_search' ||
-      name === 'reference_search' ||
-      name === 'reference_hotspots' ||
-      name === 'changed_files' ||
-      name === 'codebase_search' ||
-      name === 'ask_question' ||
-      name === 'oracle'
-    ) {
-      return 'read';
-    }
-
-    if (name === 'memory') {
-      const action = readString(input.action) || 'read';
-      return action === 'read' ? 'read' : 'write';
-    }
-
-    if (name === 'write_file' || name === 'edit_file' || name === 'update_plan') {
-      return 'write';
-    }
-
-    if (name.startsWith('mcp__') || name === 'bash' || name === 'task') {
-      return 'dangerous';
-    }
-
-    return 'dangerous';
+  private classifyToolRisk(name: string, input: Record<string, unknown>): ToolRiskAssessment {
+    return analyzeToolRisk(name, input);
   }
 
   private getConfiguredToolPolicy(name: string): ToolPolicy {
@@ -2243,6 +2238,10 @@ export class NativeBridgeController {
     const risk = this.classifyToolRisk(block.name, input);
     const policy = this.getConfiguredToolPolicy(block.name);
 
+    if (risk.hardBlockReason) {
+      return { allowed: false, reason: risk.hardBlockReason };
+    }
+
     if (policy === 'deny') {
       return { allowed: false, reason: `Blocked ${block.name}: tool policy is deny.` };
     }
@@ -2252,7 +2251,7 @@ export class NativeBridgeController {
     }
 
     if (this.permissionProfile === 'plan') {
-      if (risk === 'read') {
+      if (risk.level === 'read') {
         return { allowed: true };
       }
       return { allowed: false, reason: `Blocked ${block.name}: current permission profile is plan (read-only).` };
@@ -2266,7 +2265,7 @@ export class NativeBridgeController {
       const summary = summarizeToolInput(block.name, input);
       const answer = toolContext.askUser
         ? await toolContext.askUser(
-          `Allow ${summary}?`,
+          `Allow ${summary}? (${formatRiskConcerns(risk)})`,
           ['Allow once', `Deny (${this.permissionProfile})`],
         )
         : 'Deny';
@@ -2277,18 +2276,18 @@ export class NativeBridgeController {
       };
     }
 
-    if (this.permissionProfile === 'workspace-write') {
-      if (risk !== 'dangerous') {
-        return { allowed: true };
-      }
-    } else if (this.permissionProfile === 'ask' && risk === 'read') {
+    if (this.permissionProfile === 'ask' && risk.level === 'read') {
+      return { allowed: true };
+    }
+
+    if (!shouldPromptForRisk(this.permissionProfile, risk)) {
       return { allowed: true };
     }
 
     const summary = summarizeToolInput(block.name, input);
     const answer = toolContext.askUser
       ? await toolContext.askUser(
-        `Allow ${summary}?`,
+        `Allow ${summary}? (${formatRiskConcerns(risk)})`,
         ['Allow once', `Deny (${this.permissionProfile})`],
       )
       : 'Deny';
@@ -3870,7 +3869,7 @@ export class NativeBridgeController {
       parts.push(
         ...relevantArtifacts.map((artifact) => {
           const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
-          return `artifact: [${artifact.kind}] ${artifact.title}${mode} · ${previewText(artifact.summary, 140)}`;
+          return `artifact: ${formatArtifactContextLine(artifact, 140)}${mode ? mode : ''}`;
         }),
       );
     }
@@ -4006,10 +4005,7 @@ export class NativeBridgeController {
       .map((job) => `${job.label} · ${job.status}${job.detail ? ` · ${previewText(job.detail, 120)}` : ''}`);
     const artifacts = this.artifacts
       .slice(0, 6)
-      .map((artifact) => {
-        const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
-        return `[${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
-      });
+      .map((artifact) => formatArtifactContextLine(artifact, 180));
 
     return [
       'Context Snapshot',
@@ -4309,6 +4305,7 @@ export class NativeBridgeController {
     kind: WorkflowArtifactKind;
     title: string;
     summary: string;
+    payload?: WorkflowArtifactPayload;
     source: 'delegate' | 'team' | 'session';
     mode?: NamedMode;
   }): WorkflowArtifact {
@@ -4317,6 +4314,7 @@ export class NativeBridgeController {
       kind: artifact.kind,
       title: artifact.title.trim(),
       summary: previewText(artifact.summary, 220),
+      payload: artifact.payload,
       source: artifact.source,
       mode: artifact.mode,
       createdAt: new Date().toISOString(),
@@ -4351,6 +4349,15 @@ export class NativeBridgeController {
     purpose?: DelegationPurpose;
     mode: NamedMode;
     text: string;
+    task?: string;
+    verification?: VerificationSummary;
+    workspaceApply?: {
+      applied: boolean;
+      empty: boolean;
+      summary: string;
+      error?: string;
+      path?: string | null;
+    } | null;
   }): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(result.purpose);
     const title = `${HARNESS_MODES[result.mode].label} ${kind}`;
@@ -4358,6 +4365,15 @@ export class NativeBridgeController {
       kind,
       title,
       summary: result.text,
+      payload: buildArtifactPayload({
+        kind,
+        purpose: result.purpose,
+        task: result.task,
+        summary: result.text,
+        files: result.verification?.changedFiles,
+        verification: result.verification,
+        workspaceApply: result.workspaceApply ?? null,
+      }),
       source: 'delegate',
       mode: result.mode,
     });
@@ -4366,6 +4382,7 @@ export class NativeBridgeController {
   private rememberSessionArtifact(
     purpose: DelegationPurpose | 'general',
     text: string,
+    prompt?: string,
   ): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(purpose === 'general' ? undefined : purpose);
     const title = `${HARNESS_MODES[this.currentMode].label} ${kind}`;
@@ -4373,6 +4390,12 @@ export class NativeBridgeController {
       kind,
       title,
       summary: text,
+      payload: buildArtifactPayload({
+        kind,
+        purpose,
+        prompt,
+        summary: text,
+      }),
       source: 'session',
       mode: this.currentMode,
     });
@@ -4382,11 +4405,20 @@ export class NativeBridgeController {
     strategy: 'parallel' | 'sequential' | 'delegate',
     task: string,
     output: string,
+    notes: string[] = [],
   ): WorkflowArtifact {
     return this.rememberArtifact({
       kind: 'briefing',
       title: `team ${strategy}`,
       summary: `${previewText(task, 120)} · ${previewText(output, 220)}`,
+      payload: buildArtifactPayload({
+        kind: 'briefing',
+        purpose: 'general',
+        task,
+        strategy,
+        summary: output,
+        notes,
+      }),
       source: 'team',
       mode: this.currentMode,
     });
@@ -4464,6 +4496,13 @@ export class NativeBridgeController {
       kind: 'review',
       title,
       summary: `${verification.summary}\n${previewText(verification.report, 260)}`,
+      payload: buildArtifactPayload({
+        kind: 'review',
+        purpose: 'review',
+        summary: verification.report,
+        files: verification.changedFiles,
+        verification,
+      }),
       source: 'session',
       mode,
     });
@@ -4518,6 +4557,13 @@ export class NativeBridgeController {
         '',
         previewText(input.output, 420),
       ].join('\n'),
+      payload: buildArtifactPayload({
+        kind: 'patch',
+        purpose: input.purpose,
+        summary: input.output,
+        files: input.verification.changedFiles,
+        verification: input.verification,
+      }),
       source: 'delegate',
       mode: input.mode,
     });
@@ -4859,7 +4905,11 @@ export class NativeBridgeController {
       return [
         'Permissions',
         `current: ${this.permissionProfile}`,
-        'profiles: plan, ask, workspace-write, permissionless',
+        'profiles:',
+        '- plan · read-only',
+        '- ask · prompt for any non-read tool',
+        '- workspace-write · auto-allow local edits, prompt for network/secrets/delegation',
+        '- permissionless · allow all except hard-blocked shell patterns',
         '',
         this.formatToolPolicySummary(),
       ].join('\n');
@@ -4943,9 +4993,11 @@ export class NativeBridgeController {
 
     return [
       'Artifacts',
-      ...this.artifacts.slice(0, 8).map((artifact, index) => {
-        const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
-        return `${index + 1}. [${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
+      ...this.artifacts.slice(0, 8).flatMap((artifact, index) => {
+        const lines = formatArtifactForInspector(artifact);
+        return lines.map((line, lineIndex) =>
+          lineIndex === 0 ? `${index + 1}. ${line}` : `   ${line}`,
+        );
       }),
     ].join('\n');
   }
@@ -5092,7 +5144,9 @@ export class NativeBridgeController {
       job.resultPreview ? `result: ${job.resultPreview}` : null,
       job.workspacePath ? `workspace: ${job.workspacePath}` : null,
       job.verificationSummary ? `verification: ${job.verificationSummary}` : null,
-      artifact ? `artifact: ${artifact.title}` : job.artifactTitle ? `artifact: ${job.artifactTitle}` : null,
+      ...(artifact
+        ? ['artifact:', ...formatArtifactForInspector(artifact).map((line) => `  ${line}`)]
+        : job.artifactTitle ? [`artifact: ${job.artifactTitle}`] : []),
       job.prompt ? `prompt: ${job.prompt}` : null,
     ]
       .filter((part): part is string => Boolean(part))
@@ -5102,16 +5156,7 @@ export class NativeBridgeController {
   private formatJobResult(job: BackgroundJobState): string {
     const artifact = this.getArtifactById(job.artifactId);
     if (artifact) {
-      return [
-        `${artifact.title}`,
-        `source: ${artifact.source}`,
-        artifact.mode ? `mode: ${HARNESS_MODES[artifact.mode].label}` : null,
-        `created: ${artifact.createdAt}`,
-        '',
-        artifact.summary,
-      ]
-        .filter((part): part is string => Boolean(part))
-        .join('\n');
+      return formatArtifactForInspector(artifact).join('\n');
     }
 
     if (job.verificationSummary) {
@@ -5169,7 +5214,7 @@ export class NativeBridgeController {
       ...(activities.length > 0 ? activities : ['- no recorded agent activity']),
       '',
       'Result preview:',
-      job.result?.text ? previewText(job.result.text, 500) : job.artifact?.summary ?? 'no stored result',
+      ...(job.artifact ? formatArtifactForInspector(job.artifact) : [job.result?.text ? previewText(job.result.text, 500) : 'no stored result']),
     ]
       .filter((part): part is string => Boolean(part))
       .join('\n');
@@ -5846,7 +5891,7 @@ export class NativeBridgeController {
       );
       this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
       this.finishMessage(assistantMessageId, formatted);
-      this.rememberTeamArtifact(strategy, task, result.output);
+      this.rememberTeamArtifact(strategy, task, result.output, this.teamRunIsolatedNotes);
       if (this.sessionManager && this.state.sessionId) {
         await this.sessionManager.append(this.state.sessionId, {
           type: 'message',
@@ -6390,10 +6435,7 @@ export class NativeBridgeController {
     const artifactSection = handoffArtifacts.length > 0
       ? [
           '<handoff_artifacts>',
-          ...handoffArtifacts.map((artifact) => {
-            const mode = artifact.mode ? ` mode="${artifact.mode}"` : '';
-            return `<artifact kind="${artifact.kind}" title="${artifact.title.replace(/"/g, '\'')}"${mode}>${previewText(artifact.summary, 240)}</artifact>`;
-          }),
+          ...handoffArtifacts.map((artifact) => formatArtifactForHandoff(artifact)),
           '</handoff_artifacts>',
           '',
         ].join('\n')
