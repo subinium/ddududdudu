@@ -1,9 +1,17 @@
-import { spawn } from 'node:child_process';
+import {
+  query,
+  type SDKAssistantMessage,
+  type SDKMessage,
+  type SDKPartialAssistantMessage,
+  type SDKResultMessage,
+  type SDKUserMessage,
+} from '@anthropic-ai/claude-agent-sdk';
 
 import type {
   ApiMessage,
   StreamCallbacks,
   ToolStateUpdate,
+  UsageSummary,
 } from './anthropic-client.js';
 
 export interface ClaudeCliClientConfig {
@@ -12,14 +20,7 @@ export interface ClaudeCliClientConfig {
   command?: string;
 }
 
-interface ClaudeUsagePayload {
-  input_tokens?: number;
-  cache_creation_input_tokens?: number;
-  cache_read_input_tokens?: number;
-  output_tokens?: number;
-}
-
-interface ClaudeContentBlock {
+type ClaudeContentBlock = {
   type?: string;
   id?: string;
   name?: string;
@@ -28,29 +29,7 @@ interface ClaudeContentBlock {
   content?: unknown;
   is_error?: boolean;
   text?: string;
-}
-
-interface ClaudeJsonEvent {
-  type?: string;
-  subtype?: string;
-  is_error?: boolean;
-  result?: string;
-  session_id?: string;
-  usage?: ClaudeUsagePayload;
-  tool_use_result?: unknown;
-  message?: {
-    content?: ClaudeContentBlock[];
-    usage?: ClaudeUsagePayload;
-  };
-  event?: {
-    type?: string;
-    delta?: {
-      type?: string;
-      text?: string;
-      thinking?: string;
-    };
-  };
-}
+};
 
 const DEFAULT_COMMAND = 'claude';
 
@@ -97,16 +76,19 @@ const toError = (error: unknown, fallbackMessage: string): Error => {
   return new Error(fallbackMessage);
 };
 
-const toTotalInputTokens = (usage: ClaudeUsagePayload | undefined): number => {
-  return (
-    (usage?.input_tokens ?? 0) +
-    (usage?.cache_creation_input_tokens ?? 0) +
-    (usage?.cache_read_input_tokens ?? 0)
-  );
-};
+const toUsageSummary = (result: SDKResultMessage): UsageSummary => {
+  const usage = result.usage;
+  const uncachedInput = usage.input_tokens ?? 0;
+  const cacheWriteInput = usage.cache_creation_input_tokens ?? 0;
+  const cachedInput = usage.cache_read_input_tokens ?? 0;
 
-const toOutputTokens = (usage: ClaudeUsagePayload | undefined): number => {
-  return usage?.output_tokens ?? 0;
+  return {
+    input: uncachedInput + cacheWriteInput + cachedInput,
+    output: usage.output_tokens ?? 0,
+    uncachedInput,
+    cachedInput,
+    cacheWriteInput,
+  };
 };
 
 const extractToolResultText = (value: unknown): string => {
@@ -152,6 +134,17 @@ const extractToolResultText = (value: unknown): string => {
   }
 };
 
+const extractAssistantText = (message: SDKAssistantMessage): string => {
+  const content = Array.isArray(message.message?.content)
+    ? (message.message.content as ClaudeContentBlock[])
+    : [];
+
+  return content
+    .filter((block) => block.type === 'text' && typeof block.text === 'string')
+    .map((block) => block.text ?? '')
+    .join('');
+};
+
 const emitToolState = (
   callbacks: StreamCallbacks,
   emittedStates: Map<string, string>,
@@ -170,15 +163,24 @@ const emitToolState = (
   callbacks.onToolState?.([state]);
 };
 
+const createExecEnv = (): Record<string, string> => {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  );
+};
+
 export class ClaudeCliClient {
-  private readonly config: Required<ClaudeCliClientConfig>;
+  private readonly model: string;
+  private readonly cwd: string;
+  private readonly commandOverride: string | null;
 
   public constructor(config: ClaudeCliClientConfig) {
-    this.config = {
-      model: config.model,
-      cwd: config.cwd ?? process.cwd(),
-      command: config.command?.trim() || process.env.DDUDU_CLAUDE_COMMAND?.trim() || DEFAULT_COMMAND,
-    };
+    this.model = config.model;
+    this.cwd = config.cwd ?? process.cwd();
+    this.commandOverride =
+      config.command?.trim() || process.env.DDUDU_CLAUDE_COMMAND?.trim() || null;
   }
 
   public async stream(
@@ -191,214 +193,201 @@ export class ClaudeCliClient {
     const prompt = sessionId
       ? normalizeContent(messages[messages.length - 1]?.content ?? '')
       : buildPrompt(messages);
-    const args = [
-      '-p',
-      '--verbose',
-      '--output-format',
-      'stream-json',
-      '--include-partial-messages',
-      '--dangerously-skip-permissions',
-      '--model',
-      this.config.model,
-      '--system-prompt',
-      systemPrompt,
-    ];
-    if (sessionId) {
-      args.push('--resume', sessionId);
-    }
-    args.push(prompt);
 
-    await new Promise<void>((resolve, reject) => {
-      let fullText = '';
-      let stderr = '';
-      let inputTokens = 0;
-      let outputTokens = 0;
-      let finished = false;
-      let stdoutBuffer = '';
-      const toolNamesById = new Map<string, string>();
-      const emittedStates = new Map<string, string>();
-
-      const child = spawn(this.config.command, args, {
-        cwd: this.config.cwd,
-        env: process.env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      const finalizeDone = (): void => {
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-        callbacks.onDone(fullText, { input: inputTokens, output: outputTokens });
-        resolve();
-      };
-
-      const finalizeError = (error: Error): void => {
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-        callbacks.onError(error);
-        reject(error);
-      };
-
-      const processLine = (line: string): void => {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          return;
-        }
-
-        let parsed: ClaudeJsonEvent;
-        try {
-          parsed = JSON.parse(trimmed) as ClaudeJsonEvent;
-        } catch {
-          return;
-        }
-
-        if (parsed.session_id) {
-          callbacks.onSession?.(parsed.session_id);
-        }
-
-        if (parsed.type === 'stream_event' && parsed.event?.delta?.type === 'text_delta') {
-          const text = parsed.event.delta.text ?? '';
-          if (text) {
-            fullText += text;
-            callbacks.onText(text);
-          }
-          return;
-        }
-
-        if (parsed.type === 'assistant') {
-          const blocks = parsed.message?.content ?? [];
-          for (const block of blocks) {
-            if (block.type !== 'tool_use' || !block.id || !block.name) {
-              continue;
-            }
-
-            const input = isRecord(block.input) ? block.input : undefined;
-            toolNamesById.set(block.id, block.name);
-            emitToolState(callbacks, emittedStates, {
-              id: block.id,
-              name: block.name,
-              input,
-              status: 'running',
-            });
-          }
-          return;
-        }
-
-        if (parsed.type === 'user') {
-          const blocks = parsed.message?.content ?? [];
-          for (const block of blocks) {
-            if (block.type !== 'tool_result' || !block.tool_use_id) {
-              continue;
-            }
-
-            emitToolState(callbacks, emittedStates, {
-              id: block.tool_use_id,
-              name: toolNamesById.get(block.tool_use_id) ?? 'tool',
-              status: block.is_error || parsed.is_error ? 'error' : 'done',
-              result: extractToolResultText(parsed.tool_use_result ?? block.content),
-            });
-          }
-          return;
-        }
-
-        if (parsed.type === 'result') {
-          const uncachedInput = parsed.usage?.input_tokens ?? 0;
-          const cacheWriteInput = parsed.usage?.cache_creation_input_tokens ?? 0;
-          const cachedInput = parsed.usage?.cache_read_input_tokens ?? 0;
-          inputTokens = uncachedInput + cacheWriteInput + cachedInput;
-          outputTokens = toOutputTokens(parsed.usage);
-
-          if (parsed.is_error) {
-            finalizeError(new Error(parsed.result?.trim() || stderr.trim() || 'Claude CLI request failed.'));
-            return;
-          }
-
-          if (!fullText && parsed.result?.trim()) {
-            fullText = parsed.result.trim();
-          }
-          if (finished) {
-            return;
-          }
-
-          finished = true;
-          callbacks.onDone(fullText, {
-            input: inputTokens,
-            output: outputTokens,
-            uncachedInput,
-            cachedInput,
-            cacheWriteInput,
-          });
-          resolve();
-        }
-      };
-
-      const flushStdoutBuffer = (): void => {
-        let boundary = stdoutBuffer.indexOf('\n');
-        while (boundary !== -1) {
-          const line = stdoutBuffer.slice(0, boundary);
-          stdoutBuffer = stdoutBuffer.slice(boundary + 1);
-          processLine(line);
-          boundary = stdoutBuffer.indexOf('\n');
-        }
-      };
-
-      const abortHandler = (): void => {
-        child.kill('SIGTERM');
-        setTimeout(() => {
-          if (!finished) {
-            child.kill('SIGKILL');
-          }
-        }, 250);
-      };
-
-      signal?.addEventListener('abort', abortHandler, { once: true });
-
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => {
-        stdoutBuffer += chunk;
-        flushStdoutBuffer();
-      });
-
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk: string) => {
-        stderr += chunk;
-      });
-
-      child.on('error', (error: Error) => {
-        signal?.removeEventListener('abort', abortHandler);
-        finalizeError(toError(error, 'Failed to start Claude CLI bridge.'));
-      });
-
-      child.on('close', (code) => {
-        signal?.removeEventListener('abort', abortHandler);
-
-        if (stdoutBuffer.trim()) {
-          processLine(stdoutBuffer);
-          stdoutBuffer = '';
-        }
-
-        if (finished) {
-          return;
-        }
-
-        if (signal?.aborted) {
-          finalizeError(new Error('Claude CLI request aborted.'));
-          return;
-        }
-
-        if (code === 0) {
-          finalizeDone();
-          return;
-        }
-
-        const message = stderr.trim() || `Claude CLI exited with code ${code ?? 'unknown'}.`;
-        finalizeError(new Error(message));
-      });
+    const agentQuery = query({
+      prompt,
+      options: {
+        model: this.model,
+        cwd: this.cwd,
+        resume: sessionId,
+        systemPrompt: systemPrompt.trim() || undefined,
+        includePartialMessages: true,
+        permissionMode: 'bypassPermissions',
+        allowDangerouslySkipPermissions: true,
+        env: createExecEnv(),
+        pathToClaudeCodeExecutable:
+          this.commandOverride && this.commandOverride !== DEFAULT_COMMAND
+            ? this.commandOverride
+            : undefined,
+      },
     });
+
+    const toolNamesById = new Map<string, string>();
+    const emittedStates = new Map<string, string>();
+    let sessionEmitted = false;
+    let fullText = '';
+    let finalized = false;
+
+    const abortHandler = (): void => {
+      void agentQuery.interrupt().catch(() => {});
+      agentQuery.close();
+    };
+
+    signal?.addEventListener('abort', abortHandler, { once: true });
+
+    const maybeEmitSession = (message: { session_id: string }): void => {
+      if (sessionEmitted) {
+        return;
+      }
+
+      sessionEmitted = true;
+      callbacks.onSession?.(message.session_id);
+    };
+
+    const handleAssistantMessage = (message: SDKAssistantMessage): void => {
+      const blocks = Array.isArray(message.message?.content)
+        ? (message.message.content as ClaudeContentBlock[])
+        : [];
+
+      for (const block of blocks) {
+        if (block.type !== 'tool_use' || !block.id || !block.name) {
+          continue;
+        }
+
+        const input = isRecord(block.input) ? block.input : undefined;
+        toolNamesById.set(block.id, block.name);
+        emitToolState(callbacks, emittedStates, {
+          id: block.id,
+          name: block.name,
+          input,
+          status: 'running',
+        });
+      }
+
+      if (!fullText) {
+        const assistantText = extractAssistantText(message);
+        if (assistantText) {
+          fullText = assistantText;
+        }
+      }
+    };
+
+    const handleUserToolResult = (message: SDKUserMessage): void => {
+      const blocks = Array.isArray(message.message?.content)
+        ? (message.message.content as ClaudeContentBlock[])
+        : [];
+
+      for (const block of blocks) {
+        if (block.type !== 'tool_result' || !block.tool_use_id) {
+          continue;
+        }
+
+        emitToolState(callbacks, emittedStates, {
+          id: block.tool_use_id,
+          name: toolNamesById.get(block.tool_use_id) ?? 'tool',
+          status: block.is_error ? 'error' : 'done',
+          result: extractToolResultText(message.tool_use_result ?? block.content),
+        });
+      }
+    };
+
+    const handlePartialAssistant = (message: SDKPartialAssistantMessage): void => {
+      const delta = message.event?.delta;
+      if (delta?.type !== 'text_delta') {
+        return;
+      }
+
+      const text = delta.text ?? '';
+      if (!text) {
+        return;
+      }
+
+      fullText += text;
+      callbacks.onText(text);
+    };
+
+    try {
+      for await (const message of agentQuery) {
+        if ('session_id' in message && typeof message.session_id === 'string') {
+          maybeEmitSession(message as { session_id: string });
+        }
+
+        if (message.type === 'stream_event') {
+          handlePartialAssistant(message);
+          continue;
+        }
+
+        if (message.type === 'assistant') {
+          handleAssistantMessage(message);
+          continue;
+        }
+
+        if (message.type === 'user') {
+          handleUserToolResult(message);
+          continue;
+        }
+
+        if (message.type === 'tool_progress') {
+          emitToolState(callbacks, emittedStates, {
+            id: message.tool_use_id,
+            name: message.tool_name,
+            status: 'running',
+          });
+          continue;
+        }
+
+        if (message.type === 'system' && message.subtype === 'task_started') {
+          emitToolState(callbacks, emittedStates, {
+            id: message.task_id,
+            name: 'Task',
+            status: 'running',
+            input: { description: message.description, taskType: message.task_type ?? 'task' },
+          });
+          continue;
+        }
+
+        if (message.type === 'system' && message.subtype === 'task_progress') {
+          emitToolState(callbacks, emittedStates, {
+            id: message.task_id,
+            name: 'Task',
+            status: 'running',
+            input: { description: message.description, lastTool: message.last_tool_name ?? '' },
+          });
+          continue;
+        }
+
+        if (message.type === 'system' && message.subtype === 'task_notification') {
+          emitToolState(callbacks, emittedStates, {
+            id: message.task_id,
+            name: 'Task',
+            status: message.status === 'completed' ? 'done' : 'error',
+            result: message.summary,
+          });
+          continue;
+        }
+
+        if (message.type === 'result') {
+          if (message.subtype !== 'success') {
+            throw new Error(message.errors.join('\n') || 'Claude SDK request failed.');
+          }
+
+          if (!fullText && message.result.trim()) {
+            fullText = message.result.trim();
+          }
+
+          callbacks.onDone(fullText, toUsageSummary(message));
+          finalized = true;
+        }
+      }
+
+      if (!finalized) {
+        callbacks.onDone(fullText, {
+          input: 0,
+          output: 0,
+          uncachedInput: 0,
+          cachedInput: 0,
+          cacheWriteInput: 0,
+        });
+      }
+    } catch (error: unknown) {
+      const normalized = signal?.aborted
+        ? new Error('Claude request aborted.')
+        : toError(error, 'Failed to stream Claude response.');
+      callbacks.onError(normalized);
+      throw normalized;
+    } finally {
+      signal?.removeEventListener('abort', abortHandler);
+      agentQuery.close();
+    }
   }
 }

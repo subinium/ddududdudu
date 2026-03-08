@@ -36,6 +36,8 @@
 | `ROSÉ`   | Anthropic      | `claude-sonnet-4-6` | planning, architecture, careful reasoning |
 | `JISOO`  | Gemini         | `gemini-2.5-pro`    | design, UI/UX, visual thinking            |
 
+Recommended setup: run this default four-mode lineup together and let ddudu route or delegate between them as needed.
+
 `Shift+Tab` cycles modes inside the TUI.
 
 ## Built-In Tools
