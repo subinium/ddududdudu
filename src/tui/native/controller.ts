@@ -88,6 +88,7 @@ interface AutoRouteDecision {
   purpose?: DelegationPurpose;
   preferredMode?: NamedMode;
   strategy?: 'parallel' | 'sequential' | 'delegate';
+  repairAttempt?: number;
 }
 
 interface AgentActivityState {
@@ -113,6 +114,11 @@ interface BackgroundJobState {
   purpose?: DelegationPurpose | 'general';
   preferredMode?: NamedMode | null;
   strategy?: 'parallel' | 'sequential' | 'delegate';
+  reason?: string | null;
+  artifactId?: string | null;
+  artifactTitle?: string | null;
+  verificationSummary?: string | null;
+  attempt?: number;
   controller?: AbortController | null;
 }
 
@@ -662,7 +668,7 @@ export class NativeBridgeController {
   private readonly hookRegistry = new HookRegistry();
   private readonly lspManager = new LspManager(process.cwd());
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
-  private readonly verificationRepairFingerprints = new Set<string>();
+  private readonly verificationRepairFingerprints = new Map<string, number>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
 
@@ -836,7 +842,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs result|inspect|retry|promote|cancel)',
         );
         return;
       case '/plan':
@@ -1482,6 +1488,8 @@ export class NativeBridgeController {
       prompt: userMessage.content,
       purpose: decision.purpose ?? 'general',
       preferredMode: decision.preferredMode ?? null,
+      reason: decision.reason,
+      attempt: decision.repairAttempt ?? 0,
     });
     this.updateAgentActivity({
       id: routeActivityId,
@@ -1506,6 +1514,8 @@ export class NativeBridgeController {
       prompt: userMessage.content,
       purpose: decision.purpose ?? 'general',
       preferredMode: decision.preferredMode ?? null,
+      reason: decision.reason,
+      attempt: decision.repairAttempt ?? 0,
       controller,
     });
     void (async () => {
@@ -1609,13 +1619,14 @@ export class NativeBridgeController {
 
         const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
         this.finishMessage(assistantMessage.id, finalText);
-        this.rememberDelegationArtifact({
+        const resultArtifact = this.rememberDelegationArtifact({
           purpose: result.purpose,
           mode: result.mode,
           text: finalText,
         });
+        let verificationArtifact: WorkflowArtifact | null = null;
         if (result.verification?.status === 'failed') {
-          this.rememberVerificationArtifact(
+          verificationArtifact = this.rememberVerificationArtifact(
             result.verification,
             result.mode,
             `${BLACKPINK_MODES[result.mode].label} verification`,
@@ -1630,6 +1641,9 @@ export class NativeBridgeController {
           prompt: userMessage.content,
           purpose: result.purpose,
           preferredMode: result.mode,
+          artifactId: verificationArtifact?.id ?? resultArtifact.id,
+          artifactTitle: verificationArtifact?.title ?? resultArtifact.title,
+          verificationSummary: result.verification?.summary ?? null,
           controller: null,
         });
         this.updateAgentActivity({
@@ -1678,6 +1692,14 @@ export class NativeBridgeController {
             },
           });
         }
+
+        await this.maybeScheduleVerificationFollowup({
+          purpose: result.purpose ?? 'general',
+          userPrompt: userMessage.content,
+          assistantOutput: finalText,
+          verification: result.verification,
+          allowRepair: decision.reason !== 'verification auto-retry',
+        });
       } catch (error: unknown) {
         const detail = controller.signal.aborted ? 'background job aborted' : serializeError(error);
         this.updateBackgroundJob({
@@ -2415,6 +2437,11 @@ export class NativeBridgeController {
         purpose: job.purpose,
         preferredMode: job.preferredMode ?? null,
         strategy: job.strategy,
+        reason: job.reason ?? null,
+        artifactId: job.artifactId ?? null,
+        artifactTitle: job.artifactTitle ?? null,
+        verificationSummary: job.verificationSummary ?? null,
+        attempt: job.attempt ?? 0,
       })),
     };
   }
@@ -2553,6 +2580,14 @@ export class NativeBridgeController {
                 item.strategy === 'parallel' || item.strategy === 'sequential' || item.strategy === 'delegate'
                   ? item.strategy
                   : undefined,
+              reason: typeof item.reason === 'string' ? item.reason : null,
+              artifactId: typeof item.artifactId === 'string' && item.artifactId.trim() ? item.artifactId.trim() : null,
+              artifactTitle: typeof item.artifactTitle === 'string' && item.artifactTitle.trim() ? item.artifactTitle.trim() : null,
+              verificationSummary:
+                typeof item.verificationSummary === 'string' && item.verificationSummary.trim()
+                  ? item.verificationSummary.trim()
+                  : null,
+              attempt: typeof item.attempt === 'number' && Number.isFinite(item.attempt) ? item.attempt : 0,
             };
           })
           .filter((item): item is WorkflowBackgroundJobSnapshot => item !== null)
@@ -3770,6 +3805,11 @@ export class NativeBridgeController {
     purpose?: DelegationPurpose | 'general';
     preferredMode?: NamedMode | null;
     strategy?: 'parallel' | 'sequential' | 'delegate';
+    reason?: string | null;
+    artifactId?: string | null;
+    artifactTitle?: string | null;
+    verificationSummary?: string | null;
+    attempt?: number;
     controller?: AbortController | null;
   }): void {
     const existing = this.backgroundJobs.find((job) => job.id === update.id);
@@ -3782,6 +3822,11 @@ export class NativeBridgeController {
       existing.purpose = update.purpose ?? existing.purpose;
       existing.preferredMode = update.preferredMode ?? existing.preferredMode;
       existing.strategy = update.strategy ?? existing.strategy;
+      existing.reason = update.reason ?? existing.reason;
+      existing.artifactId = update.artifactId ?? existing.artifactId;
+      existing.artifactTitle = update.artifactTitle ?? existing.artifactTitle;
+      existing.verificationSummary = update.verificationSummary ?? existing.verificationSummary;
+      existing.attempt = update.attempt ?? existing.attempt;
       existing.controller = update.controller ?? existing.controller;
       existing.updatedAt = Date.now();
     } else {
@@ -3798,6 +3843,11 @@ export class NativeBridgeController {
         purpose: update.purpose,
         preferredMode: update.preferredMode ?? null,
         strategy: update.strategy,
+        reason: update.reason ?? null,
+        artifactId: update.artifactId ?? null,
+        artifactTitle: update.artifactTitle ?? null,
+        verificationSummary: update.verificationSummary ?? null,
+        attempt: update.attempt ?? 0,
         controller: update.controller ?? null,
       });
     }
@@ -3813,8 +3863,8 @@ export class NativeBridgeController {
     summary: string;
     source: 'delegate' | 'team' | 'session';
     mode?: NamedMode;
-  }): void {
-    this.artifacts.unshift({
+  }): WorkflowArtifact {
+    const created: WorkflowArtifact = {
       id: randomUUID(),
       kind: artifact.kind,
       title: artifact.title.trim(),
@@ -3822,11 +3872,13 @@ export class NativeBridgeController {
       source: artifact.source,
       mode: artifact.mode,
       createdAt: new Date().toISOString(),
-    });
+    };
+    this.artifacts.unshift(created);
     this.artifacts = this.artifacts.slice(0, 20);
     this.syncArtifacts();
     void this.persistWorkflowState('artifact_update');
     this.scheduleStatePush();
+    return created;
   }
 
   private artifactKindForPurpose(purpose?: DelegationPurpose): WorkflowArtifactKind {
@@ -3851,10 +3903,10 @@ export class NativeBridgeController {
     purpose?: DelegationPurpose;
     mode: NamedMode;
     text: string;
-  }): void {
+  }): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(result.purpose);
     const title = `${BLACKPINK_MODES[result.mode].label} ${kind}`;
-    this.rememberArtifact({
+    return this.rememberArtifact({
       kind,
       title,
       summary: result.text,
@@ -3866,10 +3918,10 @@ export class NativeBridgeController {
   private rememberSessionArtifact(
     purpose: DelegationPurpose | 'general',
     text: string,
-  ): void {
+  ): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(purpose === 'general' ? undefined : purpose);
     const title = `${BLACKPINK_MODES[this.currentMode].label} ${kind}`;
-    this.rememberArtifact({
+    return this.rememberArtifact({
       kind,
       title,
       summary: text,
@@ -3882,8 +3934,8 @@ export class NativeBridgeController {
     strategy: 'parallel' | 'sequential' | 'delegate',
     task: string,
     output: string,
-  ): void {
-    this.rememberArtifact({
+  ): WorkflowArtifact {
+    return this.rememberArtifact({
       kind: 'briefing',
       title: `team ${strategy}`,
       summary: `${previewText(task, 120)} · ${previewText(output, 220)}`,
@@ -3947,12 +3999,20 @@ export class NativeBridgeController {
       .map((artifact) => ({ ...artifact }));
   }
 
+  private getArtifactById(id: string | null | undefined): WorkflowArtifact | null {
+    if (!id) {
+      return null;
+    }
+
+    return this.artifacts.find((artifact) => artifact.id === id) ?? null;
+  }
+
   private rememberVerificationArtifact(
     verification: VerificationSummary,
     mode: NamedMode,
     title: string,
-  ): void {
-    this.rememberArtifact({
+  ): WorkflowArtifact {
+    return this.rememberArtifact({
       kind: 'review',
       title,
       summary: `${verification.summary}\n${previewText(verification.report, 260)}`,
@@ -4048,6 +4108,7 @@ export class NativeBridgeController {
     userPrompt: string;
     assistantOutput: string;
     verification?: VerificationSummary;
+    allowRepair?: boolean;
   }): Promise<void> {
     const verification = input.verification;
     if (!verification || verification.status !== 'failed') {
@@ -4063,14 +4124,16 @@ export class NativeBridgeController {
 
     const repairPurpose = input.purpose === 'design' ? 'design' : 'execution';
     const fingerprint = verification.fingerprint ?? `${input.purpose}:${verification.summary}`;
+    const repairAttempts = this.verificationRepairFingerprints.get(fingerprint) ?? 0;
     const canAutoRepair =
+      input.allowRepair !== false &&
       input.purpose !== 'review' &&
       input.purpose !== 'oracle' &&
       this.canStartBackgroundJob() &&
-      !this.verificationRepairFingerprints.has(fingerprint);
+      repairAttempts < 1;
 
     if (canAutoRepair) {
-      this.verificationRepairFingerprints.add(fingerprint);
+      this.verificationRepairFingerprints.set(fingerprint, repairAttempts + 1);
       await this.startBackgroundDelegatedRoute(
         {
           id: randomUUID(),
@@ -4088,6 +4151,7 @@ export class NativeBridgeController {
           purpose: repairPurpose,
           preferredMode: this.preferredRetryModeForPurpose(input.purpose),
           reason: 'verification auto-retry',
+          repairAttempt: repairAttempts + 1,
         },
       );
       return;
@@ -4323,6 +4387,7 @@ export class NativeBridgeController {
   }
 
   private formatJobInspect(job: BackgroundJobState): string {
+    const artifact = this.getArtifactById(job.artifactId);
     return [
       `Job ${job.id}`,
       `label: ${job.label}`,
@@ -4331,13 +4396,45 @@ export class NativeBridgeController {
       job.purpose ? `purpose: ${job.purpose}` : null,
       job.preferredMode ? `mode: ${BLACKPINK_MODES[job.preferredMode].label}` : null,
       job.strategy ? `strategy: ${job.strategy}` : null,
+      job.reason ? `reason: ${job.reason}` : null,
+      job.attempt && job.attempt > 0 ? `attempt: ${job.attempt}` : null,
       `started: ${new Date(job.startedAt).toISOString()}`,
       `updated: ${new Date(job.updatedAt).toISOString()}`,
       job.detail ? `detail: ${job.detail}` : null,
+      job.verificationSummary ? `verification: ${job.verificationSummary}` : null,
+      artifact ? `artifact: ${artifact.title}` : job.artifactTitle ? `artifact: ${job.artifactTitle}` : null,
       job.prompt ? `prompt: ${job.prompt}` : null,
     ]
       .filter((part): part is string => Boolean(part))
       .join('\n');
+  }
+
+  private formatJobResult(job: BackgroundJobState): string {
+    const artifact = this.getArtifactById(job.artifactId);
+    if (artifact) {
+      return [
+        `${artifact.title}`,
+        `source: ${artifact.source}`,
+        artifact.mode ? `mode: ${BLACKPINK_MODES[artifact.mode].label}` : null,
+        `created: ${artifact.createdAt}`,
+        '',
+        artifact.summary,
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join('\n');
+    }
+
+    if (job.verificationSummary) {
+      return [
+        `Job ${job.id}`,
+        `verification: ${job.verificationSummary}`,
+        job.detail ? `detail: ${job.detail}` : null,
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join('\n');
+    }
+
+    return `Job ${job.id} has no stored result yet.`;
   }
 
   private resolveBackgroundJob(reference: string): BackgroundJobState {
@@ -4446,6 +4543,14 @@ export class NativeBridgeController {
       return this.formatJobInspect(this.resolveBackgroundJob(ref));
     }
 
+    if (command === 'result') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs result <index-or-id>';
+      }
+      return this.formatJobResult(this.resolveBackgroundJob(ref));
+    }
+
     if (command === 'promote') {
       const ref = rest[0]?.trim();
       if (!ref) {
@@ -4486,7 +4591,7 @@ export class NativeBridgeController {
       return `Promoted job ${ref} to foreground.`;
     }
 
-    return 'Usage: /jobs [cancel|retry|inspect|promote] ...';
+    return 'Usage: /jobs [cancel|retry|inspect|result|promote] ...';
   }
 
   private async runCheckpointCommand(message: string): Promise<string> {
@@ -4911,6 +5016,7 @@ export class NativeBridgeController {
       detail: previewText(task, 72),
       prompt: task,
       strategy,
+      reason: options.routeNote ?? `team ${strategy}`,
     });
     this.scheduleStatePush();
 
@@ -4923,6 +5029,7 @@ export class NativeBridgeController {
       detail: previewText(task, 72),
       prompt: task,
       strategy,
+      reason: options.routeNote ?? `team ${strategy}`,
       controller,
     });
     void (async () => {
@@ -4960,7 +5067,7 @@ export class NativeBridgeController {
         );
         this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
         this.finishMessage(assistantMessageId, formatted);
-        this.rememberTeamArtifact(strategy, task, result.output);
+        const artifact = this.rememberTeamArtifact(strategy, task, result.output);
         this.updateBackgroundJob({
           id: backgroundJobId,
           kind: 'team',
@@ -4969,6 +5076,8 @@ export class NativeBridgeController {
           detail: this.teamLastSummary,
           prompt: task,
           strategy,
+          artifactId: artifact.id,
+          artifactTitle: artifact.title,
           controller: null,
         });
 

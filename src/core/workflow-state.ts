@@ -43,6 +43,11 @@ export interface WorkflowBackgroundJobSnapshot {
   purpose?: DelegationPurpose | 'general';
   preferredMode?: NamedMode | null;
   strategy?: 'parallel' | 'sequential' | 'delegate';
+  reason?: string | null;
+  artifactId?: string | null;
+  artifactTitle?: string | null;
+  verificationSummary?: string | null;
+  attempt?: number;
 }
 
 export interface WorkflowStateSnapshot {
