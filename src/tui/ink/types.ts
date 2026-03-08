@@ -125,6 +125,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/briefing', description: 'Generate a session briefing', value: '/briefing' },
   { label: '/drift', description: 'Check drift against the latest briefing', value: '/drift' },
   { label: '/quit', description: 'Exit ddudu', value: '/quit' },
+  { label: '/exit', description: 'Exit ddudu', value: '/exit' },
   { label: '/fire', description: 'Toggle PLAYING_WITH_FIRE mode', value: '/fire' },
   { label: '/init', description: 'Initialize project config', value: '/init' },
   { label: '/skill', description: 'List loaded skills', value: '/skill' },

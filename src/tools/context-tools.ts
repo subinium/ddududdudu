@@ -207,6 +207,41 @@ const changedFileBoost = (queryTokens: string[], relPath: string, changedFiles: 
   return score;
 };
 
+const renderGroupedMatches = (
+  matches: Array<{ path: string; line: string; score: number }>,
+  maxFiles: number,
+  maxLinesPerFile: number,
+): string => {
+  const grouped = new Map<string, { score: number; lines: string[] }>();
+
+  for (const match of matches) {
+    const current = grouped.get(match.path);
+    if (current) {
+      current.score += match.score;
+      if (current.lines.length < maxLinesPerFile) {
+        current.lines.push(match.line);
+      }
+      continue;
+    }
+
+    grouped.set(match.path, {
+      score: match.score,
+      lines: [match.line],
+    });
+  }
+
+  return Array.from(grouped.entries())
+    .sort((a, b) => b[1].score - a[1].score || a[0].localeCompare(b[0]))
+    .slice(0, maxFiles)
+    .map(([path, group]) => {
+      return [
+        `# ${path} (score ${group.score})`,
+        ...group.lines,
+      ].join('\n');
+    })
+    .join('\n\n');
+};
+
 export const repoMapTool: Tool = {
   definition: {
     name: 'repo_map',
@@ -386,6 +421,157 @@ export const referenceSearchTool: Tool = {
         metadata: {
           root: rootPath,
           count: Math.min(scored.length, maxResults),
+        },
+      };
+    } catch (error: unknown) {
+      return {
+        output: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+  },
+};
+
+export const definitionSearchTool: Tool = {
+  definition: {
+    name: 'definition_search',
+    description: 'Find likely symbol definitions with exact identifier and changed-file bias.',
+    parameters: {
+      query: { type: 'string', description: 'Identifier or symbol name to resolve.', required: true },
+      path: { type: 'string', description: 'Base path for searching.' },
+      max_results: { type: 'number', description: 'Maximum files to return.' },
+    },
+  },
+  async execute(args, ctx) {
+    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
+      return { output: 'Missing required argument: query', isError: true };
+    }
+
+    const rootPath =
+      typeof args.path === 'string' && args.path.trim().length > 0
+        ? resolve(ctx.cwd, args.path)
+        : ctx.cwd;
+    const maxResults =
+      typeof args.max_results === 'number' && Number.isFinite(args.max_results)
+        ? Math.max(1, Math.floor(args.max_results))
+        : 8;
+
+    try {
+      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+      const patterns = SYMBOL_PATTERNS(args.query.trim());
+      const changedFiles = new Set(await getChangedFiles(rootPath));
+      const matches: Array<{ path: string; line: string; score: number }> = [];
+
+      for (const filePath of files) {
+        const text = await readTextFile(filePath);
+        if (!text) {
+          continue;
+        }
+
+        const relPath = normalizePath(relative(rootPath, filePath));
+        const lines = text.split('\n');
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (!patterns.some((pattern) => pattern.test(line))) {
+            continue;
+          }
+
+          let score = changedFiles.has(relPath) ? 8 : 3;
+          if (line.includes(args.query.trim())) {
+            score += 3;
+          }
+          if (relPath.toLowerCase().includes(args.query.trim().toLowerCase())) {
+            score += 2;
+          }
+
+          matches.push({
+            path: relPath,
+            line: `${relPath}:${index + 1}: ${line.trim()}`,
+            score,
+          });
+        }
+      }
+
+      const output = renderGroupedMatches(matches, maxResults, 3);
+      return {
+        output,
+        metadata: {
+          root: rootPath,
+          count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
+        },
+      };
+    } catch (error: unknown) {
+      return {
+        output: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+  },
+};
+
+export const referenceHotspotsTool: Tool = {
+  definition: {
+    name: 'reference_hotspots',
+    description: 'Aggregate reference hits by file to find the most relevant implementation hotspots.',
+    parameters: {
+      query: { type: 'string', description: 'Identifier or symbol reference to search for.', required: true },
+      path: { type: 'string', description: 'Base path for searching.' },
+      max_results: { type: 'number', description: 'Maximum files to return.' },
+    },
+  },
+  async execute(args, ctx) {
+    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
+      return { output: 'Missing required argument: query', isError: true };
+    }
+
+    const rootPath =
+      typeof args.path === 'string' && args.path.trim().length > 0
+        ? resolve(ctx.cwd, args.path)
+        : ctx.cwd;
+    const maxResults =
+      typeof args.max_results === 'number' && Number.isFinite(args.max_results)
+        ? Math.max(1, Math.floor(args.max_results))
+        : 8;
+
+    try {
+      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+      const pattern = buildReferencePattern(args.query);
+      const changedFiles = new Set(await getChangedFiles(rootPath));
+      const matches: Array<{ path: string; line: string; score: number }> = [];
+
+      for (const filePath of files) {
+        const text = await readTextFile(filePath);
+        if (!text) {
+          continue;
+        }
+
+        const relPath = normalizePath(relative(rootPath, filePath));
+        const lines = text.split('\n');
+        for (let index = 0; index < lines.length; index += 1) {
+          const line = lines[index];
+          if (!pattern.test(line) || isDefinitionLine(args.query, line)) {
+            continue;
+          }
+
+          let score = changedFiles.has(relPath) ? 5 : 2;
+          if (line.includes(args.query.trim())) {
+            score += 1;
+          }
+
+          matches.push({
+            path: relPath,
+            line: `${relPath}:${index + 1}: ${line.trim()}`,
+            score,
+          });
+        }
+      }
+
+      const output = renderGroupedMatches(matches, maxResults, 3);
+      return {
+        output,
+        metadata: {
+          root: rootPath,
+          count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
         },
       };
     } catch (error: unknown) {

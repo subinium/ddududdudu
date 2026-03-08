@@ -3,7 +3,9 @@ import { bashTool } from './bash-tool.js';
 import {
   changedFilesTool,
   codebaseSearchTool,
+  definitionSearchTool,
   referenceSearchTool,
+  referenceHotspotsTool,
   repoMapTool,
   symbolSearchTool,
 } from './context-tools.js';
@@ -97,7 +99,9 @@ const BUILTIN_TOOLS: Tool[] = [
   globTool,
   repoMapTool,
   symbolSearchTool,
+  definitionSearchTool,
   referenceSearchTool,
+  referenceHotspotsTool,
   changedFilesTool,
   codebaseSearchTool,
   webFetchTool,

@@ -1672,7 +1672,7 @@ impl App {
     }
 
     fn execute_slash_command(&mut self, command: &str) -> Result<()> {
-        if command.trim() == "/quit" {
+        if matches!(command.trim(), "/quit" | "/exit") {
             self.should_quit = true;
             return Ok(());
         }

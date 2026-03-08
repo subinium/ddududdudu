@@ -820,7 +820,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team',
         );
         return;
       case '/plan':
@@ -897,6 +897,7 @@ export class NativeBridgeController {
         this.appendSystemMessage(await this.runInitSummary());
         return;
       case '/quit':
+      case '/exit':
         this.appendSystemMessage('Use /quit from the native TUI directly to exit.');
         return;
       default:
@@ -2038,7 +2039,9 @@ export class NativeBridgeController {
       name === 'web_fetch' ||
       name === 'repo_map' ||
       name === 'symbol_search' ||
+      name === 'definition_search' ||
       name === 'reference_search' ||
+      name === 'reference_hotspots' ||
       name === 'changed_files' ||
       name === 'codebase_search' ||
       name === 'ask_question' ||
@@ -3061,35 +3064,185 @@ export class NativeBridgeController {
     return Array.from(new Set(files)).slice(0, limit);
   }
 
+  private extractPromptSymbolHints(prompt: string, limit: number = 4): string[] {
+    const backticked = Array.from(prompt.matchAll(/`([A-Za-z_][A-Za-z0-9_]*)`/gu))
+      .map((match) => match[1] ?? '')
+      .filter((value) => value.length >= 3);
+    const codeLike = Array.from(
+      prompt.matchAll(/\b(?:[A-Z][A-Za-z0-9_]{2,}|[a-z]+(?:[A-Z][A-Za-z0-9_]+)+|[a-z_]{3,}_[a-z0-9_]+)\b/gu),
+    )
+      .map((match) => match[0] ?? '')
+      .filter((value) => value.length >= 3);
+    const ranked = Array.from(new Set([...backticked, ...codeLike])).filter((value) => {
+      const lower = value.toLowerCase();
+      return ![
+        'context',
+        'prompt',
+        'design',
+        'review',
+        'research',
+        'implement',
+        'background',
+        'parallel',
+        'sequential',
+        'artifact',
+      ].includes(lower);
+    });
+    return ranked.slice(0, limit);
+  }
+
+  private extractFilesFromLineMatches(output: string, limit: number = 5): string[] {
+    const files = output
+      .split('\n')
+      .map((line) => line.trim())
+      .map((line) => /^([^:\s]+):\d+:/u.exec(line)?.[1] ?? '')
+      .filter((line) => line.length > 0);
+    return Array.from(new Set(files)).slice(0, limit);
+  }
+
+  private addFileScore(scores: Map<string, number>, filePath: string, value: number): void {
+    const normalized = filePath.trim();
+    if (!normalized) {
+      return;
+    }
+    scores.set(normalized, (scores.get(normalized) ?? 0) + value);
+  }
+
+  private addRankedOutputScores(
+    scores: Map<string, number>,
+    output: string,
+    weightMultiplier: number,
+  ): void {
+    for (const line of output.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('# ')) {
+        continue;
+      }
+      const match = /^#\s+(.+?)\s+\(score\s+(\d+)/u.exec(trimmed);
+      if (!match) {
+        continue;
+      }
+      const filePath = match[1]?.trim();
+      const score = Number.parseInt(match[2] ?? '0', 10);
+      if (!filePath || !Number.isFinite(score)) {
+        continue;
+      }
+      this.addFileScore(scores, filePath, Math.max(1, Math.min(score, 24)) * weightMultiplier);
+    }
+  }
+
+  private changedFileRelevanceWeight(purpose: DelegationPurpose | 'general'): number {
+    switch (purpose) {
+      case 'execution':
+        return 18;
+      case 'review':
+        return 16;
+      case 'design':
+        return 10;
+      case 'planning':
+        return 8;
+      case 'research':
+        return 6;
+      default:
+        return 10;
+    }
+  }
+
   private async getRelevantFilesForPrompt(
     prompt: string,
     purpose?: DelegationPurpose | 'general',
     limit: number = 5,
   ): Promise<string[]> {
     const hintedFiles = this.extractPromptFileHints(prompt);
-    if (hintedFiles.length >= limit) {
-      return hintedFiles.slice(0, limit);
+    const effectivePurpose = purpose ?? this.inferPromptPurpose(prompt);
+    const scores = new Map<string, number>();
+    for (const filePath of hintedFiles) {
+      this.addFileScore(scores, filePath, 32);
     }
 
-    const tool = this.toolRegistry?.get('codebase_search');
-    if (!tool) {
-      return hintedFiles;
+    const changedFiles = await this.getChangedFiles(10);
+    const changedWeight = this.changedFileRelevanceWeight(effectivePurpose);
+    for (const filePath of changedFiles) {
+      this.addFileScore(scores, filePath, changedWeight);
     }
 
-    try {
-      const query = purpose && purpose !== 'general' ? `${purpose} ${prompt}` : prompt;
-      const result = await tool.execute(
-        {
-          query,
-          max_results: limit,
-        },
-        { cwd: process.cwd() },
-      );
-      const ranked = this.extractRankedFilesFromSearch(result.output, limit);
-      return Array.from(new Set([...hintedFiles, ...ranked])).slice(0, limit);
-    } catch {
-      return hintedFiles;
+    const symbolHints = this.extractPromptSymbolHints(prompt, 3);
+    const codebaseTool = this.toolRegistry?.get('codebase_search');
+    const definitionTool = this.toolRegistry?.get('definition_search') ?? this.toolRegistry?.get('symbol_search');
+    const hotspotTool = this.toolRegistry?.get('reference_hotspots') ?? this.toolRegistry?.get('reference_search');
+
+    const pendingSearches: Array<Promise<void>> = [];
+    if (codebaseTool) {
+      pendingSearches.push((async () => {
+        try {
+          const query = effectivePurpose && effectivePurpose !== 'general'
+            ? `${effectivePurpose} ${prompt}`
+            : prompt;
+          const result = await codebaseTool.execute(
+            {
+              query,
+              max_results: Math.max(limit, 8),
+            },
+            { cwd: process.cwd() },
+          );
+          this.addRankedOutputScores(scores, result.output, 2);
+          for (const filePath of this.extractRankedFilesFromSearch(result.output, limit + 3)) {
+            this.addFileScore(scores, filePath, 10);
+          }
+        } catch {
+          // Fall back to prompt/file hints only.
+        }
+      })());
     }
+
+    for (const symbol of symbolHints) {
+      if (definitionTool) {
+        pendingSearches.push((async () => {
+          try {
+            const result = await definitionTool.execute(
+              {
+                query: symbol,
+                max_results: Math.max(limit, 6),
+              },
+              { cwd: process.cwd() },
+            );
+            this.addRankedOutputScores(scores, result.output, 2);
+            for (const filePath of this.extractFilesFromLineMatches(result.output, limit + 2)) {
+              this.addFileScore(scores, filePath, 12);
+            }
+          } catch {
+            // Ignore symbol-specific failures.
+          }
+        })());
+      }
+
+      if (hotspotTool) {
+        pendingSearches.push((async () => {
+          try {
+            const result = await hotspotTool.execute(
+              {
+                query: symbol,
+                max_results: Math.max(limit, 6),
+              },
+              { cwd: process.cwd() },
+            );
+            this.addRankedOutputScores(scores, result.output, 1);
+            for (const filePath of this.extractFilesFromLineMatches(result.output, limit + 2)) {
+              this.addFileScore(scores, filePath, 8);
+            }
+          } catch {
+            // Ignore symbol-specific failures.
+          }
+        })());
+      }
+    }
+
+    await Promise.all(pendingSearches);
+
+    return Array.from(scores.entries())
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([filePath]) => filePath)
+      .slice(0, limit);
   }
 
   private async buildPromptContextSnapshot(
