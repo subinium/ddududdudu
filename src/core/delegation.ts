@@ -34,6 +34,7 @@ export interface DelegationRequest {
   isolatedLabel?: string;
   verificationMode?: VerificationMode;
   forceIsolation?: boolean;
+  contextSnapshot?: string;
 }
 
 export interface DelegationHandlers {
@@ -274,8 +275,11 @@ export class DelegationRuntime {
 
     try {
       const messages: ApiMessage[] = [{ role: 'user', content: request.prompt }];
+      const combinedSystemPrompt = [request.systemPrompt ?? profile.systemPrompt, request.contextSnapshot]
+        .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
+        .join('\n\n');
       for await (const event of client.stream(messages, {
-        systemPrompt: request.systemPrompt ?? profile.systemPrompt,
+        systemPrompt: combinedSystemPrompt,
         model,
         maxTokens: request.maxTokens ?? 8192,
         signal: handlers.signal,

@@ -130,6 +130,18 @@ struct NativeAgentActivityState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct NativeBackgroundJobState {
+    id: String,
+    kind: String,
+    label: String,
+    status: String,
+    detail: Option<String>,
+    started_at: u64,
+    updated_at: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct NativeWorkspaceState {
     label: String,
     path: String,
@@ -187,8 +199,12 @@ struct NativeTuiState {
     session_id: Option<String>,
     remote_session_id: Option<String>,
     remote_session_count: u64,
+    team_run_strategy: Option<String>,
+    team_run_task: Option<String>,
+    team_run_since: Option<u64>,
     todos: Vec<NativePlanItemState>,
     agent_activities: Vec<NativeAgentActivityState>,
+    background_jobs: Vec<NativeBackgroundJobState>,
     workspace: Option<NativeWorkspaceState>,
     verification: Option<NativeVerificationState>,
     error: Option<String>,
@@ -423,8 +439,12 @@ impl App {
                 session_id: None,
                 remote_session_id: None,
                 remote_session_count: 0,
+                team_run_strategy: None,
+                team_run_task: None,
+                team_run_since: None,
                 todos: Vec::new(),
                 agent_activities: Vec::new(),
+                background_jobs: Vec::new(),
                 workspace: None,
                 verification: None,
                 error: None,
@@ -819,6 +839,71 @@ impl App {
                 );
             }
         }
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(sidebar_header("Agents"));
+        let queued_count = self
+            .state
+            .agent_activities
+            .iter()
+            .filter(|item| item.status == "queued")
+            .count();
+        let running_count = self
+            .state
+            .agent_activities
+            .iter()
+            .filter(|item| item.status == "running" || item.status == "verifying")
+            .count();
+        let done_count = self
+            .state
+            .agent_activities
+            .iter()
+            .filter(|item| item.status == "done")
+            .count();
+        if let Some(strategy) = &self.state.team_run_strategy {
+            let elapsed = format_elapsed(self.state.team_run_since);
+            let counts = format!(
+                "{} running · {} queued · {} done",
+                format_count(running_count as u64),
+                format_count(queued_count as u64),
+                format_count(done_count as u64)
+            );
+            push_sidebar_rail_item(
+                &mut lines,
+                if running_count > 0 {
+                    SPINNER_FRAMES[self.spinner_index]
+                } else {
+                    "◎"
+                },
+                if running_count > 0 { ACCENT } else { SUCCESS },
+                format!("{} {elapsed}", strategy),
+                self.state
+                    .team_run_task
+                    .as_ref()
+                    .map(|task| format!("{} · {}", counts, preview_line(task, 20)))
+                    .or_else(|| Some(counts)),
+                FG,
+                ACCENT_DIM,
+            );
+        } else if !self.state.agent_activities.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                if running_count > 0 {
+                    SPINNER_FRAMES[self.spinner_index]
+                } else {
+                    "◎"
+                },
+                if running_count > 0 { ACCENT } else { ACCENT_DIM },
+                "delegated runs".to_string(),
+                Some(format!(
+                    "{} running · {} queued",
+                    format_count(running_count as u64),
+                    format_count(queued_count as u64)
+                )),
+                FG,
+                ACCENT_DIM,
+            );
+        }
         if self.state.agent_activities.is_empty() {
             push_sidebar_rail_item(
                 &mut lines,
@@ -906,6 +991,27 @@ impl App {
                 ACCENT_DIM,
                 "idle".to_string(),
                 Some("no running request".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        for job in self.state.background_jobs.iter().take(4) {
+            let (marker, color) = match job.status.as_str() {
+                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                "done" => ("✓", SUCCESS),
+                "error" => ("!", ERROR),
+                _ => ("·", ACCENT_DIM),
+            };
+            let elapsed = format_elapsed(Some(job.started_at));
+            push_sidebar_rail_item(
+                &mut lines,
+                marker,
+                color,
+                format!("{} {elapsed}", preview_line(&job.label, 18)),
+                job.detail
+                    .as_ref()
+                    .map(|detail| preview_line(detail, 28))
+                    .or_else(|| Some(job.kind.clone())),
                 FG,
                 ACCENT_DIM,
             );
@@ -1013,6 +1119,13 @@ impl App {
             }
             spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
             spans.push(Span::styled("Esc interrupt", Style::default().fg(ACCENT_DIM)));
+            if !self.state.queued_prompts.is_empty() {
+                spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+                spans.push(Span::styled(
+                    format!("queue {}", format_count(self.state.queued_prompts.len() as u64)),
+                    Style::default().fg(ACCENT),
+                ));
+            }
         } else if let Some(prompt) = &self.state.ask_user {
             spans.push(Span::styled(
                 "ask",
@@ -1062,12 +1175,14 @@ impl App {
 
         let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
+        let queue_visible = !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none();
+        let footer_rows = if queue_visible { 2 } else { 1 };
         let metrics = wrap_editor_text(
             &self.composer.text,
             self.composer.cursor,
             content_width.max(1),
         );
-        let max_visible = inner.height.saturating_sub(1) as usize;
+        let max_visible = inner.height.saturating_sub(footer_rows) as usize;
         let start = metrics
             .lines
             .len()
@@ -1082,6 +1197,35 @@ impl App {
             .collect::<Vec<_>>();
 
         let mut lines = Vec::new();
+        if queue_visible {
+            let next_prompt = self
+                .state
+                .queued_prompts
+                .first()
+                .map(|prompt| preview_line(prompt, content_width.saturating_sub(16)))
+                .unwrap_or_default();
+            let remaining = self.state.queued_prompts.len().saturating_sub(1);
+            let mut queue_spans = vec![
+                Span::styled("queue ", Style::default().fg(ACCENT_DIM)),
+                Span::styled(
+                    format_count(self.state.queued_prompts.len() as u64),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !next_prompt.is_empty() {
+                queue_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+                queue_spans.push(Span::styled(next_prompt, Style::default().fg(FG)));
+            }
+            if remaining > 0 {
+                queue_spans.push(Span::styled("  ", Style::default().fg(ACCENT_DIM)));
+                queue_spans.push(Span::styled(
+                    format!("+{}", format_count(remaining as u64)),
+                    Style::default().fg(ACCENT_DIM),
+                ));
+            }
+            lines.push(Line::from(queue_spans));
+        }
+
         if visible_lines.is_empty() {
             lines.push(Line::from(vec![
                 Span::styled(prompt_prefix.clone(), prompt_style),
@@ -1122,7 +1266,9 @@ impl App {
         );
 
         let cursor_x = inner.x + prompt_prefix.width() as u16 + metrics.cursor_col as u16;
-        let cursor_y = inner.y + (metrics.cursor_row.saturating_sub(start) as u16);
+        let cursor_y = inner.y
+            + if queue_visible { 1 } else { 0 }
+            + (metrics.cursor_row.saturating_sub(start) as u16);
         (
             cursor_x.min(inner.right().saturating_sub(1)),
             cursor_y.min(inner.bottom().saturating_sub(2)),
@@ -2075,6 +2221,186 @@ fn is_horizontal_rule(text: &str) -> bool {
     trimmed.chars().all(|ch| matches!(ch, '-' | '*' | '_'))
 }
 
+#[derive(Clone, Copy)]
+enum TableAlign {
+    Left,
+    Center,
+    Right,
+}
+
+fn parse_markdown_table_cells(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+
+    let cells = trimmed
+        .trim_matches('|')
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect::<Vec<_>>();
+    if cells.len() < 2 {
+        return None;
+    }
+
+    Some(cells)
+}
+
+fn parse_markdown_table_alignments(text: &str, expected_cols: usize) -> Option<Vec<TableAlign>> {
+    let cells = parse_markdown_table_cells(text)?;
+    if cells.len() != expected_cols {
+        return None;
+    }
+
+    let mut aligns = Vec::with_capacity(expected_cols);
+    for cell in cells {
+        let compact = cell.replace(' ', "");
+        if compact.is_empty() || !compact.chars().all(|ch| matches!(ch, '-' | ':')) {
+            return None;
+        }
+
+        let align = match (compact.starts_with(':'), compact.ends_with(':')) {
+            (true, true) => TableAlign::Center,
+            (false, true) => TableAlign::Right,
+            _ => TableAlign::Left,
+        };
+        aligns.push(align);
+    }
+
+    Some(aligns)
+}
+
+fn pad_table_cell(text: &str, width: usize, align: TableAlign) -> String {
+    let clipped = preview_line(text, width.max(1));
+    let visible_width = UnicodeWidthStr::width(clipped.as_str());
+    let pad = width.saturating_sub(visible_width);
+
+    match align {
+        TableAlign::Left => format!("{clipped}{}", " ".repeat(pad)),
+        TableAlign::Right => format!("{}{}", " ".repeat(pad), clipped),
+        TableAlign::Center => {
+            let left = pad / 2;
+            let right = pad.saturating_sub(left);
+            format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
+        }
+    }
+}
+
+fn build_table_border(left: &str, mid: &str, right: &str, widths: &[usize]) -> String {
+    let mut out = String::from(left);
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            out.push_str(mid);
+        }
+        out.push_str(&"─".repeat(width + 2));
+    }
+    out.push_str(right);
+    out
+}
+
+fn build_table_row_spans(
+    cells: &[String],
+    widths: &[usize],
+    aligns: &[TableAlign],
+    header: bool,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let border_style = Style::default().fg(ACCENT_DIM);
+    let cell_style = if header {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(FG)
+    };
+
+    spans.push(Span::styled("│", border_style));
+    for (index, cell) in cells.iter().enumerate() {
+        let align = aligns.get(index).copied().unwrap_or(TableAlign::Left);
+        spans.push(Span::styled(" ", border_style));
+        spans.push(Span::styled(
+            pad_table_cell(cell, widths[index], align),
+            cell_style,
+        ));
+        spans.push(Span::styled(" ", border_style));
+        spans.push(Span::styled("│", border_style));
+    }
+    spans
+}
+
+fn render_markdown_table_block(
+    raw_lines: &[&str],
+    width: usize,
+) -> Option<(usize, Vec<Vec<Span<'static>>>)> {
+    if raw_lines.len() < 2 {
+        return None;
+    }
+
+    let header = parse_markdown_table_cells(raw_lines[0])?;
+    let aligns = parse_markdown_table_alignments(raw_lines[1], header.len())?;
+    let mut rows = vec![header];
+    let mut consumed = 2usize;
+
+    while consumed < raw_lines.len() {
+        let Some(row) = parse_markdown_table_cells(raw_lines[consumed]) else {
+            break;
+        };
+        if row.len() != rows[0].len() {
+            break;
+        }
+        rows.push(row);
+        consumed += 1;
+    }
+
+    let col_count = rows[0].len();
+    let overhead = (3 * col_count) + 1;
+    if width <= overhead + col_count {
+        return None;
+    }
+
+    let mut widths = vec![3usize; col_count];
+    for row in &rows {
+        for (index, cell) in row.iter().enumerate() {
+            widths[index] = widths[index].max(UnicodeWidthStr::width(cell.as_str()).max(1));
+        }
+    }
+
+    let max_total = width.saturating_sub(overhead);
+    while widths.iter().sum::<usize>() > max_total {
+        let Some((largest_index, largest_width)) = widths
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, width)| **width)
+        else {
+            break;
+        };
+        if *largest_width <= 4 {
+            break;
+        }
+        widths[largest_index] = largest_width.saturating_sub(1);
+    }
+
+    let mut rendered = Vec::new();
+    rendered.push(vec![Span::styled(
+        build_table_border("╭", "┬", "╮", &widths),
+        Style::default().fg(ACCENT_DIM),
+    )]);
+    rendered.push(build_table_row_spans(&rows[0], &widths, &aligns, true));
+    rendered.push(vec![Span::styled(
+        build_table_border("├", "┼", "┤", &widths),
+        Style::default().fg(ACCENT_DIM),
+    )]);
+
+    for row in rows.iter().skip(1) {
+        rendered.push(build_table_row_spans(row, &widths, &aligns, false));
+    }
+
+    rendered.push(vec![Span::styled(
+        build_table_border("╰", "┴", "╯", &widths),
+        Style::default().fg(ACCENT_DIM),
+    )]);
+
+    Some((consumed, rendered))
+}
+
 fn render_assistant_markdown_line(
     raw_line: &str,
     width: usize,
@@ -2224,12 +2550,33 @@ fn build_transcript_lines(messages: &[NativeMessageState], width: usize) -> Vec<
             let mut first_visual_line = true;
             if message.role == "assistant" {
                 let mut in_code_block = false;
-                for raw_line in message.content.split('\n') {
-                    let rendered = render_assistant_markdown_line(
-                        raw_line,
-                        width.saturating_sub(prefix_width),
-                        &mut in_code_block,
-                    );
+                let raw_lines = message.content.split('\n').collect::<Vec<_>>();
+                let mut index = 0usize;
+                while index < raw_lines.len() {
+                    let raw_line = raw_lines[index];
+                    let rendered = if !in_code_block {
+                        if let Some((consumed, table_lines)) = render_markdown_table_block(
+                            &raw_lines[index..],
+                            width.saturating_sub(prefix_width),
+                        ) {
+                            index += consumed;
+                            table_lines
+                        } else {
+                            index += 1;
+                            render_assistant_markdown_line(
+                                raw_line,
+                                width.saturating_sub(prefix_width),
+                                &mut in_code_block,
+                            )
+                        }
+                    } else {
+                        index += 1;
+                        render_assistant_markdown_line(
+                            raw_line,
+                            width.saturating_sub(prefix_width),
+                            &mut in_code_block,
+                        )
+                    };
                     append_guttered_span_lines(
                         &mut lines,
                         rendered,

@@ -30,6 +30,7 @@ export interface ToolContext {
     detail?: string;
     workspacePath?: string;
   }) => void;
+  contextSnapshot?: (prompt: string, purpose?: string) => Promise<string>;
   askUser?: (question: string, options?: string[]) => Promise<string>;
   authToken?: string;
   authBaseUrl?: string;

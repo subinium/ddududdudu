@@ -88,6 +88,9 @@ export const taskTool: Tool = {
       });
 
       try {
+        const contextSnapshot = ctx.contextSnapshot
+          ? await ctx.contextSnapshot(args.prompt, purpose)
+          : undefined;
         const result = await ctx.delegation.run(
           {
             prompt: args.prompt,
@@ -98,6 +101,7 @@ export const taskTool: Tool = {
             parentSessionId: ctx.sessionId,
             cwd: ctx.cwd,
             isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
+            contextSnapshot,
           },
           {
             onText: (text: string) => {

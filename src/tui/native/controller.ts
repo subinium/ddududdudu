@@ -95,6 +95,16 @@ interface AgentActivityState {
   updatedAt: number;
 }
 
+interface BackgroundJobState {
+  id: string;
+  kind: 'delegate' | 'team';
+  label: string;
+  status: 'running' | 'done' | 'error';
+  detail: string | null;
+  startedAt: number;
+  updatedAt: number;
+}
+
 type EmitFn = (event: NativeBridgeEvent) => void;
 type AskUserResolver = {
   resolve: (answer: string) => void;
@@ -107,6 +117,7 @@ const MAX_TOOL_TURNS_FALLBACK = 25;
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
 const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
+const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
 const DIFF_FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
 
@@ -580,8 +591,12 @@ export class NativeBridgeController {
     sessionId: null,
     remoteSessionId: null,
     remoteSessionCount: 0,
+    teamRunStrategy: null,
+    teamRunTask: null,
+    teamRunSince: null,
     todos: [],
     agentActivities: [],
+    backgroundJobs: [],
     workspace: null,
     verification: null,
     error: null,
@@ -606,6 +621,7 @@ export class NativeBridgeController {
   private lastSafePermissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private todos: PlanItem[] = [];
   private agentActivities: AgentActivityState[] = [];
+  private backgroundJobs: BackgroundJobState[] = [];
   private readonly epistemicState = new EpistemicStateManager();
   private abortController: AbortController | null = null;
   private activeOperation: 'request' | 'team' | null = null;
@@ -958,18 +974,26 @@ export class NativeBridgeController {
     if (!trimmedContent) {
       return;
     }
-    this.resetEphemeralAgentActivities();
 
     if (this.state.loading && this.abortController) {
+      if (await this.maybeStartBackgroundPrompt(trimmedContent)) {
+        return;
+      }
       this.queuedPrompts.push(trimmedContent);
       this.state.queuedPrompts = [...this.queuedPrompts];
       this.scheduleStatePush();
       return;
     }
 
+    this.resetEphemeralAgentActivities();
+
     const mode = this.currentMode;
     const model = this.getCurrentModel();
     await this.refreshSystemPrompt();
+    const requestContextSnapshot = await this.buildPromptContextSnapshot(trimmedContent);
+    const requestSystemPrompt = requestContextSnapshot
+      ? `${this.systemPrompt}\n\n${requestContextSnapshot}`
+      : this.systemPrompt;
     this.tokenCounter.setModel(model);
     await this.maybeAutoCompact(trimmedContent);
 
@@ -1059,7 +1083,7 @@ export class NativeBridgeController {
             }
 
             const stream = this.activeClient.stream(apiMessages, {
-              systemPrompt: this.systemPrompt,
+              systemPrompt: requestSystemPrompt,
               model,
               tools,
               signal: controller.signal,
@@ -1309,6 +1333,40 @@ export class NativeBridgeController {
     return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
   }
 
+  private canStartBackgroundJob(): boolean {
+    const runningJobs = this.backgroundJobs.filter((job) => job.status === 'running').length;
+    return runningJobs < MAX_BACKGROUND_JOBS;
+  }
+
+  private async maybeStartBackgroundPrompt(trimmedContent: string): Promise<boolean> {
+    if (this.currentMode !== 'jennie' || !this.canStartBackgroundJob()) {
+      return false;
+    }
+
+    const decision = this.classifyJennieAutoRoute(trimmedContent);
+    if (decision.kind === 'direct') {
+      return false;
+    }
+
+    const userMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'user',
+      content: trimmedContent,
+      timestamp: Date.now(),
+    };
+    this.state.messages.push(userMessage);
+
+    if (decision.kind === 'team') {
+      await this.startBackgroundTeamRun(decision.strategy ?? 'parallel', trimmedContent, {
+        routeNote: `${this.formatAutoRouteNotice(decision)} · background`,
+      });
+      return true;
+    }
+
+    await this.startBackgroundDelegatedRoute(userMessage, decision);
+    return true;
+  }
+
   private async maybeHandleJennieAutoRoute(trimmedContent: string): Promise<boolean> {
     if (this.currentMode !== 'jennie') {
       return false;
@@ -1337,6 +1395,232 @@ export class NativeBridgeController {
 
     await this.executeDelegatedRoute(userMessage, decision);
     return true;
+  }
+
+  private async startBackgroundDelegatedRoute(
+    userMessage: NativeMessageState,
+    decision: AutoRouteDecision,
+  ): Promise<void> {
+    const assistantMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+    const backgroundJobId = randomUUID();
+    const routeActivityId = `bg:${backgroundJobId}:route`;
+    const routeNotice = `${this.formatAutoRouteNotice(decision)} · background`;
+
+    this.state.messages.push({
+      id: randomUUID(),
+      role: 'system',
+      content: routeNotice,
+      timestamp: Date.now(),
+    });
+    this.state.messages.push(assistantMessage);
+    this.updateBackgroundJob({
+      id: backgroundJobId,
+      kind: 'delegate',
+      label: decision.preferredMode
+        ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+        : `delegate ${decision.purpose ?? 'general'}`,
+      status: 'running',
+      detail: previewText(userMessage.content, 72),
+    });
+    this.updateAgentActivity({
+      id: routeActivityId,
+      label: 'route',
+      status: 'running',
+      mode: decision.preferredMode ?? null,
+      purpose: decision.purpose ?? 'general',
+      detail: `background · ${previewText(userMessage.content, 64)}`,
+    });
+
+    this.scheduleStatePush();
+
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const contextSnapshot = await this.buildPromptContextSnapshot(
+          userMessage.content,
+          decision.purpose ?? 'general',
+        );
+        await this.hookRegistry.emit('beforeSend', {
+          provider: this.getCurrentProvider(),
+          model: this.getCurrentModel(),
+          sessionId: this.state.sessionId,
+          remoteSessionId: null,
+          requestMode: 'full',
+          prompt: userMessage.content,
+        });
+
+        const runtime = this.createDelegationRuntime();
+        const result = await runtime.run(
+          {
+            prompt: userMessage.content,
+            purpose: decision.purpose,
+            preferredMode: decision.preferredMode,
+            parentSessionId: this.state.sessionId,
+            maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+            cwd: process.cwd(),
+            isolatedLabel: `background-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
+            verificationMode: this.verificationModeForPurpose(decision.purpose),
+            contextSnapshot,
+          },
+          {
+            signal: controller.signal,
+            onText: (delta) => {
+              if (!delta) {
+                return;
+              }
+
+              const current = this.state.messages.find((message) => message.id === assistantMessage.id)?.content ?? '';
+              this.updateMessage(assistantMessage.id, current + delta);
+              this.updateBackgroundJob({
+                id: backgroundJobId,
+                kind: 'delegate',
+                label: decision.preferredMode
+                  ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+                  : `delegate ${decision.purpose ?? 'general'}`,
+                status: 'running',
+                detail: previewText(delta, 72),
+              });
+              this.updateAgentActivity({
+                id: routeActivityId,
+                label: 'route',
+                status: 'running',
+                mode: decision.preferredMode ?? null,
+                purpose: decision.purpose ?? 'general',
+                detail: previewText(delta, 64),
+              });
+            },
+            onToolState: (states) => {
+              this.applyToolStates(assistantMessage.id, states);
+              const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
+              if (activeTool) {
+                const toolLabel = `${activeTool.name} ${activeTool.status}`;
+                this.updateBackgroundJob({
+                  id: backgroundJobId,
+                  kind: 'delegate',
+                  label: decision.preferredMode
+                    ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+                    : `delegate ${decision.purpose ?? 'general'}`,
+                  status: 'running',
+                  detail: toolLabel,
+                });
+                this.updateAgentActivity({
+                  id: routeActivityId,
+                  label: 'route',
+                  status: 'running',
+                  mode: decision.preferredMode ?? null,
+                  purpose: decision.purpose ?? 'general',
+                  detail: toolLabel,
+                });
+              }
+            },
+            onVerificationState: (state) => {
+              this.updateAgentActivity({
+                id: routeActivityId,
+                label: 'route',
+                status:
+                  state.status === 'running'
+                    ? 'verifying'
+                    : state.status === 'passed' || state.status === 'skipped'
+                      ? 'done'
+                      : 'error',
+                mode: decision.preferredMode ?? null,
+                purpose: decision.purpose ?? 'general',
+                detail: state.summary ?? null,
+              });
+            },
+          },
+        );
+
+        const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
+        this.finishMessage(assistantMessage.id, finalText);
+        this.updateBackgroundJob({
+          id: backgroundJobId,
+          kind: 'delegate',
+          label: `${BLACKPINK_MODES[result.mode].label} ${result.purpose ?? 'general'}`,
+          status: 'done',
+          detail: result.verification?.summary ?? previewText(finalText, 72),
+        });
+        this.updateAgentActivity({
+          id: routeActivityId,
+          label: BLACKPINK_MODES[result.mode].label,
+          status: 'done',
+          mode: result.mode,
+          purpose: result.purpose,
+          detail: result.verification?.summary ?? previewText(finalText, 64),
+          workspacePath: result.workspace?.path ?? null,
+        });
+
+        await this.hookRegistry.emit('afterResponse', {
+          provider: result.provider,
+          model: result.model,
+          sessionId: this.state.sessionId,
+          remoteSessionId: result.remoteSessionId ?? null,
+          requestMode: 'full',
+          inputTokens: result.usage.input,
+          outputTokens: result.usage.output,
+        });
+
+        if (this.sessionManager && this.state.sessionId) {
+          await this.sessionManager.append(this.state.sessionId, {
+            type: 'message',
+            timestamp: new Date().toISOString(),
+            data: {
+              user: userMessage.content,
+              assistant: finalText,
+              mode: result.mode,
+              provider: result.provider,
+              model: result.model,
+              requestMode: 'delegate_background',
+              purpose: result.purpose,
+              autoRoute: decision.reason,
+              remoteSessionId: result.remoteSessionId,
+              workspacePath: result.workspace?.path,
+              verification: result.verification
+                ? {
+                    status: result.verification.status,
+                    summary: result.verification.summary,
+                  }
+                : undefined,
+              inputTokens: result.usage.input,
+              outputTokens: result.usage.output,
+            },
+          });
+        }
+      } catch (error: unknown) {
+        const detail = controller.signal.aborted ? 'background job aborted' : serializeError(error);
+        this.updateBackgroundJob({
+          id: backgroundJobId,
+          kind: 'delegate',
+          label: decision.preferredMode
+            ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+            : `delegate ${decision.purpose ?? 'general'}`,
+          status: 'error',
+          detail,
+        });
+        this.updateAgentActivity({
+          id: routeActivityId,
+          label: 'route',
+          status: 'error',
+          mode: decision.preferredMode ?? null,
+          purpose: decision.purpose ?? 'general',
+          detail,
+        });
+        await this.hookRegistry.emit('onError', {
+          provider: this.getCurrentProvider(),
+          model: this.getCurrentModel(),
+          sessionId: this.state.sessionId,
+          operation: 'delegate_background',
+          message: serializeError(error),
+        });
+        this.finishMessage(assistantMessage.id, controller.signal.aborted ? '[background request aborted]' : toErrorMessage(error));
+      }
+    })();
   }
 
   private async executeDelegatedRoute(
@@ -1380,6 +1664,10 @@ export class NativeBridgeController {
     });
 
     try {
+      const contextSnapshot = await this.buildPromptContextSnapshot(
+        userMessage.content,
+        decision.purpose ?? 'general',
+      );
       await this.hookRegistry.emit('beforeSend', {
         provider: this.getCurrentProvider(),
         model: this.getCurrentModel(),
@@ -1400,6 +1688,7 @@ export class NativeBridgeController {
           cwd: process.cwd(),
           isolatedLabel: `route-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
           verificationMode: this.verificationModeForPurpose(decision.purpose),
+          contextSnapshot,
         },
         {
           signal: controller.signal,
@@ -1839,6 +2128,9 @@ export class NativeBridgeController {
             detail: activity.detail ?? null,
             workspacePath: activity.workspacePath ?? null,
           });
+        },
+        contextSnapshot: async (prompt: string, purpose?: string): Promise<string> => {
+          return this.buildPromptContextSnapshot(prompt, purpose as DelegationPurpose | 'general' | undefined);
         },
       };
 
@@ -2651,8 +2943,95 @@ export class NativeBridgeController {
     }
   }
 
-  private async buildPromptContextSnapshot(): Promise<string> {
+  private extractPromptFileHints(prompt: string): string[] {
+    const matches = prompt.match(/(?:^|[\s`"'(])([./]?[A-Za-z0-9_-]+(?:\/[A-Za-z0-9._-]+)+)(?=$|[\s`"'),:;])/gu) ?? [];
+    return Array.from(
+      new Set(
+        matches
+          .map((entry) => entry.trim().replace(/^['"`(]+|['"`),:;]+$/gu, ''))
+          .filter((entry) => entry.length > 0),
+      ),
+    ).slice(0, 8);
+  }
+
+  private inferPromptPurpose(prompt: string): DelegationPurpose | 'general' {
+    const lower = prompt.toLowerCase();
+    if (/\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color)\b/u.test(lower)) {
+      return 'design';
+    }
+    if (/\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b/u.test(lower)) {
+      return 'planning';
+    }
+    if (/\b(review|audit|verify|validation|regression|risk|critic|critique)\b/u.test(lower)) {
+      return 'review';
+    }
+    if (/\b(research|investigate|look into|survey|compare|explore)\b/u.test(lower)) {
+      return 'research';
+    }
+    if (/\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b/u.test(lower)) {
+      return 'execution';
+    }
+    return 'general';
+  }
+
+  private extractRankedFilesFromSearch(output: string, limit: number = 5): string[] {
+    const files = output
+      .split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith('# '))
+      .map((line) => line.slice(2))
+      .map((line) => line.replace(/\s+\(score.+$/u, '').trim())
+      .filter((line) => line.length > 0);
+    return Array.from(new Set(files)).slice(0, limit);
+  }
+
+  private async getRelevantFilesForPrompt(
+    prompt: string,
+    purpose?: DelegationPurpose | 'general',
+    limit: number = 5,
+  ): Promise<string[]> {
+    const hintedFiles = this.extractPromptFileHints(prompt);
+    if (hintedFiles.length >= limit) {
+      return hintedFiles.slice(0, limit);
+    }
+
+    const tool = this.toolRegistry?.get('codebase_search');
+    if (!tool) {
+      return hintedFiles;
+    }
+
+    try {
+      const query = purpose && purpose !== 'general' ? `${purpose} ${prompt}` : prompt;
+      const result = await tool.execute(
+        {
+          query,
+          max_results: limit,
+        },
+        { cwd: process.cwd() },
+      );
+      const ranked = this.extractRankedFilesFromSearch(result.output, limit);
+      return Array.from(new Set([...hintedFiles, ...ranked])).slice(0, limit);
+    } catch {
+      return hintedFiles;
+    }
+  }
+
+  private async buildPromptContextSnapshot(
+    prompt?: string,
+    purpose?: DelegationPurpose | 'general',
+  ): Promise<string> {
     const parts: string[] = [];
+    const effectivePurpose = purpose ?? (prompt ? this.inferPromptPurpose(prompt) : 'general');
+    if (prompt) {
+      parts.push(`request_focus: ${effectivePurpose}`);
+      const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
+      if (relevantFiles.length > 0) {
+        parts.push(
+          'relevant_files:',
+          ...relevantFiles.map((filePath) => `- ${filePath}`),
+        );
+      }
+    }
     const changedFiles = await this.getChangedFiles(8);
     if (changedFiles.length > 0) {
       parts.push(
@@ -2705,6 +3084,18 @@ export class NativeBridgeController {
       );
     }
 
+    const activeBackgroundJobs = this.backgroundJobs
+      .filter((job) => job.status === 'running')
+      .slice(0, 3);
+    if (activeBackgroundJobs.length > 0) {
+      parts.push(
+        ...activeBackgroundJobs.map((job) => {
+          const detail = job.detail ? ` · ${previewText(job.detail, 120)}` : '';
+          return `background_job: ${job.label} · ${job.kind}${detail}`;
+        }),
+      );
+    }
+
     if (this.state.workspace?.path) {
       parts.push(`workspace: ${this.state.workspace.path}`);
     }
@@ -2744,6 +3135,12 @@ export class NativeBridgeController {
         return `${scope} · ${item.status}${item.detail ? ` · ${previewText(item.detail, 120)}` : ''}`;
       });
 
+    const backgroundJobs = this.backgroundJobs
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 4)
+      .map((job) => `${job.label} · ${job.status}${job.detail ? ` · ${previewText(job.detail, 120)}` : ''}`);
+
     return [
       'Context Snapshot',
       '',
@@ -2754,7 +3151,7 @@ export class NativeBridgeController {
       '- loaded skills',
       '- layered memory',
       '- workflow state (permissions + todo plan)',
-      '- dynamic context snapshot (changed files, briefing, uncertainties, active agents, workspace)',
+      '- dynamic context snapshot (changed files, briefing, uncertainties, active agents, background jobs, workspace)',
       '',
       `Changed files: ${changedFiles.length > 0 ? changedFiles.join(', ') : 'none'}`,
       `Briefing: ${briefingSummary}`,
@@ -2764,6 +3161,9 @@ export class NativeBridgeController {
       ...(activeAgents.length > 0
         ? ['Recent agents:', ...activeAgents.map((entry) => `- ${entry}`)]
         : ['Recent agents: none']),
+      ...(backgroundJobs.length > 0
+        ? ['Background jobs:', ...backgroundJobs.map((entry) => `- ${entry}`)]
+        : ['Background jobs: none']),
       `Uncertainties: ${this.epistemicState.getStats().uncertainties}`,
     ].join('\n');
   }
@@ -2866,6 +3266,26 @@ export class NativeBridgeController {
       .map((activity) => ({ ...activity }));
   }
 
+  private syncBackgroundJobs(): void {
+    this.state.backgroundJobs = this.backgroundJobs
+      .slice()
+      .sort((a, b) => {
+        const priority = (job: BackgroundJobState): number => {
+          if (job.status === 'running') {
+            return 0;
+          }
+          if (job.status === 'error') {
+            return 1;
+          }
+          return 2;
+        };
+
+        return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
+      })
+      .slice(0, 8)
+      .map((job) => ({ ...job }));
+  }
+
   private updateAgentActivity(update: {
     id: string;
     label: string;
@@ -2904,6 +3324,38 @@ export class NativeBridgeController {
   private resetEphemeralAgentActivities(): void {
     this.agentActivities = this.agentActivities.filter((activity) => activity.status === 'error');
     this.syncAgentActivities();
+  }
+
+  private updateBackgroundJob(update: {
+    id: string;
+    kind: BackgroundJobState['kind'];
+    label: string;
+    status: BackgroundJobState['status'];
+    detail?: string | null;
+    startedAt?: number;
+  }): void {
+    const existing = this.backgroundJobs.find((job) => job.id === update.id);
+    if (existing) {
+      existing.kind = update.kind;
+      existing.label = update.label;
+      existing.status = update.status;
+      existing.detail = update.detail ?? existing.detail;
+      existing.updatedAt = Date.now();
+    } else {
+      const now = Date.now();
+      this.backgroundJobs.push({
+        id: update.id,
+        kind: update.kind,
+        label: update.label,
+        status: update.status,
+        detail: update.detail ?? null,
+        startedAt: update.startedAt ?? now,
+        updatedAt: now,
+      });
+    }
+
+    this.syncBackgroundJobs();
+    this.scheduleStatePush();
   }
 
   private async runAutoVerification(
@@ -3228,6 +3680,16 @@ export class NativeBridgeController {
       return 'Usage: /team run [parallel|sequential|delegate] <task>';
     }
 
+    if (this.state.loading || this.abortController) {
+      if (!this.canStartBackgroundJob()) {
+        return 'Team run unavailable: background capacity full.';
+      }
+      await this.startBackgroundTeamRun(strategy, task, {
+        routeNote: `Team run background · ${strategy}`,
+      });
+      return `Team run started in background · ${strategy}`;
+    }
+
     return this.executeTeamRun(strategy, task);
   }
 
@@ -3245,9 +3707,10 @@ export class NativeBridgeController {
     if (teamAgents.length < 2) {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
+    const runId = randomUUID();
     for (const agent of teamAgents) {
       this.updateAgentActivity({
-        id: `team:queued:${agent.id}`,
+        id: `team:${runId}:queued:${agent.id}`,
         label: agent.name,
         status: 'queued',
         mode: agent.mode,
@@ -3282,6 +3745,7 @@ export class NativeBridgeController {
     this.teamRunSince = Date.now();
     this.teamRunStrategy = strategy;
     this.teamRunTask = task;
+    this.syncTeamRunState();
     this.teamRunIsolatedNotes.length = 0;
     this.scheduleStatePush();
 
@@ -3295,7 +3759,8 @@ export class NativeBridgeController {
         strategy,
         maxRounds: 2,
         sharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
-        runAgent: async (agent, input, round) => this.executeTeamAgent(agent, input, round, controller.signal),
+        runAgent: async (agent, input, round) =>
+          this.executeTeamAgent(agent, input, round, controller.signal, runId, this.teamRunIsolatedNotes),
         onMessage: (message) => {
           this.updateMessage(
             assistantMessageId,
@@ -3305,7 +3770,16 @@ export class NativeBridgeController {
       });
 
       const result = await orchestrator.run(task, controller.signal);
-      const formatted = this.formatTeamResult(strategy, task, teamAgents, result.messages, result.output, result.success, result.rounds);
+      const formatted = this.formatTeamResult(
+        strategy,
+        task,
+        teamAgents,
+        result.messages,
+        result.output,
+        result.success,
+        result.rounds,
+        this.teamRunIsolatedNotes,
+      );
       this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
       this.finishMessage(assistantMessageId, formatted);
       if (this.sessionManager && this.state.sessionId) {
@@ -3347,8 +3821,136 @@ export class NativeBridgeController {
       this.teamRunSince = null;
       this.teamRunStrategy = null;
       this.teamRunTask = null;
+      this.syncTeamRunState();
       this.scheduleStatePush();
     }
+  }
+
+  private async startBackgroundTeamRun(
+    strategy: 'parallel' | 'sequential' | 'delegate',
+    task: string,
+    options: { routeNote?: string } = {},
+  ): Promise<void> {
+    const teamAgents = this.buildTeamAgents();
+    if (teamAgents.length < 2) {
+      this.appendSystemMessage('Team run unavailable: need at least one lead and one worker with valid auth.');
+      return;
+    }
+
+    const runId = randomUUID();
+    const backgroundJobId = randomUUID();
+    const backgroundNotes: string[] = [];
+    for (const agent of teamAgents) {
+      this.updateAgentActivity({
+        id: `team:${runId}:queued:${agent.id}`,
+        label: agent.name,
+        status: 'queued',
+        mode: agent.mode,
+        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
+        detail: `background ${strategy} · ${agent.role}`,
+      });
+    }
+
+    const assistantMessageId = randomUUID();
+    const notice = options.routeNote
+      ? `${options.routeNote} · ${previewText(task, 96)}`
+      : `Team run background · ${strategy} · ${previewText(task, 96)}`;
+    this.state.messages.push({
+      id: randomUUID(),
+      role: 'system',
+      content: notice,
+      timestamp: Date.now(),
+    });
+    this.state.messages.push({
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    });
+    this.updateBackgroundJob({
+      id: backgroundJobId,
+      kind: 'team',
+      label: `team ${strategy}`,
+      status: 'running',
+      detail: previewText(task, 72),
+    });
+    this.scheduleStatePush();
+
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const orchestrator = new TeamOrchestrator({
+          name: 'ddudu-native-team-bg',
+          agents: teamAgents,
+          strategy,
+          maxRounds: 2,
+          sharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
+          runAgent: async (agent, input, round) =>
+            this.executeTeamAgent(agent, input, round, controller.signal, runId, backgroundNotes),
+          onMessage: (message) => {
+            this.updateMessage(assistantMessageId, this.formatTeamProgress(message));
+            this.updateBackgroundJob({
+              id: backgroundJobId,
+              kind: 'team',
+              label: `team ${strategy}`,
+              status: 'running',
+              detail: `${message.type} · ${message.from} → ${message.to}`,
+            });
+          },
+        });
+
+        const result = await orchestrator.run(task, controller.signal);
+        const formatted = this.formatTeamResult(
+          strategy,
+          task,
+          teamAgents,
+          result.messages,
+          result.output,
+          result.success,
+          result.rounds,
+          backgroundNotes,
+        );
+        this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
+        this.finishMessage(assistantMessageId, formatted);
+        this.updateBackgroundJob({
+          id: backgroundJobId,
+          kind: 'team',
+          label: `team ${strategy}`,
+          status: 'done',
+          detail: this.teamLastSummary,
+        });
+
+        if (this.sessionManager && this.state.sessionId) {
+          await this.sessionManager.append(this.state.sessionId, {
+            type: 'message',
+            timestamp: new Date().toISOString(),
+            data: {
+              user: task,
+              assistant: formatted,
+              mode: this.currentMode,
+              requestMode: 'team_background',
+              teamStrategy: strategy,
+              teamAgents: teamAgents.map((agent) => ({
+                id: agent.id,
+                mode: agent.mode,
+                model: agent.model,
+              })),
+            },
+          });
+        }
+      } catch (error: unknown) {
+        const detail = controller.signal.aborted ? 'background team aborted' : serializeError(error);
+        this.updateBackgroundJob({
+          id: backgroundJobId,
+          kind: 'team',
+          label: `team ${strategy}`,
+          status: 'error',
+          detail,
+        });
+        this.finishMessage(assistantMessageId, controller.signal.aborted ? '[background team aborted]' : `Team run failed: ${serializeError(error)}`);
+      }
+    })();
   }
 
   private buildTeamAgents(): TeamAgentRole[] {
@@ -3426,12 +4028,14 @@ export class NativeBridgeController {
     input: string,
     round: number,
     signal: AbortSignal,
+    runId: string,
+    isolatedNotes: string[],
   ): Promise<string> {
     const runtime = this.createDelegationRuntime();
-    const queuedActivityId = `team:queued:${agent.id}`;
+    const queuedActivityId = `team:${runId}:queued:${agent.id}`;
     this.agentActivities = this.agentActivities.filter((activity) => activity.id !== queuedActivityId);
     this.syncAgentActivities();
-    const activityId = `team:${round}:${agent.id}`;
+    const activityId = `team:${runId}:${round}:${agent.id}`;
     const purpose: DelegationPurpose =
       agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
     this.updateAgentActivity({
@@ -3443,6 +4047,7 @@ export class NativeBridgeController {
       detail: `round ${round} · ${agent.role}`,
     });
     try {
+      const contextSnapshot = await this.buildPromptContextSnapshot(input, purpose);
       const result = await runtime.run(
         {
           prompt: [
@@ -3459,6 +4064,7 @@ export class NativeBridgeController {
           cwd: process.cwd(),
           isolatedLabel: `team-${agent.id}-r${round}`,
           verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
+          contextSnapshot,
         },
         {
           signal,
@@ -3514,7 +4120,7 @@ export class NativeBridgeController {
         });
       }
       if (result.workspace || result.verification) {
-        this.teamRunIsolatedNotes.push(
+        isolatedNotes.push(
           [
             `- ${agent.name}`,
             result.workspace ? `workspace ${result.workspace.path}` : null,
@@ -3568,6 +4174,7 @@ export class NativeBridgeController {
     output: string,
     success: boolean,
     rounds: number,
+    isolatedNotes: string[],
   ): string {
     const recentMessages = messages
       .slice(-6)
@@ -3587,8 +4194,8 @@ export class NativeBridgeController {
       '',
       '## Recent Coordination',
       ...(recentMessages.length > 0 ? recentMessages : ['- No coordination messages recorded.']),
-      ...(this.teamRunIsolatedNotes.length > 0
-        ? ['', '## Isolated Runs', ...this.teamRunIsolatedNotes]
+      ...(isolatedNotes.length > 0
+        ? ['', '## Isolated Runs', ...isolatedNotes]
         : []),
     ].join('\n');
   }
@@ -3682,6 +4289,12 @@ export class NativeBridgeController {
     const current = this.remoteSessions.get(this.getCurrentProvider()) ?? null;
     this.state.remoteSessionId = current?.sessionId ?? null;
     this.state.remoteSessionCount = this.remoteSessions.size;
+  }
+
+  private syncTeamRunState(): void {
+    this.state.teamRunStrategy = this.teamRunStrategy;
+    this.state.teamRunTask = this.teamRunTask;
+    this.state.teamRunSince = this.teamRunSince;
   }
 
   private rememberRemoteSession(session: BridgeSessionState): void {
@@ -3880,6 +4493,7 @@ export class NativeBridgeController {
         modes: this.state.modes.map((mode) => ({ ...mode })),
         slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
         todos: this.state.todos.map((item) => ({ ...item })),
+        backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
         askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
       },
     });

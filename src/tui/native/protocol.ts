@@ -64,6 +64,16 @@ export interface NativeAgentActivityState {
   updatedAt: number;
 }
 
+export interface NativeBackgroundJobState {
+  id: string;
+  kind: 'delegate' | 'team';
+  label: string;
+  status: 'running' | 'done' | 'error';
+  detail: string | null;
+  startedAt: number;
+  updatedAt: number;
+}
+
 export interface NativeWorkspaceState {
   label: string;
   path: string;
@@ -114,8 +124,12 @@ export interface NativeTuiState {
   sessionId: string | null;
   remoteSessionId: string | null;
   remoteSessionCount: number;
+  teamRunStrategy: 'parallel' | 'sequential' | 'delegate' | null;
+  teamRunTask: string | null;
+  teamRunSince: number | null;
   todos: NativePlanItemState[];
   agentActivities: NativeAgentActivityState[];
+  backgroundJobs: NativeBackgroundJobState[];
   workspace: NativeWorkspaceState | null;
   verification: NativeVerificationState | null;
   error: string | null;
