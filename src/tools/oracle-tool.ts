@@ -5,9 +5,12 @@ import { resolve } from 'node:path';
 import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
 import { AnthropicClient } from '../api/anthropic-client.js';
 import type { NamedMode } from '../core/types.js';
+import type { WorkflowArtifactKind } from '../core/workflow-state.js';
+import { HARNESS_MODES } from '../tui/shared/theme.js';
 import type { Tool } from './index.js';
 
 const DEFAULT_ORACLE_MODEL = 'claude-opus-4-5';
+const DELIVERABLE_KINDS: WorkflowArtifactKind[] = ['answer', 'plan', 'review', 'design', 'patch', 'briefing', 'research'];
 
 const resolveToken = (): string => {
   return process.env.ANTHROPIC_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
@@ -55,6 +58,33 @@ const preview = (value: string, maxLength: number = 80): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
+const oracleActivityLabel = (mode?: NamedMode): string =>
+  mode ? (HARNESS_MODES[mode]?.label ?? mode) : 'Oracle';
+
+const buildDeliverableQuestion = (
+  question: string,
+  deliverable?: WorkflowArtifactKind,
+  successCriteria?: string[],
+): string => {
+  if (!deliverable && (!successCriteria || successCriteria.length === 0)) {
+    return question;
+  }
+
+  const sections = [question.trim()];
+  if (deliverable) {
+    sections.push(
+      '',
+      `Requested deliverable: ${deliverable}`,
+      `Respond as a concise ${deliverable} deliverable with clear structure.`,
+    );
+  }
+  if (successCriteria && successCriteria.length > 0) {
+    sections.push('', 'Success criteria:', ...successCriteria.map((criterion) => `- ${criterion}`));
+  }
+
+  return sections.join('\n');
+};
+
 export const oracleTool: Tool = {
   definition: {
     name: 'oracle',
@@ -71,6 +101,16 @@ export const oracleTool: Tool = {
         type: 'array',
         description: 'Optional file paths to include as context.',
         items: { type: 'string', description: 'Relative file path.' },
+      },
+      deliverable: {
+        type: 'string',
+        description: 'Requested deliverable kind for the oracle response.',
+        enum: DELIVERABLE_KINDS,
+      },
+      success_criteria: {
+        type: 'array',
+        description: 'Optional success criteria for the oracle response.',
+        items: { type: 'string', description: 'A concrete success criterion.' },
       },
     },
   },
@@ -103,12 +143,20 @@ export const oracleTool: Tool = {
         : undefined;
     const preferredModel =
       typeof args.model === 'string' && args.model.trim().length > 0 ? args.model : undefined;
+    const deliverable =
+      typeof args.deliverable === 'string' && DELIVERABLE_KINDS.includes(args.deliverable as WorkflowArtifactKind)
+        ? (args.deliverable as WorkflowArtifactKind)
+        : undefined;
+    const successCriteria = Array.isArray(args.success_criteria)
+      ? args.success_criteria.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const delegatedQuestion = buildDeliverableQuestion(question, deliverable, successCriteria);
 
     if (ctx.delegation) {
       const activityId = randomUUID();
       ctx.onAgentActivity?.({
         id: activityId,
-        label: 'oracle',
+        label: oracleActivityLabel(preferredMode),
         status: 'running',
         mode: preferredMode,
         purpose: 'oracle',
@@ -122,8 +170,10 @@ export const oracleTool: Tool = {
         const artifacts = ctx.artifacts?.('oracle', 4);
         const result = await ctx.delegation.run(
           {
-            prompt: question,
+            prompt: delegatedQuestion,
             purpose: 'oracle',
+            requestedArtifactKind: deliverable,
+            successCriteria,
             preferredMode,
             preferredModel,
             parentSessionId: ctx.sessionId,
@@ -139,7 +189,7 @@ export const oracleTool: Tool = {
               if (text.trim()) {
                 ctx.onAgentActivity?.({
                   id: activityId,
-                  label: 'oracle',
+                  label: oracleActivityLabel(preferredMode),
                   status: 'running',
                   mode: preferredMode,
                   purpose: 'oracle',
@@ -153,7 +203,7 @@ export const oracleTool: Tool = {
 
         ctx.onAgentActivity?.({
           id: activityId,
-          label: 'oracle',
+          label: oracleActivityLabel(result.mode),
           status: 'done',
           mode: result.mode,
           purpose: result.purpose,
@@ -172,12 +222,14 @@ export const oracleTool: Tool = {
             localSessionId: result.localSessionId,
             remoteSessionId: result.remoteSessionId,
             durationMs: result.durationMs,
+            deliverable,
+            successCriteria,
           },
         };
       } catch (error: unknown) {
         ctx.onAgentActivity?.({
           id: activityId,
-          label: 'oracle',
+          label: oracleActivityLabel(preferredMode),
           status: 'error',
           mode: preferredMode,
           purpose: 'oracle',
@@ -200,7 +252,7 @@ export const oracleTool: Tool = {
     try {
       await client.stream(
         'You are an expert oracle model. Answer clearly with strong technical judgment.',
-        [{ role: 'user', content: question }],
+        [{ role: 'user', content: delegatedQuestion }],
         {
           onText: (text: string) => {
             output += text;
@@ -220,6 +272,8 @@ export const oracleTool: Tool = {
           usage,
           model: process.env.DDUDU_ORACLE_MODEL ?? DEFAULT_ORACLE_MODEL,
           files,
+          deliverable,
+          successCriteria,
         },
       };
     } catch (err: unknown) {
@@ -230,6 +284,8 @@ export const oracleTool: Tool = {
           usage,
           model: process.env.DDUDU_ORACLE_MODEL ?? DEFAULT_ORACLE_MODEL,
           files,
+          deliverable,
+          successCriteria,
         },
       };
     }

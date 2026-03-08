@@ -8,7 +8,7 @@ import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { VerificationRunner } from './verifier.js';
 import type { IsolatedWorkspace, WorkspaceApplyResult } from './worktree-manager.js';
 import { WorktreeManager } from './worktree-manager.js';
-import type { WorkflowArtifact } from './workflow-state.js';
+import type { WorkflowArtifact, WorkflowArtifactKind } from './workflow-state.js';
 
 export interface DelegationCredentials {
   token: string;
@@ -28,6 +28,8 @@ export type DelegationPurpose =
 export interface DelegationRequest {
   prompt: string;
   purpose?: DelegationPurpose;
+  requestedArtifactKind?: WorkflowArtifactKind;
+  successCriteria?: string[];
   preferredMode?: NamedMode;
   preferredModel?: string;
   systemPrompt?: string;
@@ -55,6 +57,8 @@ export interface DelegationResult {
   provider: string;
   model: string;
   purpose: DelegationPurpose;
+  requestedArtifactKind?: WorkflowArtifactKind;
+  successCriteria?: string[];
   localSessionId?: string;
   remoteSessionId?: string;
   cwd: string;
@@ -183,6 +187,8 @@ const buildSessionEntry = (
       provider: result.provider,
       model: result.model,
       purpose: result.purpose,
+      requestedArtifactKind: result.requestedArtifactKind,
+      successCriteria: result.successCriteria,
       remoteSessionId: result.remoteSessionId,
       cwd: result.cwd,
       workspacePath: result.workspace?.path,
@@ -214,6 +220,23 @@ const buildDelegationPrompt = (
   purpose: DelegationPurpose,
 ): string => {
   const sections: string[] = [`Task purpose: ${purpose}`];
+
+  if (request.requestedArtifactKind) {
+    sections.push(
+      '<requested_deliverable>',
+      `kind: ${request.requestedArtifactKind}`,
+      'Return the result in a shape that fits this deliverable kind.',
+      '</requested_deliverable>',
+    );
+  }
+
+  if (request.successCriteria && request.successCriteria.length > 0) {
+    sections.push(
+      '<success_criteria>',
+      ...request.successCriteria.map((criterion) => `- ${criterion}`),
+      '</success_criteria>',
+    );
+  }
 
   if (request.artifacts && request.artifacts.length > 0) {
     sections.push(
@@ -368,6 +391,8 @@ export class DelegationRuntime {
         provider,
         model,
         purpose,
+        requestedArtifactKind: request.requestedArtifactKind,
+        successCriteria: request.successCriteria,
         localSessionId,
         remoteSessionId,
         cwd: effectiveCwd,

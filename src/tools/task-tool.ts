@@ -4,7 +4,11 @@ import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } fro
 import type { DelegationPurpose } from '../core/delegation.js';
 import type { NamedMode } from '../core/types.js';
 import { SubAgentPool } from '../core/sub-agent.js';
+import { HARNESS_MODES } from '../tui/shared/theme.js';
+import type { WorkflowArtifactKind } from '../core/workflow-state.js';
 import type { Tool } from './index.js';
+
+const DELIVERABLE_KINDS: WorkflowArtifactKind[] = ['answer', 'plan', 'review', 'design', 'patch', 'briefing', 'research'];
 
 const resolveToken = (): string => {
   return process.env.ANTHROPIC_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
@@ -35,6 +39,53 @@ const preview = (value: string, maxLength: number = 80): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
+const activityLabel = (mode?: NamedMode, purpose?: DelegationPurpose): string => {
+  if (mode) {
+    return HARNESS_MODES[mode]?.label ?? mode;
+  }
+
+  switch (purpose) {
+    case 'planning':
+      return 'Planner';
+    case 'research':
+      return 'Research';
+    case 'review':
+      return 'Reviewer';
+    case 'design':
+      return 'Design';
+    case 'execution':
+      return 'Worker';
+    case 'oracle':
+      return 'Oracle';
+    default:
+      return 'Delegate';
+  }
+};
+
+const buildDeliverablePrompt = (
+  prompt: string,
+  deliverable?: WorkflowArtifactKind,
+  successCriteria?: string[],
+): string => {
+  if (!deliverable && (!successCriteria || successCriteria.length === 0)) {
+    return prompt;
+  }
+
+  const sections = [prompt.trim()];
+  if (deliverable) {
+    sections.push(
+      '',
+      `Deliverable kind: ${deliverable}`,
+      `Shape the response as a concise ${deliverable} deliverable rather than a generic answer.`,
+    );
+  }
+  if (successCriteria && successCriteria.length > 0) {
+    sections.push('', 'Success criteria:', ...successCriteria.map((criterion) => `- ${criterion}`));
+  }
+
+  return sections.join('\n');
+};
+
 export const taskTool: Tool = {
   definition: {
     name: 'task',
@@ -53,6 +104,16 @@ export const taskTool: Tool = {
       },
       model: { type: 'string', description: 'Model override for the sub-agent.' },
       system_prompt: { type: 'string', description: 'Optional system prompt override for the delegated agent.' },
+      deliverable: {
+        type: 'string',
+        description: 'Requested deliverable kind for the delegated worker.',
+        enum: DELIVERABLE_KINDS,
+      },
+      success_criteria: {
+        type: 'array',
+        description: 'Optional success criteria the delegated worker should satisfy.',
+        items: { type: 'string', description: 'A concrete success criterion.' },
+      },
     },
   },
   async execute(args, ctx) {
@@ -75,12 +136,20 @@ export const taskTool: Tool = {
       typeof args.system_prompt === 'string' && args.system_prompt.trim().length > 0
         ? args.system_prompt
         : undefined;
+    const deliverable =
+      typeof args.deliverable === 'string' && DELIVERABLE_KINDS.includes(args.deliverable as WorkflowArtifactKind)
+        ? (args.deliverable as WorkflowArtifactKind)
+        : undefined;
+    const successCriteria = Array.isArray(args.success_criteria)
+      ? args.success_criteria.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+      : [];
+    const delegatedPrompt = buildDeliverablePrompt(args.prompt, deliverable, successCriteria);
 
     if (ctx.delegation) {
       const activityId = randomUUID();
       ctx.onAgentActivity?.({
         id: activityId,
-        label: 'task',
+        label: activityLabel(mode, purpose),
         status: 'running',
         mode,
         purpose,
@@ -94,8 +163,10 @@ export const taskTool: Tool = {
         const artifacts = ctx.artifacts?.(purpose ?? 'general', 4);
         const result = await ctx.delegation.run(
           {
-            prompt: args.prompt,
+            prompt: delegatedPrompt,
             purpose,
+            requestedArtifactKind: deliverable,
+            successCriteria,
             preferredMode: mode,
             preferredModel: model,
             systemPrompt,
@@ -111,7 +182,7 @@ export const taskTool: Tool = {
               if (text.trim()) {
                 ctx.onAgentActivity?.({
                   id: activityId,
-                  label: 'task',
+                  label: activityLabel(mode, purpose),
                   status: 'running',
                   mode,
                   purpose,
@@ -122,7 +193,7 @@ export const taskTool: Tool = {
             onVerificationState: (state) => {
               ctx.onAgentActivity?.({
                 id: activityId,
-                label: 'task',
+                label: activityLabel(mode, purpose),
                 status:
                   state.status === 'running'
                     ? 'verifying'
@@ -140,7 +211,7 @@ export const taskTool: Tool = {
 
         ctx.onAgentActivity?.({
           id: activityId,
-          label: 'task',
+          label: activityLabel(result.mode, result.purpose),
           status: 'done',
           mode: result.mode,
           purpose: result.purpose,
@@ -167,6 +238,8 @@ export const taskTool: Tool = {
             remoteSessionId: result.remoteSessionId,
             cwd: result.cwd,
             workspacePath: result.workspace?.path,
+            deliverable,
+            successCriteria,
             verification: result.verification,
             usage: result.usage,
             durationMs: result.durationMs,
@@ -175,7 +248,7 @@ export const taskTool: Tool = {
       } catch (error: unknown) {
         ctx.onAgentActivity?.({
           id: activityId,
-          label: 'task',
+          label: activityLabel(mode, purpose),
           status: 'error',
           mode,
           purpose,
@@ -205,7 +278,7 @@ export const taskTool: Tool = {
     const result = await pool.runTask(
       {
         id: taskId,
-        prompt: args.prompt,
+        prompt: delegatedPrompt,
         role: 'general',
         model,
       },
@@ -222,6 +295,8 @@ export const taskTool: Tool = {
         metadata: {
           taskId,
           status: result.status,
+          deliverable,
+          successCriteria,
           usage: result.usage,
           durationMs: result.durationMs,
         },
@@ -233,6 +308,8 @@ export const taskTool: Tool = {
       metadata: {
         taskId,
         status: result.status,
+        deliverable,
+        successCriteria,
         usage: result.usage,
         durationMs: result.durationMs,
       },

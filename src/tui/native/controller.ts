@@ -125,6 +125,7 @@ interface AgentActivityState {
   label: string;
   mode: NamedMode | null;
   purpose: string | null;
+  checklistId?: string | null;
   status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
   detail: string | null;
   workspacePath: string | null;
@@ -367,6 +368,28 @@ const createChecklistItem = (
   updatedAt: Date.now(),
 });
 
+const getChecklistTodoRef = (
+  checklist: BackgroundJobChecklistItem[],
+  itemId: string,
+): string | null => {
+  const index = checklist.findIndex((item) => item.id === itemId);
+  return index >= 0 ? `todo #${index + 1}` : null;
+};
+
+const formatChecklistLinkedDetail = (
+  checklist: BackgroundJobChecklistItem[],
+  checklistId: string | null | undefined,
+  detail: string | null | undefined,
+): string | null => {
+  const todoRef = checklistId ? getChecklistTodoRef(checklist, checklistId) : null;
+  const normalizedDetail = detail?.trim() ? detail.trim() : null;
+  if (todoRef && normalizedDetail) {
+    return `${todoRef} · ${normalizedDetail}`;
+  }
+
+  return todoRef ?? normalizedDetail;
+};
+
 const buildDelegateJobChecklist = (
   purpose: DelegationPurpose | 'general',
   mode: NamedMode | null,
@@ -394,9 +417,13 @@ const buildTeamJobChecklist = (
   teamAgents: TeamAgentRole[],
   strategy: 'parallel' | 'sequential' | 'delegate',
 ): BackgroundJobChecklistItem[] => [
-  createChecklistItem('fanout', `Launch ${teamAgents.length} agents`, 'in_progress', {
-    owner: `team ${strategy}`,
+  createChecklistItem('route', `Route ${strategy} team run`, 'completed', {
+    owner: 'ddudu',
   }),
+  ...teamAgents.map((agent) =>
+    createChecklistItem(`agent:${agent.id}`, `Run ${agent.name}`, 'pending', {
+      owner: agent.name,
+    })),
   createChecklistItem('synthesize', 'Synthesize agent outputs', 'pending', { owner: 'Jennie' }),
   createChecklistItem('verify', 'Verify team result', 'pending', { owner: 'Jennie' }),
   createChecklistItem('report', 'Publish the result', 'pending', { owner: 'ddudu' }),
@@ -945,8 +972,9 @@ export class NativeBridgeController {
         label: activity.label,
         mode: activity.mode,
         purpose: activity.purpose,
+        checklistId: activity.checklistId ?? null,
         status: activity.status,
-        detail: activity.detail,
+        detail: formatChecklistLinkedDetail(job.checklist, activity.checklistId, activity.detail),
         workspacePath: activity.workspacePath,
         updatedAt: activity.updatedAt,
       })),
@@ -1750,6 +1778,11 @@ export class NativeBridgeController {
       decision.purpose ?? 'general',
     );
     const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
+    const checklist = buildDelegateJobChecklist(
+      decision.purpose ?? 'general',
+      decision.preferredMode ?? null,
+      this.verificationModeForPurpose(decision.purpose),
+    );
     const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
       sessionId: this.state.sessionId,
@@ -1767,19 +1800,20 @@ export class NativeBridgeController {
       artifacts,
       teamAgents: [],
       teamSharedContext: null,
-      checklist: buildDelegateJobChecklist(
-        decision.purpose ?? 'general',
-        decision.preferredMode ?? null,
-        this.verificationModeForPurpose(decision.purpose),
-      ),
+      checklist,
       agentActivities: [
         {
-          id: `job:${backgroundJobId}:route`,
-          label: 'route',
+          id: `job:${backgroundJobId}:delegate`,
+          label: decision.preferredMode ? HARNESS_MODES[decision.preferredMode].label : 'Delegate',
           mode: decision.preferredMode ?? null,
           purpose: decision.purpose ?? 'general',
+          checklistId: 'execute',
           status: 'queued',
-          detail: `background · ${previewText(userMessage.content, 64)}`,
+          detail: formatChecklistLinkedDetail(
+            checklist,
+            'execute',
+            `queued · ${previewText(userMessage.content, 64)}`,
+          ),
           workspacePath: null,
           updatedAt: Date.now(),
         },
@@ -1888,7 +1922,9 @@ export class NativeBridgeController {
             this.updateMessage(assistantMessage.id, current + delta);
             this.updateAgentActivity({
               id: routeActivityId,
-              label: 'route',
+              label: decision.preferredMode
+                ? HARNESS_MODES[decision.preferredMode].label
+                : 'Delegate',
               status: 'running',
               mode: decision.preferredMode ?? null,
               purpose: decision.purpose ?? 'general',
@@ -1901,7 +1937,9 @@ export class NativeBridgeController {
             if (activeTool) {
               this.updateAgentActivity({
                 id: routeActivityId,
-                label: 'route',
+                label: decision.preferredMode
+                  ? HARNESS_MODES[decision.preferredMode].label
+                  : 'Delegate',
                 status: 'running',
                 mode: decision.preferredMode ?? null,
                 purpose: decision.purpose ?? 'general',
@@ -1912,7 +1950,9 @@ export class NativeBridgeController {
           onVerificationState: (state) => {
             this.updateAgentActivity({
               id: routeActivityId,
-              label: 'route',
+              label: decision.preferredMode
+                ? HARNESS_MODES[decision.preferredMode].label
+                : 'Delegate',
               status:
                 state.status === 'running'
                   ? 'verifying'
@@ -1931,6 +1971,7 @@ export class NativeBridgeController {
       this.finishMessage(assistantMessage.id, finalText);
       this.rememberDelegationArtifact({
         purpose: result.purpose,
+        requestedKind: result.requestedArtifactKind,
         mode: result.mode,
         text: finalText,
         task: userMessage.content,
@@ -4261,6 +4302,7 @@ export class NativeBridgeController {
     status: AgentActivityState['status'];
     mode?: NamedMode | null;
     purpose?: string | null;
+    checklistId?: string | null;
     detail?: string | null;
     workspacePath?: string | null;
   }): void {
@@ -4270,6 +4312,7 @@ export class NativeBridgeController {
       existing.status = update.status;
       existing.mode = update.mode ?? existing.mode;
       existing.purpose = update.purpose ?? existing.purpose;
+      existing.checklistId = update.checklistId ?? existing.checklistId;
       existing.detail = update.detail ?? existing.detail;
       existing.workspacePath = update.workspacePath ?? existing.workspacePath;
       existing.updatedAt = Date.now();
@@ -4280,6 +4323,7 @@ export class NativeBridgeController {
         status: update.status,
         mode: update.mode ?? null,
         purpose: update.purpose ?? null,
+        checklistId: update.checklistId ?? null,
         detail: update.detail ?? null,
         workspacePath: update.workspacePath ?? null,
         updatedAt: Date.now(),
@@ -4415,6 +4459,7 @@ export class NativeBridgeController {
 
   private rememberDelegationArtifact(result: {
     purpose?: DelegationPurpose;
+    requestedKind?: WorkflowArtifactKind;
     mode: NamedMode;
     text: string;
     task?: string;
@@ -4427,7 +4472,7 @@ export class NativeBridgeController {
       path?: string | null;
     } | null;
   }): WorkflowArtifact {
-    const kind = this.artifactKindForPurpose(result.purpose);
+    const kind = result.requestedKind ?? this.artifactKindForPurpose(result.purpose);
     const title = `${HARNESS_MODES[result.mode].label} ${kind}`;
     return this.rememberArtifact({
       kind,
@@ -5245,10 +5290,12 @@ export class NativeBridgeController {
       .slice()
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .map((activity) => {
+        const todoRef = activity.checklistId ? getChecklistTodoRef(job.checklist, activity.checklistId) : null;
         const scope = [
           activity.mode ? HARNESS_MODES[activity.mode].label : activity.label,
           activity.purpose,
           activity.status,
+          todoRef,
         ]
           .filter((part): part is string => Boolean(part))
           .join(' · ');
@@ -6032,6 +6079,7 @@ export class NativeBridgeController {
     });
     const contextSnapshot = await this.buildPromptContextSnapshot(task, 'planning');
     const artifacts = this.getArtifactsForPurpose('planning', 4);
+    const checklist = buildTeamJobChecklist(teamAgents, strategy);
     const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
       sessionId: this.state.sessionId,
@@ -6050,14 +6098,19 @@ export class NativeBridgeController {
       artifacts,
       teamAgents,
       teamSharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
-      checklist: buildTeamJobChecklist(teamAgents, strategy),
+      checklist,
       agentActivities: teamAgents.map((agent) => ({
         id: `job:${backgroundJobId}:${agent.id}:queued`,
         label: agent.name,
         mode: agent.mode ?? null,
         purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
+        checklistId: `agent:${agent.id}`,
         status: 'queued',
-        detail: `background ${strategy} · ${agent.role}`,
+        detail: formatChecklistLinkedDetail(
+          checklist,
+          `agent:${agent.id}`,
+          `${strategy} · ${agent.role}`,
+        ),
         workspacePath: null,
         updatedAt: Date.now(),
       })),

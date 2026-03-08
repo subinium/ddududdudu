@@ -67,6 +67,7 @@ export interface Tool {
 
 export * from './registry.js';
 export * from './file-tools.js';
+export * from './git-tools.js';
 export * from './bash-tool.js';
 export * from './search-tools.js';
 export * from './context-tools.js';

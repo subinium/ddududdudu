@@ -11,13 +11,14 @@ import {
   symbolSearchTool,
 } from './context-tools.js';
 import { editFileTool, listDirTool, readFileTool, writeFileTool } from './file-tools.js';
+import { gitDiffTool, gitStatusTool, patchApplyTool } from './git-tools.js';
 import type { Tool, ToolDefinition, ToolParameter } from './index.js';
 import { memoryTool } from './memory-tool.js';
 import { oracleTool } from './oracle-tool.js';
 import { globTool, grepTool } from './search-tools.js';
 import { taskTool } from './task-tool.js';
 import { updatePlanTool } from './update-plan-tool.js';
-import { webFetchTool } from './web-tool.js';
+import { webFetchTool, webSearchTool } from './web-tool.js';
 
 interface JsonSchema {
   type: string;
@@ -95,6 +96,9 @@ const BUILTIN_TOOLS: Tool[] = [
   writeFileTool,
   editFileTool,
   listDirTool,
+  gitStatusTool,
+  gitDiffTool,
+  patchApplyTool,
   bashTool,
   grepTool,
   globTool,
@@ -106,6 +110,7 @@ const BUILTIN_TOOLS: Tool[] = [
   changedFilesTool,
   fileImportanceTool,
   codebaseSearchTool,
+  webSearchTool,
   webFetchTool,
   taskTool,
   oracleTool,

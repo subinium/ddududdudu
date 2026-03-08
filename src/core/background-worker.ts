@@ -127,6 +127,7 @@ const updateActivity = (
     existing.label = next.label;
     existing.mode = next.mode;
     existing.purpose = next.purpose;
+    existing.checklistId = next.checklistId ?? existing.checklistId ?? null;
     existing.status = next.status;
     existing.detail = next.detail;
     existing.workspacePath = next.workspacePath;
@@ -224,8 +225,8 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               detail: 'booting delegated worker',
             },
           )
-        : updateChecklistItem(job.checklist, 'fanout', {
-            status: 'in_progress',
+        : updateChecklistItem(job.checklist, 'route', {
+            status: 'completed',
             detail: 'starting team workers',
           }),
   });
@@ -279,6 +280,17 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
             }
             latestDetail = previewText(delta, 72);
             queuePersist({
+              agentActivities: updateActivity(current.agentActivities, {
+                id: `job:${current.id}:delegate`,
+                label: current.preferredMode ?? 'delegate',
+                mode: current.preferredMode ?? null,
+                purpose: current.purpose ?? 'general',
+                checklistId: 'execute',
+                status: 'running',
+                detail: latestDetail,
+                workspacePath: null,
+                updatedAt: Date.now(),
+              }),
               detail: latestDetail,
               checklist: updateChecklistItem(current.checklist, 'execute', {
                 status: 'in_progress',
@@ -292,6 +304,17 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               return;
             }
             queuePersist({
+              agentActivities: updateActivity(current.agentActivities, {
+                id: `job:${current.id}:delegate`,
+                label: current.preferredMode ?? 'delegate',
+                mode: current.preferredMode ?? null,
+                purpose: current.purpose ?? 'general',
+                checklistId: 'execute',
+                status: 'running',
+                detail: `${activeTool.name} ${activeTool.status}`,
+                workspacePath: null,
+                updatedAt: Date.now(),
+              }),
               detail: `${activeTool.name} ${activeTool.status}`,
               checklist: updateChecklistItem(current.checklist, 'execute', {
                 status: 'in_progress',
@@ -301,10 +324,11 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           },
           onVerificationState: (state) => {
             const activity = updateActivity(current.agentActivities, {
-              id: `job:${current.id}:route`,
-              label: 'route',
+              id: `job:${current.id}:delegate`,
+              label: current.preferredMode ?? 'delegate',
               mode: current.preferredMode ?? null,
               purpose: current.purpose ?? 'general',
+              checklistId: 'verify',
               status:
                 state.status === 'running'
                   ? 'verifying'
@@ -340,14 +364,15 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       );
 
       const finalText = result.text.trim() || '[background delegate] no output';
+      const artifactKind = result.requestedArtifactKind ?? artifactKindForPurpose(result.purpose);
       const artifact = buildArtifact({
-        kind: artifactKindForPurpose(result.purpose),
+        kind: artifactKind,
         title: `${result.mode} ${result.purpose ?? 'general'}`,
         summary: finalText,
         source: 'delegate',
         mode: result.mode,
         payload: buildArtifactPayload({
-          kind: artifactKindForPurpose(result.purpose),
+          kind: artifactKind,
           purpose: result.purpose,
           task: current.prompt,
           summary: finalText,
@@ -473,10 +498,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
             return item;
           }),
         agentActivities: updateActivity(current.agentActivities, {
-          id: `job:${current.id}:route`,
+          id: `job:${current.id}:delegate`,
           label: result.mode,
           mode: result.mode,
           purpose: result.purpose ?? 'general',
+          checklistId:
+            result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+              ? 'apply'
+              : result.verification
+                ? 'verify'
+                : 'report',
           status:
             result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
               ? 'error'
@@ -515,15 +546,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               label: agent.name,
               mode: agent.mode ?? null,
               purpose,
+              checklistId: `agent:${agent.id}`,
               status: 'running',
               detail: `round ${round} · ${agent.role}`,
               workspacePath: null,
               updatedAt: Date.now(),
             }),
             detail: `${agent.name} · round ${round}`,
-            checklist: updateChecklistItem(current.checklist, 'fanout', {
+            checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
               status: 'in_progress',
-              detail: `${agent.name} · round ${round}`,
+              detail: `round ${round} · ${agent.role}`,
             }),
           });
 
@@ -554,15 +586,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     label: agent.name,
                     mode: agent.mode ?? null,
                     purpose,
+                    checklistId: `agent:${agent.id}`,
                     status: 'running',
                     detail: previewText(delta, 64),
                     workspacePath: null,
                     updatedAt: Date.now(),
                   }),
                   detail: `${agent.name} · ${previewText(delta, 64)}`,
-                  checklist: updateChecklistItem(current.checklist, 'fanout', {
+                  checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
                     status: 'in_progress',
-                    detail: `${agent.name} · ${previewText(delta, 64)}`,
+                    detail: previewText(delta, 64),
                   }),
                 });
               },
@@ -577,15 +610,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     label: agent.name,
                     mode: agent.mode ?? null,
                     purpose,
+                    checklistId: `agent:${agent.id}`,
                     status: 'running',
                     detail: `${activeTool.name} ${activeTool.status}`,
                     workspacePath: null,
                     updatedAt: Date.now(),
                   }),
                   detail: `${agent.name} · ${activeTool.name} ${activeTool.status}`,
-                  checklist: updateChecklistItem(current.checklist, 'fanout', {
+                  checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
                     status: 'in_progress',
-                    detail: `${agent.name} · ${activeTool.name} ${activeTool.status}`,
+                    detail: `${activeTool.name} ${activeTool.status}`,
                   }),
                 });
               },
@@ -596,6 +630,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     label: agent.name,
                     mode: agent.mode ?? null,
                     purpose,
+                    checklistId: `agent:${agent.id}`,
                     status:
                       state.status === 'running'
                         ? 'verifying'
@@ -606,8 +641,8 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     workspacePath: null,
                     updatedAt: Date.now(),
                   }),
-                  detail: state.summary ?? current.detail,
-                  checklist: updateChecklistItem(current.checklist, 'verify', {
+                    detail: state.summary ?? current.detail,
+                  checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
                     status:
                       state.status === 'running'
                         ? 'in_progress'
@@ -624,6 +659,24 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           if (result.workspace) {
             backgroundNotes.push(`${agent.name} · ${result.workspace.kind} · ${result.workspace.path}`);
           }
+
+          queuePersist({
+            agentActivities: updateActivity(current.agentActivities, {
+              id: `job:${current.id}:${agent.id}:${round}`,
+              label: agent.name,
+              mode: agent.mode ?? null,
+              purpose,
+              checklistId: `agent:${agent.id}`,
+              status: result.verification?.status === 'failed' ? 'error' : 'done',
+              detail: result.verification?.summary ?? previewText(result.text, 64),
+              workspacePath: result.workspace?.path ?? null,
+              updatedAt: Date.now(),
+            }),
+            checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
+              status: result.verification?.status === 'failed' ? 'error' : 'completed',
+              detail: result.verification?.summary ?? previewText(result.text, 64),
+            }),
+          });
 
           return result.text.trim() || `[${agent.name}] no output`;
         },
@@ -686,7 +739,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
         },
         artifact,
         checklist: current.checklist.map((item) => {
-          if (item.id === 'fanout' || item.id === 'synthesize' || item.id === 'report') {
+          if (item.id === 'route' || item.id === 'synthesize' || item.id === 'report') {
             return {
               ...item,
               status: 'completed',
@@ -702,6 +755,14 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               ...item,
               status: result.success ? 'completed' : 'error',
               detail: result.success ? 'team output verified' : 'team output incomplete',
+              updatedAt: Date.now(),
+            };
+          }
+          if (item.id.startsWith('agent:') && item.status === 'pending') {
+            return {
+              ...item,
+              status: result.success ? 'completed' : item.status,
+              detail: result.success ? `${current.strategy ?? 'parallel'} agent completed` : item.detail,
               updatedAt: Date.now(),
             };
           }
