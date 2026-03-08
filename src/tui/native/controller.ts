@@ -22,6 +22,7 @@ import { GitCheckpoint } from '../../core/git-checkpoint.js';
 import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
+import { LspManager } from '../../core/lsp-manager.js';
 import { loadMemory } from '../../core/memory.js';
 import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
@@ -37,6 +38,7 @@ import type {
   PlanItemStatus,
   WorkflowArtifact,
   WorkflowArtifactKind,
+  WorkflowBackgroundJobSnapshot,
   WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
@@ -56,7 +58,9 @@ import {
 } from './session-support.js';
 import type {
   NativeBridgeEvent,
+  NativeLspState,
   NativeMessageState,
+  NativeMcpState,
   NativeProviderState,
   NativeRequestEstimateState,
   NativeToolCallState,
@@ -598,6 +602,8 @@ export class NativeBridgeController {
     requestEstimate: null,
     queuedPrompts: [],
     providers: [],
+    mcp: null,
+    lsp: null,
     messages: [],
     askUser: null,
     slashCommands: SLASH_COMMANDS.map((item) => ({
@@ -654,7 +660,9 @@ export class NativeBridgeController {
   private teamLastSummary: string | null = null;
   private readonly compactionEngine = new CompactionEngine();
   private readonly hookRegistry = new HookRegistry();
+  private readonly lspManager = new LspManager(process.cwd());
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
+  private readonly verificationRepairFingerprints = new Set<string>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
 
@@ -699,6 +707,13 @@ export class NativeBridgeController {
     } catch (error: unknown) {
       this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
     }
+    this.syncMcpState();
+    try {
+      await this.lspManager.refresh(process.cwd());
+    } catch (error: unknown) {
+      this.appendSystemMessage(`[lsp] ${serializeError(error)}`);
+    }
+    this.syncLspState();
 
     try {
       await loadHookFiles(process.cwd(), this.hookRegistry);
@@ -747,6 +762,7 @@ export class NativeBridgeController {
       });
     }
     this.mcpManager?.disconnectAll();
+    void this.lspManager.shutdown();
     this.abortCurrentRequest();
   }
 
@@ -1009,8 +1025,7 @@ export class NativeBridgeController {
         return;
       }
       this.queuedPrompts.push(trimmedContent);
-      this.state.queuedPrompts = [...this.queuedPrompts];
-      this.scheduleStatePush();
+      this.syncQueuedPrompts();
       return;
     }
 
@@ -1274,7 +1289,7 @@ export class NativeBridgeController {
       this.scheduleStatePush();
 
       const nextPrompt = this.queuedPrompts.shift();
-      this.state.queuedPrompts = [...this.queuedPrompts];
+      this.syncQueuedPrompts();
       if (nextPrompt) {
         await this.submit(nextPrompt);
       }
@@ -2228,6 +2243,7 @@ export class NativeBridgeController {
             limit ?? 4,
           );
         },
+        lsp: this.lspManager,
       };
 
       const authorization = await this.authorizeToolExecution(block, toolContext);
@@ -2386,6 +2402,20 @@ export class NativeBridgeController {
       todos: this.todos.map((item) => ({ ...item })),
       remoteSessions: Array.from(this.remoteSessions.values()).map((session) => ({ ...session })),
       artifacts: this.artifacts.map((artifact) => ({ ...artifact })),
+      queuedPrompts: [...this.queuedPrompts],
+      backgroundJobs: this.backgroundJobs.map((job) => ({
+        id: job.id,
+        kind: job.kind,
+        label: job.label,
+        status: job.status,
+        detail: job.detail,
+        startedAt: job.startedAt,
+        updatedAt: job.updatedAt,
+        prompt: job.prompt,
+        purpose: job.purpose,
+        preferredMode: job.preferredMode ?? null,
+        strategy: job.strategy,
+      })),
     };
   }
 
@@ -2478,6 +2508,55 @@ export class NativeBridgeController {
           })
           .filter((item) => item.title.length > 0 && item.summary.length > 0)
       : [];
+    const queuedPrompts = Array.isArray(record.queuedPrompts)
+      ? record.queuedPrompts
+          .filter((item): item is string => typeof item === 'string')
+          .map((item) => item.trim())
+          .filter((item) => item.length > 0)
+      : [];
+    const backgroundJobs = Array.isArray(record.backgroundJobs)
+      ? record.backgroundJobs
+          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
+          .map((item): WorkflowBackgroundJobSnapshot | null => {
+            const status = item.status === 'running' || item.status === 'done' || item.status === 'error'
+              ? item.status
+              : null;
+            const kind = item.kind === 'delegate' || item.kind === 'team' ? item.kind : null;
+            if (!status || !kind) {
+              return null;
+            }
+
+            return {
+              id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
+              kind,
+              label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : kind,
+              status,
+              detail: typeof item.detail === 'string' ? item.detail : null,
+              startedAt: typeof item.startedAt === 'number' ? item.startedAt : Date.parse(entry.timestamp),
+              updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.parse(entry.timestamp),
+              prompt: typeof item.prompt === 'string' && item.prompt.trim() ? item.prompt.trim() : undefined,
+              purpose:
+                item.purpose === 'general' ||
+                item.purpose === 'execution' ||
+                item.purpose === 'planning' ||
+                item.purpose === 'research' ||
+                item.purpose === 'review' ||
+                item.purpose === 'design' ||
+                item.purpose === 'oracle'
+                  ? item.purpose
+                  : undefined,
+              preferredMode:
+                item.preferredMode === 'jennie' || item.preferredMode === 'lisa' || item.preferredMode === 'rosé' || item.preferredMode === 'jisoo'
+                  ? item.preferredMode
+                  : null,
+              strategy:
+                item.strategy === 'parallel' || item.strategy === 'sequential' || item.strategy === 'delegate'
+                  ? item.strategy
+                  : undefined,
+            };
+          })
+          .filter((item): item is WorkflowBackgroundJobSnapshot => item !== null)
+      : [];
 
     return {
       mode,
@@ -2486,6 +2565,8 @@ export class NativeBridgeController {
       todos,
       remoteSessions,
       artifacts,
+      queuedPrompts,
+      backgroundJobs,
     };
   }
 
@@ -2696,7 +2777,10 @@ export class NativeBridgeController {
     this.state.mode = inferredMode;
     this.remoteSessions.clear();
     this.agentActivities = [];
+    this.backgroundJobs = [];
+    this.queuedPrompts = [];
     this.syncAgentActivities();
+    this.syncBackgroundJobs();
 
     if (restoredSnapshot) {
       this.selectedModels = { ...restoredSnapshot.selectedModels };
@@ -2709,6 +2793,18 @@ export class NativeBridgeController {
       this.state.todos = this.todos.map((item) => ({ ...item }));
       this.artifacts = restoredSnapshot.artifacts.map((artifact) => ({ ...artifact }));
       this.syncArtifacts();
+      this.queuedPrompts = [...restoredSnapshot.queuedPrompts];
+      this.state.queuedPrompts = [...this.queuedPrompts];
+      this.backgroundJobs = restoredSnapshot.backgroundJobs.map((job) => ({
+        ...job,
+        status: job.status === 'running' ? 'error' : job.status,
+        detail:
+          job.status === 'running'
+            ? 'interrupted by restart'
+            : job.detail,
+        controller: null,
+      }));
+      this.syncBackgroundJobs();
       for (const remoteSession of restoredSnapshot.remoteSessions) {
         this.remoteSessions.set(remoteSession.provider, { ...remoteSession });
       }
@@ -2744,6 +2840,36 @@ export class NativeBridgeController {
     }
 
     this.mcpManager = manager;
+    this.syncMcpState();
+  }
+
+  private syncMcpState(): void {
+    const entries = Object.entries(this.config?.mcp.servers ?? {});
+    const connectedServers = this.mcpManager?.getConnectedServers() ?? [];
+    const toolCount =
+      this.toolRegistry?.list().filter((tool) => tool.name.startsWith('mcp__')).length ?? 0;
+
+    const nextState: NativeMcpState = {
+      configuredServers: entries.length,
+      connectedServers: connectedServers.length,
+      toolCount,
+      serverNames: entries.map(([name]) => name),
+      connectedNames: [...connectedServers],
+    };
+
+    this.state.mcp = nextState;
+  }
+
+  private syncLspState(): void {
+    const state = this.lspManager.getServerState();
+    const nextState: NativeLspState = {
+      availableServers: state.available.length,
+      connectedServers: state.connected.length,
+      serverLabels: state.available.map((server) => server.label),
+      connectedLabels: state.connected.map((server) => server.label),
+    };
+
+    this.state.lsp = nextState;
   }
 
   private buildProviderState(): NativeProviderState[] {
@@ -2955,6 +3081,7 @@ export class NativeBridgeController {
   private formatDoctorSummary(): string {
     const profile = this.getContextProfile();
     const queue = this.queuedPrompts.length > 0 ? this.queuedPrompts.length.toString() : '0';
+    const lspState = this.lspManager.getServerState();
 
     return [
       'Doctor',
@@ -2969,6 +3096,8 @@ export class NativeBridgeController {
       `skills loaded: ${this.loadedSkills.size}`,
       `provider sessions: ${this.remoteSessions.size}`,
       `background queue: ${queue}`,
+      `background jobs: ${this.backgroundJobs.length}`,
+      `lsp: ${lspState.connected.length}/${lspState.available.length} connected`,
     ].join('\n');
   }
 
@@ -3214,7 +3343,7 @@ export class NativeBridgeController {
               query,
               max_results: Math.max(limit, 8),
             },
-            { cwd: process.cwd() },
+            { cwd: process.cwd(), lsp: this.lspManager },
           );
           this.addRankedOutputScores(scores, result.output, 2);
           for (const filePath of this.extractRankedFilesFromSearch(result.output, limit + 3)) {
@@ -3235,7 +3364,7 @@ export class NativeBridgeController {
                 query: symbol,
                 max_results: Math.max(limit, 6),
               },
-              { cwd: process.cwd() },
+              { cwd: process.cwd(), lsp: this.lspManager },
             );
             this.addRankedOutputScores(scores, result.output, 2);
             for (const filePath of this.extractFilesFromLineMatches(result.output, limit + 2)) {
@@ -3255,7 +3384,7 @@ export class NativeBridgeController {
                 query: symbol,
                 max_results: Math.max(limit, 6),
               },
-              { cwd: process.cwd() },
+              { cwd: process.cwd(), lsp: this.lspManager },
             );
             this.addRankedOutputScores(scores, result.output, 1);
             for (const filePath of this.extractFilesFromLineMatches(result.output, limit + 2)) {
@@ -3569,7 +3698,17 @@ export class NativeBridgeController {
         detail: job.detail,
         startedAt: job.startedAt,
         updatedAt: job.updatedAt,
+        purpose: job.purpose ?? null,
+        preferredMode: job.preferredMode ?? null,
+        strategy: job.strategy ?? null,
+        promptPreview: job.prompt ? previewText(job.prompt, 96) : null,
       }));
+  }
+
+  private syncQueuedPrompts(): void {
+    this.state.queuedPrompts = [...this.queuedPrompts];
+    this.scheduleStatePush();
+    void this.persistWorkflowState('queue_update');
   }
 
   private syncArtifacts(): void {
@@ -3665,6 +3804,7 @@ export class NativeBridgeController {
 
     this.syncBackgroundJobs();
     this.scheduleStatePush();
+    void this.persistWorkflowState('background_job_update');
   }
 
   private rememberArtifact(artifact: {
@@ -3858,6 +3998,51 @@ export class NativeBridgeController {
     ].join('\n');
   }
 
+  private buildVerificationRepairPrompt(input: {
+    purpose: DelegationPurpose | 'general';
+    userPrompt: string;
+    assistantOutput: string;
+    verification: VerificationSummary;
+  }): string {
+    return [
+      `A previous ${input.purpose} attempt failed verification.`,
+      '',
+      'Retry this as a repair pass in an isolated workspace.',
+      'Keep the patch as small as possible and optimize only for turning the failing checks green.',
+      '',
+      'Original request:',
+      input.userPrompt,
+      '',
+      'Current failing output summary:',
+      previewText(input.assistantOutput, 700),
+      '',
+      'Verification summary:',
+      input.verification.summary,
+      '',
+      'Verification report:',
+      input.verification.report,
+      '',
+      'Return:',
+      '1. the minimal repair you made',
+      '2. the files touched',
+      '3. the final verification status',
+    ].join('\n');
+  }
+
+  private preferredRetryModeForPurpose(
+    purpose: DelegationPurpose | 'general',
+  ): NamedMode {
+    if (purpose === 'design') {
+      return this.getTeamEligibleModes().includes('jisoo') ? 'jisoo' : 'lisa';
+    }
+
+    if (purpose === 'review') {
+      return this.getTeamEligibleModes().includes('jennie') ? 'jennie' : 'rosé';
+    }
+
+    return this.getTeamEligibleModes().includes('lisa') ? 'lisa' : this.currentMode;
+  }
+
   private async maybeScheduleVerificationFollowup(input: {
     purpose: DelegationPurpose | 'general';
     userPrompt: string;
@@ -3875,6 +4060,38 @@ export class NativeBridgeController {
       `${BLACKPINK_MODES[this.currentMode].label} verification`,
     );
     await this.ensureVerificationTodo(verification);
+
+    const repairPurpose = input.purpose === 'design' ? 'design' : 'execution';
+    const fingerprint = verification.fingerprint ?? `${input.purpose}:${verification.summary}`;
+    const canAutoRepair =
+      input.purpose !== 'review' &&
+      input.purpose !== 'oracle' &&
+      this.canStartBackgroundJob() &&
+      !this.verificationRepairFingerprints.has(fingerprint);
+
+    if (canAutoRepair) {
+      this.verificationRepairFingerprints.add(fingerprint);
+      await this.startBackgroundDelegatedRoute(
+        {
+          id: randomUUID(),
+          role: 'user',
+          content: this.buildVerificationRepairPrompt({
+            purpose: input.purpose,
+            userPrompt: input.userPrompt,
+            assistantOutput: input.assistantOutput,
+            verification,
+          }),
+          timestamp: Date.now(),
+        },
+        {
+          kind: 'delegate',
+          purpose: repairPurpose,
+          preferredMode: this.preferredRetryModeForPurpose(input.purpose),
+          reason: 'verification auto-retry',
+        },
+      );
+      return;
+    }
 
     if (input.purpose === 'review' || input.purpose === 'oracle' || !this.canStartBackgroundJob()) {
       return;
@@ -4039,8 +4256,7 @@ export class NativeBridgeController {
 
     if (command === 'clear') {
       this.queuedPrompts = [];
-      this.state.queuedPrompts = [];
-      this.scheduleStatePush();
+      this.syncQueuedPrompts();
       return 'Queue cleared.';
     }
 
@@ -4051,8 +4267,7 @@ export class NativeBridgeController {
       }
       const index = this.resolveQueueIndex(ref);
       const [removed] = this.queuedPrompts.splice(index, 1);
-      this.state.queuedPrompts = [...this.queuedPrompts];
-      this.scheduleStatePush();
+      this.syncQueuedPrompts();
       return `Dropped queue item ${index + 1}: ${previewText(removed ?? '', 120)}`;
     }
 
@@ -4066,8 +4281,7 @@ export class NativeBridgeController {
       if (prompt) {
         this.queuedPrompts.unshift(prompt);
       }
-      this.state.queuedPrompts = [...this.queuedPrompts];
-      this.scheduleStatePush();
+      this.syncQueuedPrompts();
       return this.formatQueueSummary();
     }
 
@@ -4078,15 +4292,13 @@ export class NativeBridgeController {
       }
       const index = this.resolveQueueIndex(ref);
       const [prompt] = this.queuedPrompts.splice(index, 1);
-      this.state.queuedPrompts = [...this.queuedPrompts];
-      this.scheduleStatePush();
+      this.syncQueuedPrompts();
       if (!prompt) {
         return `Queue item not found: ${ref}`;
       }
       if (this.state.loading && this.abortController) {
         this.queuedPrompts.unshift(prompt);
-        this.state.queuedPrompts = [...this.queuedPrompts];
-        this.scheduleStatePush();
+        this.syncQueuedPrompts();
         return `Queue item ${ref} promoted to run next.`;
       }
       await this.submit(prompt);
@@ -4108,6 +4320,24 @@ export class NativeBridgeController {
         return `${index + 1}. ${job.label} [${job.status}]${detail}`;
       }),
     ].join('\n');
+  }
+
+  private formatJobInspect(job: BackgroundJobState): string {
+    return [
+      `Job ${job.id}`,
+      `label: ${job.label}`,
+      `kind: ${job.kind}`,
+      `status: ${job.status}`,
+      job.purpose ? `purpose: ${job.purpose}` : null,
+      job.preferredMode ? `mode: ${BLACKPINK_MODES[job.preferredMode].label}` : null,
+      job.strategy ? `strategy: ${job.strategy}` : null,
+      `started: ${new Date(job.startedAt).toISOString()}`,
+      `updated: ${new Date(job.updatedAt).toISOString()}`,
+      job.detail ? `detail: ${job.detail}` : null,
+      job.prompt ? `prompt: ${job.prompt}` : null,
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join('\n');
   }
 
   private resolveBackgroundJob(reference: string): BackgroundJobState {
@@ -4208,7 +4438,55 @@ export class NativeBridgeController {
       return `Retried job ${ref} in background.`;
     }
 
-    return 'Usage: /jobs [cancel|retry] ...';
+    if (command === 'inspect') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs inspect <index-or-id>';
+      }
+      return this.formatJobInspect(this.resolveBackgroundJob(ref));
+    }
+
+    if (command === 'promote') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs promote <index-or-id>';
+      }
+      const job = this.resolveBackgroundJob(ref);
+      if (!job.prompt) {
+        return `Job ${ref} cannot be promoted.`;
+      }
+
+      if (job.status === 'running' && job.controller) {
+        job.controller.abort();
+        this.updateBackgroundJob({
+          id: job.id,
+          kind: job.kind,
+          label: job.label,
+          status: 'error',
+          detail: 'promoted to foreground',
+          prompt: job.prompt,
+          purpose: job.purpose,
+          preferredMode: job.preferredMode,
+          strategy: job.strategy,
+          controller: null,
+        });
+      }
+
+      if (this.state.loading && this.abortController) {
+        return 'Promote unavailable while a foreground request is active.';
+      }
+
+      if (job.kind === 'team') {
+        await this.executeTeamRun(job.strategy ?? 'parallel', job.prompt, {
+          routeNote: `Team run promoted · ${job.strategy ?? 'parallel'}`,
+        });
+      } else {
+        await this.submit(job.prompt);
+      }
+      return `Promoted job ${ref} to foreground.`;
+    }
+
+    return 'Usage: /jobs [cancel|retry|inspect|promote] ...';
   }
 
   private async runCheckpointCommand(message: string): Promise<string> {
@@ -5249,6 +5527,7 @@ export class NativeBridgeController {
 
   private emitStateNow(): void {
     this.syncUsageState();
+    this.syncLspState();
 
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
@@ -5266,6 +5545,20 @@ export class NativeBridgeController {
           toolCalls: message.toolCalls ? [...message.toolCalls] : undefined,
         })),
         providers: this.state.providers.map((provider) => ({ ...provider })),
+        mcp: this.state.mcp
+          ? {
+              ...this.state.mcp,
+              serverNames: [...this.state.mcp.serverNames],
+              connectedNames: [...this.state.mcp.connectedNames],
+            }
+          : null,
+        lsp: this.state.lsp
+          ? {
+              ...this.state.lsp,
+              serverLabels: [...this.state.lsp.serverLabels],
+              connectedLabels: [...this.state.lsp.connectedLabels],
+            }
+          : null,
         modes: this.state.modes.map((mode) => ({ ...mode })),
         slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
         todos: this.state.todos.map((item) => ({ ...item })),

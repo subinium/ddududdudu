@@ -1,4 +1,5 @@
 import type { DelegationRuntime } from '../core/delegation.js';
+import type { LspManager } from '../core/lsp-manager.js';
 import type { NamedMode } from '../core/types.js';
 import type { PermissionProfile, PlanItem, PlanItemStatus, WorkflowArtifact } from '../core/workflow-state.js';
 
@@ -32,6 +33,7 @@ export interface ToolContext {
   }) => void;
   contextSnapshot?: (prompt: string, purpose?: string) => Promise<string>;
   artifacts?: (purpose?: string, limit?: number) => WorkflowArtifact[];
+  lsp?: LspManager;
   askUser?: (question: string, options?: string[]) => Promise<string>;
   authToken?: string;
   authBaseUrl?: string;

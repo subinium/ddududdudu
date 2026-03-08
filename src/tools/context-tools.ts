@@ -3,6 +3,7 @@ import { readdir, readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
+import type { LspDocumentSymbol, LspResolvedLocation, LspWorkspaceSymbol } from '../core/lsp-manager.js';
 import type { Tool } from './index.js';
 
 const execFileAsync = promisify(execFile);
@@ -187,6 +188,379 @@ const isDefinitionLine = (query: string, line: string): boolean => {
   return SYMBOL_PATTERNS(query).some((pattern) => pattern.test(line));
 };
 
+const symbolKindLabel = (kind: number | undefined): string => {
+  switch (kind) {
+    case 5:
+      return 'class';
+    case 6:
+      return 'method';
+    case 12:
+      return 'function';
+    case 13:
+      return 'variable';
+    case 23:
+      return 'struct';
+    case 11:
+      return 'interface';
+    default:
+      return 'symbol';
+  }
+};
+
+const symbolMatchScore = (
+  query: string,
+  symbol: LspDocumentSymbol,
+  rootPath: string,
+): number => {
+  const normalizedQuery = query.trim().toLowerCase();
+  const normalizedName = symbol.name.toLowerCase();
+  const relPath = normalizePath(relative(rootPath, symbol.filePath));
+  let score = 0;
+  if (normalizedName === normalizedQuery) {
+    score += 10;
+  } else if (normalizedName.startsWith(normalizedQuery)) {
+    score += 6;
+  } else if (normalizedName.includes(normalizedQuery)) {
+    score += 3;
+  }
+
+  if (relPath.toLowerCase().includes(normalizedQuery)) {
+    score += 2;
+  }
+
+  return score;
+};
+
+const readLineAt = async (filePath: string, zeroBasedLine: number): Promise<string | null> => {
+  try {
+    const text = await readTextFile(filePath);
+    if (!text) {
+      return null;
+    }
+    const lines = text.split('\n');
+    return lines[zeroBasedLine]?.trim() ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const withTimeout = async <T>(
+  promise: Promise<T>,
+  fallback: T,
+  timeoutMs: number = 1_500,
+): Promise<T> => {
+  return Promise.race([
+    promise,
+    new Promise<T>((resolve) => {
+      setTimeout(() => resolve(fallback), timeoutMs);
+    }),
+  ]);
+};
+
+const findQueryPositionsInFile = async (
+  filePath: string,
+  query: string,
+  maxPositions: number,
+): Promise<Array<{ line: number; character: number }>> => {
+  const text = await readTextFile(filePath);
+  if (!text) {
+    return [];
+  }
+
+  const positions: Array<{ line: number; character: number }> = [];
+  const lines = text.split('\n');
+  const pattern = buildReferencePattern(query);
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    if (positions.length >= maxPositions) {
+      break;
+    }
+
+    const line = lines[lineIndex];
+    const match = pattern.exec(line);
+    if (!match || match.index < 0) {
+      continue;
+    }
+
+    positions.push({
+      line: lineIndex,
+      character: match.index,
+    });
+  }
+
+  return positions;
+};
+
+const collectCandidateFilesForSymbol = async (
+  rootPath: string,
+  query: string,
+  maxFiles: number,
+): Promise<string[]> => {
+  const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+  const patterns = SYMBOL_PATTERNS(query.trim());
+  const needle = query.trim().toLowerCase();
+  const matches: string[] = [];
+
+  for (const filePath of files) {
+    if (matches.length >= maxFiles) {
+      break;
+    }
+
+    const relPath = normalizePath(relative(rootPath, filePath));
+    if (relPath.toLowerCase().includes(needle)) {
+      matches.push(filePath);
+      continue;
+    }
+
+    const text = await readTextFile(filePath);
+    if (!text) {
+      continue;
+    }
+
+    const lines = text.split('\n');
+    if (lines.some((line) => patterns.some((pattern) => pattern.test(line)))) {
+      matches.push(filePath);
+    }
+  }
+
+  return matches;
+};
+
+const collectCandidateFilesForReferences = async (
+  rootPath: string,
+  query: string,
+  maxFiles: number,
+): Promise<string[]> => {
+  const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+  const pattern = buildReferencePattern(query);
+  const matches: string[] = [];
+
+  for (const filePath of files) {
+    if (matches.length >= maxFiles) {
+      break;
+    }
+
+    const text = await readTextFile(filePath);
+    if (!text || !pattern.test(text)) {
+      continue;
+    }
+
+    matches.push(filePath);
+  }
+
+  return matches;
+};
+
+const tryLspDefinitionSearch = async (
+  query: string,
+  rootPath: string,
+  maxResults: number,
+  ctx: {
+    lsp?: {
+      supportsFile: (filePath: string) => boolean;
+      documentSymbols: (filePath: string) => Promise<LspDocumentSymbol[]>;
+      workspaceSymbols: (query: string, filePath: string) => Promise<LspWorkspaceSymbol[]>;
+      definition: (filePath: string, position: { line: number; character: number }) => Promise<LspResolvedLocation[]>;
+    };
+  },
+): Promise<{ output: string; count: number } | null> => {
+  if (!ctx.lsp) {
+    return null;
+  }
+
+  const candidateFiles = (await collectCandidateFilesForSymbol(rootPath, query, Math.max(maxResults * 2, 10)))
+    .filter((filePath) => ctx.lsp?.supportsFile(filePath));
+  if (candidateFiles.length === 0) {
+    return null;
+  }
+
+  const matches: Array<{ score: number; path: string; line: string }> = [];
+  for (const filePath of candidateFiles) {
+    let symbols: LspDocumentSymbol[] = [];
+    try {
+      const workspaceSymbols = await withTimeout(ctx.lsp.workspaceSymbols(query, filePath), []);
+      symbols =
+        workspaceSymbols.length > 0
+          ? workspaceSymbols.map((symbol) => ({
+              name: symbol.name,
+              detail: symbol.detail,
+              kind: symbol.kind,
+              filePath: symbol.filePath,
+              range: symbol.range,
+              selectionRange: symbol.range,
+            }))
+          : await withTimeout(ctx.lsp.documentSymbols(filePath), []);
+    } catch {
+      symbols = [];
+    }
+
+    if (symbols.length === 0) {
+      const positions = await findQueryPositionsInFile(filePath, query, 3);
+      for (const position of positions) {
+        let definitionLocations: LspResolvedLocation[] = [];
+        try {
+          definitionLocations = await withTimeout(ctx.lsp.definition(filePath, position), []);
+        } catch {
+          definitionLocations = [];
+        }
+
+        for (const location of definitionLocations) {
+          const relPath = normalizePath(relative(rootPath, location.filePath));
+          const line = await readLineAt(location.filePath, location.line);
+          const snippet = `${relPath}:${location.line + 1}:${location.character + 1}: ${line ?? query.trim()}`;
+          matches.push({
+            score: relPath === normalizePath(relative(rootPath, filePath)) ? 8 : 6,
+            path: relPath,
+            line: snippet,
+          });
+        }
+      }
+    }
+
+    for (const symbol of symbols) {
+      const score = symbolMatchScore(query, symbol, rootPath);
+      if (score <= 0) {
+        continue;
+      }
+      const relPath = normalizePath(relative(rootPath, symbol.filePath));
+      const line = await readLineAt(symbol.filePath, symbol.selectionRange.start.line);
+      matches.push({
+        score,
+        path: relPath,
+        line: `${relPath}:${symbol.selectionRange.start.line + 1}:${symbol.selectionRange.start.character + 1}: ${symbolKindLabel(symbol.kind)} ${symbol.name}${line ? ` · ${line}` : ''}`,
+      });
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  const output = renderGroupedMatches(
+    matches.map((match) => ({ path: match.path, line: match.line, score: match.score })),
+    maxResults,
+    3,
+  );
+
+  return {
+    output,
+    count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
+  };
+};
+
+const tryLspReferenceSearch = async (
+  query: string,
+  rootPath: string,
+  maxResults: number,
+  ctx: {
+    lsp?: {
+      supportsFile: (filePath: string) => boolean;
+      documentSymbols: (filePath: string) => Promise<LspDocumentSymbol[]>;
+      workspaceSymbols: (query: string, filePath: string) => Promise<LspWorkspaceSymbol[]>;
+      definition: (filePath: string, position: { line: number; character: number }) => Promise<LspResolvedLocation[]>;
+      references: (filePath: string, position: { line: number; character: number }) => Promise<LspResolvedLocation[]>;
+    };
+  },
+): Promise<Array<{ path: string; line: string; score: number }> | null> => {
+  if (!ctx.lsp) {
+    return null;
+  }
+
+  const candidateFiles = (await collectCandidateFilesForReferences(rootPath, query, 12))
+    .filter((filePath) => ctx.lsp?.supportsFile(filePath));
+  if (candidateFiles.length === 0) {
+    return null;
+  }
+
+  const definitionCandidates: Array<{ symbol: LspDocumentSymbol; score: number }> = [];
+  for (const filePath of candidateFiles) {
+    let symbols: LspDocumentSymbol[] = [];
+    try {
+      const workspaceSymbols = await withTimeout(ctx.lsp.workspaceSymbols(query, filePath), []);
+      symbols =
+        workspaceSymbols.length > 0
+          ? workspaceSymbols.map((symbol) => ({
+              name: symbol.name,
+              detail: symbol.detail,
+              kind: symbol.kind,
+              filePath: symbol.filePath,
+              range: symbol.range,
+              selectionRange: symbol.range,
+            }))
+          : await withTimeout(ctx.lsp.documentSymbols(filePath), []);
+    } catch {
+      symbols = [];
+    }
+
+    if (symbols.length === 0) {
+      const positions = await findQueryPositionsInFile(filePath, query, 3);
+      for (const position of positions) {
+        let definitionLocations: LspResolvedLocation[] = [];
+        try {
+          definitionLocations = await withTimeout(ctx.lsp.definition(filePath, position), []);
+        } catch {
+          definitionLocations = [];
+        }
+        for (const location of definitionLocations) {
+          definitionCandidates.push({
+            symbol: {
+              name: query.trim(),
+              filePath: location.filePath,
+              range: {
+                start: { line: location.line, character: location.character },
+                end: { line: location.endLine, character: location.endCharacter },
+              },
+              selectionRange: {
+                start: { line: location.line, character: location.character },
+                end: { line: location.endLine, character: location.endCharacter },
+              },
+            },
+            score: 8,
+          });
+        }
+      }
+    }
+
+    for (const symbol of symbols) {
+      const score = symbolMatchScore(query, symbol, rootPath);
+      if (score > 0) {
+        definitionCandidates.push({ symbol, score });
+      }
+    }
+  }
+
+  definitionCandidates.sort((a, b) => b.score - a.score || a.symbol.filePath.localeCompare(b.symbol.filePath));
+  if (definitionCandidates.length === 0) {
+    return null;
+  }
+
+  const matches: Array<{ path: string; line: string; score: number }> = [];
+  for (const candidate of definitionCandidates.slice(0, 4)) {
+    const references = await withTimeout(
+      ctx.lsp.references(candidate.symbol.filePath, candidate.symbol.selectionRange.start),
+      [],
+    );
+    for (const reference of references) {
+      const relPath = normalizePath(relative(rootPath, reference.filePath));
+      const snippet = await readLineAt(reference.filePath, reference.line);
+      matches.push({
+        path: relPath,
+        score: candidate.score + (reference.filePath === candidate.symbol.filePath ? 1 : 3),
+        line: `${relPath}:${reference.line + 1}:${reference.character + 1}: ${snippet ?? query.trim()}`,
+      });
+    }
+    if (matches.length >= maxResults * 2) {
+      break;
+    }
+  }
+
+  if (matches.length === 0) {
+    return null;
+  }
+
+  matches.sort((a, b) => b.score - a.score || a.line.localeCompare(b.line));
+  return matches.slice(0, maxResults * 2);
+};
+
 const changedFileBoost = (queryTokens: string[], relPath: string, changedFiles: Set<string>): number => {
   let score = 0;
   if (changedFiles.has(relPath)) {
@@ -310,6 +684,18 @@ export const symbolSearchTool: Tool = {
         : 60;
 
     try {
+      const lspResult = await tryLspDefinitionSearch(args.query.trim(), rootPath, maxResults, ctx);
+      if (lspResult) {
+        return {
+          output: lspResult.output,
+          metadata: {
+            root: rootPath,
+            count: lspResult.count,
+            source: 'lsp',
+          },
+        };
+      }
+
       const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
       const patterns = SYMBOL_PATTERNS(args.query.trim());
       const results: string[] = [];
@@ -379,6 +765,18 @@ export const referenceSearchTool: Tool = {
         : 80;
 
     try {
+      const lspMatches = await tryLspReferenceSearch(args.query.trim(), rootPath, maxResults, ctx);
+      if (lspMatches && lspMatches.length > 0) {
+        return {
+          output: lspMatches.map((entry) => entry.line).join('\n'),
+          metadata: {
+            root: rootPath,
+            count: Math.min(lspMatches.length, maxResults),
+            source: 'lsp',
+          },
+        };
+      }
+
       const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
       const pattern = buildReferencePattern(args.query);
       const changedFiles = new Set(await getChangedFiles(rootPath));
@@ -457,6 +855,18 @@ export const definitionSearchTool: Tool = {
         : 8;
 
     try {
+      const lspResult = await tryLspDefinitionSearch(args.query.trim(), rootPath, maxResults, ctx);
+      if (lspResult) {
+        return {
+          output: lspResult.output,
+          metadata: {
+            root: rootPath,
+            count: lspResult.count,
+            source: 'lsp',
+          },
+        };
+      }
+
       const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
       const patterns = SYMBOL_PATTERNS(args.query.trim());
       const changedFiles = new Set(await getChangedFiles(rootPath));
@@ -534,6 +944,18 @@ export const referenceHotspotsTool: Tool = {
         : 8;
 
     try {
+      const lspMatches = await tryLspReferenceSearch(args.query.trim(), rootPath, maxResults, ctx);
+      if (lspMatches && lspMatches.length > 0) {
+        return {
+          output: renderGroupedMatches(lspMatches, maxResults, 3),
+          metadata: {
+            root: rootPath,
+            count: Math.min(new Set(lspMatches.map((match) => match.path)).size, maxResults),
+            source: 'lsp',
+          },
+        };
+      }
+
       const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
       const pattern = buildReferencePattern(args.query);
       const changedFiles = new Set(await getChangedFiles(rootPath));

@@ -104,6 +104,27 @@ struct NativeProviderState {
     token_type: Option<String>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeMcpState {
+    configured_servers: u64,
+    connected_servers: u64,
+    tool_count: u64,
+    server_names: Vec<String>,
+    connected_names: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeLspState {
+    available_servers: u64,
+    connected_servers: u64,
+    server_labels: Vec<String>,
+    connected_labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeAskUserState {
@@ -147,6 +168,10 @@ struct NativeBackgroundJobState {
     detail: Option<String>,
     started_at: u64,
     updated_at: u64,
+    purpose: Option<String>,
+    preferred_mode: Option<String>,
+    strategy: Option<String>,
+    prompt_preview: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -218,6 +243,8 @@ struct NativeTuiState {
     request_estimate: Option<NativeRequestEstimateState>,
     queued_prompts: Vec<String>,
     providers: Vec<NativeProviderState>,
+    mcp: Option<NativeMcpState>,
+    lsp: Option<NativeLspState>,
     messages: Vec<NativeMessageState>,
     ask_user: Option<NativeAskUserState>,
     slash_commands: Vec<NativeSlashCommand>,
@@ -475,6 +502,8 @@ impl App {
                 request_estimate: None,
                 queued_prompts: Vec::new(),
                 providers: Vec::new(),
+                mcp: None,
+                lsp: None,
                 messages: Vec::new(),
                 ask_user: None,
                 slash_commands: Vec::new(),
@@ -867,7 +896,7 @@ impl App {
         }
         lines.push(Line::from(Span::raw("")));
 
-        lines.push(sidebar_header("Agents"));
+        lines.push(sidebar_header("Subagents"));
         let queued_count = self
             .state
             .agent_activities
@@ -935,7 +964,7 @@ impl App {
                 &mut lines,
                 "·",
                 ACCENT_DIM,
-                "agents idle".to_string(),
+                "no active subagents".to_string(),
                 None,
                 FG,
                 ACCENT_DIM,
@@ -974,50 +1003,6 @@ impl App {
         }
         lines.push(Line::from(Span::raw("")));
 
-        lines.push(sidebar_header("Artifacts"));
-        if self.state.artifacts.is_empty() {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "no recent artifacts".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        } else {
-            for artifact in self.state.artifacts.iter().take(5) {
-                let color = match artifact.kind.as_str() {
-                    "plan" => ACCENT,
-                    "review" => SUCCESS,
-                    "patch" => PATH,
-                    "design" => LINK,
-                    "briefing" => ACCENT_DIM,
-                    _ => FG,
-                };
-                let title = if let Some(mode) = &artifact.mode {
-                    format!(
-                        "[{}] {} · {}",
-                        artifact.kind,
-                        preview_line(&artifact.title, 16),
-                        title_case_label(mode)
-                    )
-                } else {
-                    format!("[{}] {}", artifact.kind, preview_line(&artifact.title, 22))
-                };
-                push_sidebar_rail_item(
-                    &mut lines,
-                    "□",
-                    color,
-                    title,
-                    Some(preview_line(&artifact.summary, 28)),
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-        }
-        lines.push(Line::from(Span::raw("")));
-
         lines.push(sidebar_header("Background"));
         for job in self.state.background_jobs.iter().take(4) {
             let (marker, color) = match job.status.as_str() {
@@ -1035,6 +1020,18 @@ impl App {
                 job.detail
                     .as_ref()
                     .map(|detail| preview_line(detail, 28))
+                    .or_else(|| {
+                        let note = [
+                            job.purpose.as_ref().map(|value| value.as_str()),
+                            job.strategy.as_ref().map(|value| value.as_str()),
+                            job.preferred_mode.as_ref().map(|value| value.as_str()),
+                            job.prompt_preview.as_ref().map(|value| value.as_str()),
+                        ]
+                        .into_iter()
+                        .flatten()
+                        .next();
+                        note.map(|value| preview_line(value, 28))
+                    })
                     .or_else(|| Some(job.kind.clone())),
                 FG,
                 ACCENT_DIM,
@@ -1054,7 +1051,7 @@ impl App {
         if self.state.background_jobs.is_empty() && self.state.queued_prompts.is_empty() {
             push_sidebar_rail_item(
                 &mut lines,
-                if self.state.loading { "·" } else { "·" },
+                "·",
                 ACCENT_DIM,
                 if self.state.loading {
                     "foreground active".to_string()
@@ -1070,6 +1067,105 @@ impl App {
                 } else {
                     "no background work".to_string()
                 }),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(sidebar_header("MCP"));
+        if let Some(mcp) = &self.state.mcp {
+            if mcp.configured_servers == 0 {
+                push_sidebar_rail_item(
+                    &mut lines,
+                    "·",
+                    ACCENT_DIM,
+                    "no mcp servers".to_string(),
+                    None,
+                    FG,
+                    ACCENT_DIM,
+                );
+            } else {
+                let connected = format!(
+                    "{} / {} connected",
+                    format_count(mcp.connected_servers),
+                    format_count(mcp.configured_servers)
+                );
+                push_sidebar_rail_item(
+                    &mut lines,
+                    if mcp.connected_servers > 0 { "◎" } else { "○" },
+                    if mcp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                    connected,
+                    Some(format!("{} tools", format_count(mcp.tool_count))),
+                    FG,
+                    ACCENT_DIM,
+                );
+                for server in mcp.server_names.iter().take(5) {
+                    let connected_server = mcp.connected_names.iter().any(|name| name == server);
+                    push_sidebar_rail_item(
+                        &mut lines,
+                        if connected_server { "•" } else { "·" },
+                        if connected_server { ACCENT } else { ACCENT_DIM },
+                        preview_line(server, 28),
+                        None,
+                        FG,
+                        ACCENT_DIM,
+                    );
+                }
+            }
+        }
+
+        lines.push(Line::from(Span::raw("")));
+        lines.push(sidebar_header("LSP"));
+        if let Some(lsp) = &self.state.lsp {
+            if lsp.available_servers == 0 {
+                push_sidebar_rail_item(
+                    &mut lines,
+                    "·",
+                    ACCENT_DIM,
+                    "no language servers".to_string(),
+                    None,
+                    FG,
+                    ACCENT_DIM,
+                );
+            } else {
+                push_sidebar_rail_item(
+                    &mut lines,
+                    if lsp.connected_servers > 0 { "◎" } else { "○" },
+                    if lsp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                    format!(
+                        "{} / {} connected",
+                        format_count(lsp.connected_servers),
+                        format_count(lsp.available_servers)
+                    ),
+                    Some(preview_line(&lsp.server_labels.join(" · "), 30)),
+                    FG,
+                    ACCENT_DIM,
+                );
+                for server in lsp.server_labels.iter().take(5) {
+                    let connected = lsp.connected_labels.iter().any(|item| item == server);
+                    push_sidebar_rail_item(
+                        &mut lines,
+                        if connected { "•" } else { "·" },
+                        if connected { ACCENT } else { ACCENT_DIM },
+                        preview_line(server, 28),
+                        Some(if connected {
+                            "connected".to_string()
+                        } else {
+                            "available".to_string()
+                        }),
+                        FG,
+                        ACCENT_DIM,
+                    );
+                }
+            }
+        } else {
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "no language servers".to_string(),
+                None,
                 FG,
                 ACCENT_DIM,
             );
@@ -1115,24 +1211,6 @@ impl App {
                 ACCENT_DIM,
                 "no tool activity".to_string(),
                 None,
-                FG,
-                ACCENT_DIM,
-            );
-        }
-
-        lines.push(Line::from(Span::raw("")));
-        lines.push(sidebar_header("Providers"));
-        for provider in &self.state.providers {
-            let color = if provider.available { SUCCESS } else { ACCENT_DIM };
-            push_sidebar_rail_item(
-                &mut lines,
-                if provider.available { "●" } else { "○" },
-                color,
-                title_case_label(&provider.name),
-                provider
-                    .source
-                    .as_ref()
-                    .map(|source| preview_line(source, 28)),
                 FG,
                 ACCENT_DIM,
             );

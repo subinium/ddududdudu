@@ -50,6 +50,21 @@ export interface NativeProviderState {
   tokenType?: string;
 }
 
+export interface NativeMcpState {
+  configuredServers: number;
+  connectedServers: number;
+  toolCount: number;
+  serverNames: string[];
+  connectedNames: string[];
+}
+
+export interface NativeLspState {
+  availableServers: number;
+  connectedServers: number;
+  serverLabels: string[];
+  connectedLabels: string[];
+}
+
 export interface NativeAskUserState {
   question: string;
   options: string[];
@@ -78,6 +93,10 @@ export interface NativeBackgroundJobState {
   detail: string | null;
   startedAt: number;
   updatedAt: number;
+  purpose?: string | null;
+  preferredMode?: NamedMode | null;
+  strategy?: 'parallel' | 'sequential' | 'delegate' | null;
+  promptPreview?: string | null;
 }
 
 export interface NativeArtifactState extends Omit<WorkflowArtifact, 'kind'> {
@@ -128,6 +147,8 @@ export interface NativeTuiState {
   requestEstimate: NativeRequestEstimateState | null;
   queuedPrompts: string[];
   providers: NativeProviderState[];
+  mcp: NativeMcpState | null;
+  lsp: NativeLspState | null;
   messages: NativeMessageState[];
   askUser: NativeAskUserState | null;
   slashCommands: NativeSlashCommand[];

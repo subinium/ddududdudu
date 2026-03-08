@@ -1,4 +1,5 @@
 import type { NamedMode } from './types.js';
+import type { DelegationPurpose } from './delegation.js';
 
 export type PlanItemStatus = 'pending' | 'in_progress' | 'completed';
 export type PermissionProfile = 'plan' | 'ask' | 'workspace-write' | 'permissionless';
@@ -30,6 +31,20 @@ export interface WorkflowArtifact {
   createdAt: string;
 }
 
+export interface WorkflowBackgroundJobSnapshot {
+  id: string;
+  kind: 'delegate' | 'team';
+  label: string;
+  status: 'running' | 'done' | 'error';
+  detail: string | null;
+  startedAt: number;
+  updatedAt: number;
+  prompt?: string;
+  purpose?: DelegationPurpose | 'general';
+  preferredMode?: NamedMode | null;
+  strategy?: 'parallel' | 'sequential' | 'delegate';
+}
+
 export interface WorkflowStateSnapshot {
   mode: NamedMode;
   selectedModels: Record<NamedMode, string>;
@@ -37,4 +52,6 @@ export interface WorkflowStateSnapshot {
   todos: PlanItem[];
   remoteSessions: WorkflowRemoteSession[];
   artifacts: WorkflowArtifact[];
+  queuedPrompts: string[];
+  backgroundJobs: WorkflowBackgroundJobSnapshot[];
 }
