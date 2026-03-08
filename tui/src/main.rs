@@ -29,6 +29,7 @@ const MUTED: Color = Color::Rgb(128, 96, 108);
 const LINK: Color = Color::Rgb(132, 203, 255);
 const PATH: Color = Color::Rgb(255, 208, 120);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
 const SPLASH_FULL: &[&str] = &[
     "      d8b       d8b                d8b                    d8b       d8b                d8b",
     "      88P       88P                88P                    88P       88P                88P",
@@ -59,6 +60,7 @@ struct NativeSlashCommand {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeToolCallState {
     id: String,
     name: String,
@@ -70,6 +72,7 @@ struct NativeToolCallState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeMessageState {
     id: String,
     role: String,
@@ -102,6 +105,7 @@ struct NativeProviderState {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeAskUserState {
     question: String,
     options: Vec<String>,
@@ -109,6 +113,7 @@ struct NativeAskUserState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativePlanItemState {
     id: String,
     step: String,
@@ -119,6 +124,7 @@ struct NativePlanItemState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeAgentActivityState {
     id: String,
     label: String,
@@ -132,6 +138,7 @@ struct NativeAgentActivityState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeBackgroundJobState {
     id: String,
     kind: String,
@@ -144,6 +151,7 @@ struct NativeBackgroundJobState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeArtifactState {
     id: String,
     kind: String,
@@ -156,6 +164,7 @@ struct NativeArtifactState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeWorkspaceState {
     label: String,
     path: String,
@@ -164,6 +173,7 @@ struct NativeWorkspaceState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeVerificationState {
     status: String,
     summary: Option<String>,
@@ -172,6 +182,7 @@ struct NativeVerificationState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeRequestEstimateState {
     system: u64,
     history: u64,
@@ -370,8 +381,24 @@ impl BridgeClient {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 let outcome = match line {
-                    Ok(raw) => serde_json::from_str::<BridgeEvent>(&raw)
-                        .map_err(|error| anyhow!("failed to parse bridge event: {error}")),
+                    Ok(raw) => {
+                        let trimmed = raw.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+
+                        let payload = if let Some(rest) = trimmed.strip_prefix(BRIDGE_EVENT_PREFIX)
+                        {
+                            rest
+                        } else if trimmed.starts_with('{') {
+                            trimmed
+                        } else {
+                            continue;
+                        };
+
+                        serde_json::from_str::<BridgeEvent>(payload)
+                            .map_err(|error| anyhow!("failed to parse bridge event: {error}"))
+                    }
                     Err(error) => Err(anyhow!("failed to read bridge event: {error}")),
                 };
 

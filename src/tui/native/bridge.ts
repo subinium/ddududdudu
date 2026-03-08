@@ -4,8 +4,10 @@ import type { NamedMode } from '../../core/types.js';
 import type { NativeBridgeCommand, NativeBridgeEvent } from './protocol.js';
 import { NativeBridgeController } from './controller.js';
 
+const BRIDGE_EVENT_PREFIX = '__DDUDU_BRIDGE__ ';
+
 const writeEvent = (event: NativeBridgeEvent): void => {
-  process.stdout.write(`${JSON.stringify(event)}\n`);
+  process.stdout.write(`${BRIDGE_EVENT_PREFIX}${JSON.stringify(event)}\n`);
 };
 
 const redirectConsoleToStderr = (): void => {
@@ -96,7 +98,10 @@ export const runNativeBridge = async (): Promise<void> => {
     try {
       command = parseCommand(line);
     } catch (error: unknown) {
-      writeEvent({ type: 'fatal', message: error instanceof Error ? error.message : String(error) });
+      console.error(
+        '[ddudu bridge] ignored invalid command:',
+        error instanceof Error ? error.message : String(error),
+      );
       return;
     }
 

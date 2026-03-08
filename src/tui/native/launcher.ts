@@ -14,10 +14,6 @@ const exists = async (filePath: string): Promise<boolean> => {
 };
 
 const resolveBridgeEntrypoint = (): string => {
-  if (process.argv[1]) {
-    return process.argv[1];
-  }
-
   return fileURLToPath(new URL('../../index.js', import.meta.url));
 };
 
@@ -42,7 +38,15 @@ export interface NativeTuiLaunchOptions {
   resumeSessionId?: string;
 }
 
+type ExecveProcess = NodeJS.Process & {
+  execve?: (file: string, args: string[], env?: Record<string, string>) => never;
+};
+
 export const startNativeTui = async (options: NativeTuiLaunchOptions = {}): Promise<void> => {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error('ddudu native TUI requires an interactive terminal (TTY).');
+  }
+
   if (process.env.DDUDU_TUI === 'ink') {
     const configModule = await import('../../core/config.js');
     const config = await configModule.loadConfig();
@@ -61,25 +65,45 @@ export const startNativeTui = async (options: NativeTuiLaunchOptions = {}): Prom
   }
 
   const bridgeEntrypoint = resolveBridgeEntrypoint();
+  const nativeEnv = {
+    ...process.env,
+    DDUDU_TUI: 'native',
+    ...(options.resumeSessionId
+      ? { DDUDU_RESUME_SESSION_ID: options.resumeSessionId }
+      : {}),
+  };
+
+  const execve = (process as ExecveProcess).execve;
+  if (process.env.DDUDU_NO_EXECVE !== '1' && typeof execve === 'function') {
+    execve(binaryPath, [binaryPath, '--node', process.execPath, '--bridge', bridgeEntrypoint], nativeEnv);
+  }
+
+  const launchedAt = Date.now();
   const child = spawn(
     binaryPath,
     ['--node', process.execPath, '--bridge', bridgeEntrypoint],
     {
       stdio: 'inherit',
-      env: {
-        ...process.env,
-        DDUDU_TUI: 'native',
-        ...(options.resumeSessionId
-          ? { DDUDU_RESUME_SESSION_ID: options.resumeSessionId }
-          : {}),
-      },
+      env: nativeEnv,
     },
   );
 
-  const exitCode = await new Promise<number>((resolvePromise, reject) => {
+  const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolvePromise, reject) => {
     child.on('error', reject);
-    child.on('close', (code) => resolvePromise(code ?? 0));
+    child.on('close', (code, signal) => resolvePromise({ code, signal }));
   });
 
-  process.exitCode = exitCode;
+  if (result.signal) {
+    throw new Error(`ddudu native TUI terminated by signal ${result.signal}`);
+  }
+
+  if ((result.code ?? 0) !== 0) {
+    throw new Error(`ddudu native TUI exited with code ${result.code ?? 0}`);
+  }
+
+  if (Date.now() - launchedAt < 500) {
+    throw new Error('ddudu native TUI exited immediately during startup');
+  }
+
+  process.exitCode = result.code ?? 0;
 };
