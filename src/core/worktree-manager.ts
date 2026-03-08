@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { constants } from 'node:fs';
-import { access, lstat, mkdir, rm, symlink } from 'node:fs/promises';
+import { access, lstat, mkdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -16,6 +16,14 @@ export interface IsolatedWorkspace {
   repoRoot: string;
   baseCwd: string;
   kind: 'git-worktree';
+}
+
+export interface WorkspaceApplyResult {
+  attempted: boolean;
+  applied: boolean;
+  empty: boolean;
+  summary: string;
+  error?: string;
 }
 
 const slugify = (value: string): string => {
@@ -126,5 +134,55 @@ export class WorktreeManager {
     }
 
     await rm(workspace.path, { recursive: true, force: true });
+  }
+
+  public async applyToBase(workspace: IsolatedWorkspace): Promise<WorkspaceApplyResult> {
+    try {
+      await runGit(workspace.path, ['add', '--all']);
+      const summary = await runGit(workspace.path, ['diff', '--cached', '--shortstat', 'HEAD', '--']);
+      const { stdout: patch } = await execFileAsync(
+        'git',
+        ['diff', '--cached', '--binary', '--no-ext-diff', 'HEAD', '--'],
+        {
+          cwd: workspace.path,
+          encoding: 'utf8',
+          maxBuffer: 8 * 1024 * 1024,
+        },
+      );
+      if (!patch.trim()) {
+        return {
+          attempted: true,
+          applied: false,
+          empty: true,
+          summary: summary || 'no workspace changes to apply',
+        };
+      }
+
+      const patchDir = resolve(workspace.repoRoot, '.ddudu', 'tmp');
+      await mkdir(patchDir, { recursive: true });
+      const patchPath = resolve(patchDir, `${workspace.id}-apply.patch`);
+      await writeFile(patchPath, patch, 'utf8');
+
+      try {
+        await runGit(workspace.repoRoot, ['apply', '--whitespace=nowarn', patchPath]);
+      } finally {
+        await rm(patchPath, { force: true });
+      }
+
+      return {
+        attempted: true,
+        applied: true,
+        empty: false,
+        summary: summary || 'applied workspace patch',
+      };
+    } catch (error: unknown) {
+      return {
+        attempted: true,
+        applied: false,
+        empty: false,
+        summary: 'workspace patch apply failed',
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
   }
 }

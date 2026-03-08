@@ -154,8 +154,8 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/plan` | show the shared execution plan |
 | `/todo` | add, update, or clear plan items |
 | `/permissions` | change the active permission profile |
-| `/memory` | inspect persistent memory |
-| `/session` | inspect local and remote session state |
+| `/memory` | read, write, append, or clear scoped memory |
+| `/session` | list sessions or resume a saved session |
 | `/config` | show runtime config summary |
 | `/help` | show available commands |
 | `/doctor` | show runtime health and context info |
@@ -171,8 +171,8 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/fire` | fast toggle permissionless mode |
 | `/init` | initialize `.ddudu/` files |
 | `/skill` | inspect or load skills |
-| `/hook` | inspect loaded hooks |
-| `/mcp` | inspect MCP server/tool state |
+| `/hook` | inspect or reload file-based hooks |
+| `/mcp` | inspect config paths or reload MCP servers |
 | `/team` | run multi-agent orchestration |
 | `/quit` / `/exit` | exit ddudu |
 

@@ -29,6 +29,13 @@ export interface BackgroundJobResult {
   mode?: NamedMode;
   remoteSessionId?: string | null;
   workspacePath?: string | null;
+  workspaceApply?: {
+    attempted: boolean;
+    applied: boolean;
+    empty: boolean;
+    summary: string;
+    error?: string;
+  } | null;
   verification?: VerificationSummary | null;
   usage?: {
     input: number;

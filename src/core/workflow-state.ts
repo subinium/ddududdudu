@@ -39,6 +39,7 @@ export interface WorkflowBackgroundJobSnapshot {
   detail: string | null;
   startedAt: number;
   updatedAt: number;
+  finishedAt?: number | null;
   prompt?: string;
   purpose?: DelegationPurpose | 'general';
   preferredMode?: NamedMode | null;
@@ -48,6 +49,9 @@ export interface WorkflowBackgroundJobSnapshot {
   artifactTitle?: string | null;
   verificationSummary?: string | null;
   attempt?: number;
+  hasResult?: boolean;
+  resultPreview?: string | null;
+  workspacePath?: string | null;
 }
 
 export interface WorkflowStateSnapshot {

@@ -4,7 +4,7 @@ import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { VerificationRunner } from './verifier.js';
-import type { IsolatedWorkspace } from './worktree-manager.js';
+import type { IsolatedWorkspace, WorkspaceApplyResult } from './worktree-manager.js';
 import { WorktreeManager } from './worktree-manager.js';
 import type { WorkflowArtifact } from './workflow-state.js';
 
@@ -35,6 +35,7 @@ export interface DelegationRequest {
   isolatedLabel?: string;
   verificationMode?: VerificationMode;
   forceIsolation?: boolean;
+  applyWorkspaceChanges?: boolean;
   contextSnapshot?: string;
   artifacts?: WorkflowArtifact[];
 }
@@ -56,6 +57,7 @@ export interface DelegationResult {
   remoteSessionId?: string;
   cwd: string;
   workspace?: IsolatedWorkspace | null;
+  workspaceApply?: WorkspaceApplyResult | null;
   verification?: VerificationSummary;
   usage: {
     input: number;
@@ -193,6 +195,15 @@ const buildSessionEntry = (
       cwd: result.cwd,
       workspacePath: result.workspace?.path,
       workspaceKind: result.workspace?.kind,
+      workspaceApply: result.workspaceApply
+        ? {
+            attempted: result.workspaceApply.attempted,
+            applied: result.workspaceApply.applied,
+            empty: result.workspaceApply.empty,
+            summary: result.workspaceApply.summary,
+            error: result.workspaceApply.error,
+          }
+        : undefined,
       verification: result.verification
         ? {
             status: result.verification.status,
@@ -294,6 +305,7 @@ export class DelegationRuntime {
     let remoteSessionId: string | undefined;
     let localSessionId: string | undefined;
     let verification: VerificationSummary | undefined;
+    let workspaceApply: WorkspaceApplyResult | null = null;
 
     if (this.config.sessionManager) {
       const session = await this.config.sessionManager.create({
@@ -362,6 +374,14 @@ export class DelegationRuntime {
         });
       }
 
+      if (
+        request.applyWorkspaceChanges &&
+        workspace &&
+        (verification === undefined || verification.status === 'passed' || verification.status === 'skipped')
+      ) {
+        workspaceApply = await this.config.worktreeManager?.applyToBase(workspace) ?? null;
+      }
+
       const result: DelegationResult = {
         text: text.trim(),
         mode,
@@ -372,6 +392,7 @@ export class DelegationRuntime {
         remoteSessionId,
         cwd: effectiveCwd,
         workspace,
+        workspaceApply,
         verification,
         usage,
         durationMs: Date.now() - start,

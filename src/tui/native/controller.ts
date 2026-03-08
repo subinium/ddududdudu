@@ -25,7 +25,7 @@ import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
-import { loadMemory } from '../../core/memory.js';
+import { appendMemory, clearMemory, loadMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
 import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
@@ -138,6 +138,7 @@ type AskUserResolver = {
 const execFileAsync = promisify(execFile);
 
 const MAX_TOOL_TURNS_FALLBACK = 25;
+const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
 const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
@@ -877,6 +878,8 @@ export class NativeBridgeController {
               purpose: job.purpose ?? 'general',
               output: job.result.text,
               mode,
+              appliedToBase:
+                job.result.workspaceApply?.applied ?? !job.result.workspaceApply?.attempted,
               verification: job.result.verification,
             });
           }
@@ -1042,10 +1045,10 @@ export class NativeBridgeController {
         this.appendSystemMessage(await this.runDriftCommand());
         return;
       case '/session':
-        this.appendSystemMessage(await this.formatSessionSummary());
+        this.appendSystemMessage(await this.runSessionCommand(rest));
         return;
       case '/memory':
-        this.appendSystemMessage(await this.formatMemorySummary());
+        this.appendSystemMessage(await this.runMemoryCommand(rest));
         return;
       case '/skill':
         if (rest.length === 0) {
@@ -1055,10 +1058,10 @@ export class NativeBridgeController {
         }
         return;
       case '/mcp':
-        this.appendSystemMessage(this.formatMcpSummary());
+        this.appendSystemMessage(await this.runMcpCommand(rest));
         return;
       case '/hook':
-        this.appendSystemMessage(this.formatHookSummary());
+        this.appendSystemMessage(await this.runHookCommand(rest));
         return;
       case '/team':
         this.appendSystemMessage(await this.runTeamCommand(rest));
@@ -1753,6 +1756,7 @@ export class NativeBridgeController {
           maxTokens: this.config ? getMaxTokens(this.config) : undefined,
           cwd: process.cwd(),
           isolatedLabel: `route-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
+          applyWorkspaceChanges: decision.purpose === 'execution' || decision.purpose === 'design',
           verificationMode: this.verificationModeForPurpose(decision.purpose),
           contextSnapshot,
           artifacts,
@@ -1814,6 +1818,15 @@ export class NativeBridgeController {
         mode: result.mode,
         text: finalText,
       });
+      if (result.workspaceApply?.attempted) {
+        if (result.workspaceApply.applied) {
+          this.appendSystemMessage(`[apply] ${result.workspaceApply.summary}`);
+        } else if (!result.workspaceApply.empty) {
+          this.appendSystemMessage(
+            `[apply] failed to land isolated changes${result.workspaceApply.error ? ` · ${result.workspaceApply.error}` : ''}`,
+          );
+        }
+      }
       this.setWorkspaceState(result.workspace ?? null);
       if (result.verification) {
         this.setVerificationState({
@@ -1831,6 +1844,10 @@ export class NativeBridgeController {
         output: finalText,
         mode: result.mode,
         verification: result.verification,
+        appliedToBase:
+          result.workspaceApply?.attempted === true
+            ? result.workspaceApply.applied
+            : true,
       });
       this.updateAgentActivity({
         id: routeActivityId,
@@ -2393,6 +2410,7 @@ export class NativeBridgeController {
         detail: job.detail,
         startedAt: job.startedAt,
         updatedAt: job.updatedAt,
+        finishedAt: job.finishedAt ?? null,
         prompt: job.prompt,
         purpose: job.purpose,
         preferredMode: job.preferredMode ?? null,
@@ -2402,6 +2420,9 @@ export class NativeBridgeController {
         artifactTitle: job.artifactTitle ?? null,
         verificationSummary: job.verificationSummary ?? null,
         attempt: job.attempt ?? 0,
+        hasResult: job.hasResult ?? false,
+        resultPreview: job.resultPreview ?? null,
+        workspacePath: job.workspacePath ?? null,
       })),
     };
   }
@@ -2548,6 +2569,16 @@ export class NativeBridgeController {
                   ? item.verificationSummary.trim()
                   : null,
               attempt: typeof item.attempt === 'number' && Number.isFinite(item.attempt) ? item.attempt : 0,
+              finishedAt: typeof item.finishedAt === 'number' ? item.finishedAt : null,
+              hasResult: item.hasResult === true,
+              resultPreview:
+                typeof item.resultPreview === 'string' && item.resultPreview.trim()
+                  ? item.resultPreview.trim()
+                  : null,
+              workspacePath:
+                typeof item.workspacePath === 'string' && item.workspacePath.trim()
+                  ? item.workspacePath.trim()
+                  : null,
             };
           })
           .filter((item): item is WorkflowBackgroundJobSnapshot => item !== null)
@@ -2773,6 +2804,7 @@ export class NativeBridgeController {
     this.remoteSessions.clear();
     this.agentActivities = [];
     this.backgroundJobs = [];
+    this.backgroundJobStatusCache.clear();
     this.queuedPrompts = [];
     this.syncAgentActivities();
     this.syncBackgroundJobs();
@@ -3139,6 +3171,122 @@ export class NativeBridgeController {
     } catch (error: unknown) {
       return `Memory read failed: ${serializeError(error)}`;
     }
+  }
+
+  private parseMemoryScope(value: string | undefined): MemoryScope | null {
+    if (!value) {
+      return null;
+    }
+
+    return MEMORY_SCOPES.includes(value as MemoryScope) ? (value as MemoryScope) : null;
+  }
+
+  private async runSessionCommand(args: string[]): Promise<string> {
+    const command = args[0]?.trim().toLowerCase() ?? '';
+    if (!command || command === 'status') {
+      return this.formatSessionSummary();
+    }
+
+    if (!this.sessionManager) {
+      return 'Session manager unavailable.';
+    }
+
+    if (command === 'list') {
+      const sessions = await this.sessionManager.list();
+      if (sessions.length === 0) {
+        return 'Sessions: none';
+      }
+      return [
+        'Sessions',
+        ...sessions.slice(0, 12).map((session, index) =>
+          `${index + 1}. ${session.id.slice(0, 8)} · ${session.entryCount} entries · ${session.updatedAt}`),
+      ].join('\n');
+    }
+
+    if (command === 'last') {
+      const sessions = await this.sessionManager.list();
+      const latest = sessions[0];
+      if (!latest) {
+        return 'No saved sessions yet.';
+      }
+      const loaded = await this.sessionManager.load(latest.id);
+      this.restoreSession(loaded);
+      await this.refreshSystemPrompt();
+      this.reconfigureClient();
+      await this.pollBackgroundJobs();
+      this.scheduleStatePush();
+      return `Resumed session ${latest.id.slice(0, 8)}.`;
+    }
+
+    if (command === 'resume') {
+      const id = args[1]?.trim();
+      if (!id) {
+        return 'Usage: /session resume <id>';
+      }
+      const sessions = await this.sessionManager.list();
+      const resolved = sessions.find((session) => session.id === id || session.id.startsWith(id));
+      if (!resolved) {
+        return `Session not found: ${id}`;
+      }
+      const loaded = await this.sessionManager.load(resolved.id);
+      this.restoreSession(loaded);
+      await this.refreshSystemPrompt();
+      this.reconfigureClient();
+      await this.pollBackgroundJobs();
+      this.scheduleStatePush();
+      return `Resumed session ${resolved.id.slice(0, 8)}.`;
+    }
+
+    return 'Usage: /session [list|last|resume <id>]';
+  }
+
+  private async runMemoryCommand(args: string[]): Promise<string> {
+    const command = args[0]?.trim().toLowerCase() ?? '';
+    if (!command || command === 'read') {
+      if (command === 'read' && args[1]) {
+        const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
+        if (!scope) {
+          return 'Usage: /memory read [global|project|working|episodic|semantic|procedural]';
+        }
+        const memory = await loadMemory(process.cwd());
+        const title = `## ${scope.charAt(0).toUpperCase() + scope.slice(1)} Memory\n`;
+        const section = memory.split(/\n(?=## )/u).find((entry) => entry.startsWith(title));
+        return section ? `Memory\n${section.replace(title, '')}` : `Memory (${scope}) is empty.`;
+      }
+      return this.formatMemorySummary();
+    }
+
+    if (command === 'write' || command === 'append') {
+      const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
+      if (!scope) {
+        return `Usage: /memory ${command} <global|project|working|episodic|semantic|procedural> <content>`;
+      }
+      const content = args.slice(2).join(' ').trim();
+      if (!content) {
+        return `Usage: /memory ${command} <global|project|working|episodic|semantic|procedural> <content>`;
+      }
+      if (command === 'write') {
+        await saveMemory(process.cwd(), content, scope);
+      } else {
+        await appendMemory(process.cwd(), content, scope);
+      }
+      await this.refreshSystemPrompt();
+      this.scheduleStatePush();
+      return `Memory ${command === 'write' ? 'written' : 'appended'} in ${scope}.`;
+    }
+
+    if (command === 'clear') {
+      const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
+      if (!scope) {
+        return 'Usage: /memory clear <global|project|working|episodic|semantic|procedural>';
+      }
+      await clearMemory(process.cwd(), scope);
+      await this.refreshSystemPrompt();
+      this.scheduleStatePush();
+      return `Memory cleared in ${scope}.`;
+    }
+
+    return 'Usage: /memory [read [scope]|write <scope> <content>|append <scope> <content>|clear <scope>]';
   }
 
   private async getChangedFiles(limit: number = 8): Promise<string[]> {
@@ -4073,10 +4221,11 @@ export class NativeBridgeController {
     purpose: DelegationPurpose | 'general';
     output: string;
     mode: NamedMode;
+    appliedToBase?: boolean;
     verification?: VerificationSummary | null;
   }): Promise<void> {
     const verification = input.verification;
-    if (!verification || verification.status !== 'passed') {
+    if (!verification || verification.status !== 'passed' || input.appliedToBase === false) {
       return;
     }
 
@@ -4485,19 +4634,36 @@ export class NativeBridgeController {
     return 'Usage: /queue [run|promote|drop|clear] ...';
   }
 
-  private formatJobsSummary(): string {
-    if (this.state.backgroundJobs.length === 0) {
+  private async listVisibleBackgroundJobs(scope: 'all' | 'current' = 'all'): Promise<BackgroundJobState[]> {
+    if (!this.backgroundJobStore) {
+      return this.backgroundJobs.slice();
+    }
+
+    try {
+      const jobs =
+        scope === 'current' && this.state.sessionId
+          ? await this.backgroundJobStore.listBySession(this.state.sessionId)
+          : await this.backgroundJobStore.list();
+      return jobs.map((job) => this.mapStoredJobToState(job));
+    } catch {
+      return this.backgroundJobs.slice();
+    }
+  }
+
+  private async formatJobsSummary(): Promise<string> {
+    const jobs = await this.listVisibleBackgroundJobs('all');
+    if (jobs.length === 0) {
       return 'Jobs: none';
     }
 
-    const running = this.state.backgroundJobs.filter((job) => job.status === 'running').length;
-    const done = this.state.backgroundJobs.filter((job) => job.status === 'done').length;
-    const error = this.state.backgroundJobs.filter((job) => job.status === 'error').length;
+    const running = jobs.filter((job) => job.status === 'running').length;
+    const done = jobs.filter((job) => job.status === 'done').length;
+    const error = jobs.filter((job) => job.status === 'error').length;
 
     return [
       'Jobs',
       `summary: ${running} running · ${done} done · ${error} error`,
-      ...this.state.backgroundJobs.map((job, index) => {
+      ...jobs.map((job, index) => {
         const detail = job.status === 'done'
           ? job.resultPreview ?? job.workspacePath ?? job.detail ?? null
           : job.detail ?? job.resultPreview ?? job.workspacePath ?? null;
@@ -4587,6 +4753,9 @@ export class NativeBridgeController {
       job.attempt > 0 ? `attempt: ${job.attempt}` : null,
       job.detail ? `detail: ${job.detail}` : null,
       job.result?.workspacePath ? `workspace: ${job.result.workspacePath}` : null,
+      job.result?.workspaceApply
+        ? `apply: ${job.result.workspaceApply.applied ? 'applied' : job.result.workspaceApply.empty ? 'empty' : 'failed'} · ${job.result.workspaceApply.summary}${job.result.workspaceApply.error ? ` · ${job.result.workspaceApply.error}` : ''}`
+        : null,
       '',
       'Agent activity:',
       ...(activities.length > 0 ? activities : ['- no recorded agent activity']),
@@ -4610,8 +4779,30 @@ export class NativeBridgeController {
     }
   }
 
-  private resolveBackgroundJob(reference: string): BackgroundJobState {
-    const visibleJobs = this.backgroundJobs
+  private async waitForJobCompletion(jobId: string, timeoutMs: number): Promise<boolean> {
+    if (!this.backgroundJobStore) {
+      return false;
+    }
+
+    const start = Date.now();
+    while (Date.now() - start < timeoutMs) {
+      const stored = await this.getStoredBackgroundJob(jobId);
+      if (!stored) {
+        return false;
+      }
+      if (stored.status === 'done' || stored.status === 'error') {
+        return true;
+      }
+      await new Promise((resolve) => {
+        setTimeout(resolve, 150);
+      });
+    }
+
+    return false;
+  }
+
+  private async resolveBackgroundJob(reference: string): Promise<BackgroundJobState> {
+    const visibleJobs = (await this.listVisibleBackgroundJobs('all'))
       .slice()
       .sort((a, b) => {
         const priority = (job: BackgroundJobState): number => {
@@ -4628,7 +4819,7 @@ export class NativeBridgeController {
 
     const numeric = Number.parseInt(reference, 10);
     if (Number.isFinite(numeric) && numeric >= 1 && numeric <= visibleJobs.length) {
-      return visibleJobs[numeric - 1];
+      return visibleJobs[numeric - 1]!;
     }
 
     const direct = visibleJobs.find((job) => job.id === reference || job.id.startsWith(reference));
@@ -4652,7 +4843,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs cancel <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       const stored = await this.getStoredBackgroundJob(job.id);
       if (job.status !== 'running' || !stored?.pid) {
         return `Job ${ref} is not cancellable.`;
@@ -4667,8 +4858,11 @@ export class NativeBridgeController {
           pid: null,
         });
       }
+      const cancelled = await this.waitForJobCompletion(job.id, 2_000);
       await this.pollBackgroundJobs();
-      return `Cancelled job ${ref}.`;
+      return cancelled
+        ? `Cancelled job ${ref}.`
+        : `Cancellation signal sent to job ${ref}; waiting for worker shutdown.`;
     }
 
     if (command === 'retry') {
@@ -4676,7 +4870,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs retry <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       if (!this.canStartBackgroundJob()) {
         return 'Retry unavailable: background capacity full.';
       }
@@ -4686,6 +4880,7 @@ export class NativeBridgeController {
       if (job.kind === 'team') {
         await this.startBackgroundTeamRun(job.strategy ?? 'parallel', job.prompt, {
           routeNote: `Team run retry · ${job.strategy ?? 'parallel'}`,
+          attempt: (job.attempt ?? 0) + 1,
         });
       } else {
         const decision: AutoRouteDecision = {
@@ -4693,6 +4888,7 @@ export class NativeBridgeController {
           purpose: job.purpose && job.purpose !== 'general' ? job.purpose : 'general',
           preferredMode: job.preferredMode ?? undefined,
           reason: 'manual retry',
+          repairAttempt: (job.attempt ?? 0) + 1,
         };
         await this.startBackgroundDelegatedRoute(
           {
@@ -4712,7 +4908,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs inspect <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       const stored = await this.getStoredBackgroundJob(job.id);
       if (stored) {
         return [
@@ -4731,6 +4927,9 @@ export class NativeBridgeController {
           `updated: ${new Date(stored.updatedAt).toISOString()}`,
           stored.detail ? `detail: ${stored.detail}` : null,
           stored.result?.workspacePath ? `workspace: ${stored.result.workspacePath}` : null,
+          stored.result?.workspaceApply
+            ? `apply: ${stored.result.workspaceApply.applied ? 'applied' : stored.result.workspaceApply.empty ? 'empty' : 'failed'} · ${stored.result.workspaceApply.summary}${stored.result.workspaceApply.error ? ` · ${stored.result.workspaceApply.error}` : ''}`
+            : null,
           stored.result?.text ? `result: ${previewText(stored.result.text, 220)}` : null,
           stored.result?.verification?.summary ? `verification: ${stored.result.verification.summary}` : null,
           stored.artifact ? `artifact: ${stored.artifact.title}` : null,
@@ -4747,7 +4946,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs logs <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       const stored = await this.getStoredBackgroundJob(job.id);
       if (!stored) {
         return `Job ${ref} has no stored logs.`;
@@ -4760,7 +4959,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs result <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       const stored = await this.getStoredBackgroundJob(job.id);
       if (stored?.result?.text) {
         return stored.result.text;
@@ -4785,7 +4984,7 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs promote <index-or-id>';
       }
-      const job = this.resolveBackgroundJob(ref);
+      const job = await this.resolveBackgroundJob(ref);
       if (!job.prompt) {
         return `Job ${ref} cannot be promoted.`;
       }
@@ -5021,6 +5220,51 @@ export class NativeBridgeController {
     return ['Hooks', ...lines].join('\n');
   }
 
+  private async runMcpCommand(args: string[]): Promise<string> {
+    const command = args[0]?.trim().toLowerCase() ?? '';
+    if (!command || command === 'status' || command === 'list') {
+      return this.formatMcpSummary();
+    }
+
+    if (command === 'path') {
+      const paths = getDduduPaths(process.cwd());
+      return [
+        'MCP config paths',
+        `project: ${paths.projectConfig}`,
+        `global: ${paths.globalConfig}`,
+      ].join('\n');
+    }
+
+    if (command === 'reload') {
+      this.config = await loadConfig();
+      this.mcpManager?.disconnectAll();
+      this.mcpManager = null;
+      this.toolRegistry?.removeMatching((name) => name.startsWith('mcp__'));
+      await this.initializeMcpTools();
+      this.syncMcpState();
+      this.scheduleStatePush();
+      return this.formatMcpSummary();
+    }
+
+    return 'Usage: /mcp [status|list|path|reload]';
+  }
+
+  private async runHookCommand(args: string[]): Promise<string> {
+    const command = args[0]?.trim().toLowerCase() ?? '';
+    if (!command || command === 'status' || command === 'list') {
+      return this.formatHookSummary();
+    }
+
+    if (command === 'reload') {
+      this.hookRegistry.clear();
+      await loadHookFiles(process.cwd(), this.hookRegistry);
+      this.scheduleStatePush();
+      return this.formatHookSummary();
+    }
+
+    return 'Usage: /hook [status|list|reload]';
+  }
+
   private formatTeamSummary(): string {
     const availableModes = this.getTeamEligibleModes();
     return [
@@ -5210,7 +5454,7 @@ export class NativeBridgeController {
   private async startBackgroundTeamRun(
     strategy: 'parallel' | 'sequential' | 'delegate',
     task: string,
-    options: { routeNote?: string } = {},
+    options: { routeNote?: string; attempt?: number } = {},
   ): Promise<void> {
     const teamAgents = this.buildTeamAgents();
     if (teamAgents.length < 2) {
@@ -5247,7 +5491,7 @@ export class NativeBridgeController {
       preferredModel: null,
       strategy,
       reason: options.routeNote ?? `team ${strategy}`,
-      attempt: 0,
+      attempt: options.attempt ?? 0,
       verificationMode: 'checks',
       contextSnapshot,
       artifacts,

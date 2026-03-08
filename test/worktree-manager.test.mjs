@@ -1,0 +1,50 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { execFile } from 'node:child_process';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
+import { promisify } from 'node:util';
+
+import { WorktreeManager } from '../dist/core/worktree-manager.js';
+
+const execFileAsync = promisify(execFile);
+
+const runGit = async (cwd, args) => {
+  const { stdout } = await execFileAsync('git', args, {
+    cwd,
+    encoding: 'utf8',
+  });
+  return stdout.trim();
+};
+
+test('WorktreeManager.applyToBase lands tracked and new files from an isolated workspace', async () => {
+  const repoRoot = await mkdtemp(resolve(tmpdir(), 'ddudu-worktree-test-'));
+  try {
+    await runGit(repoRoot, ['init']);
+    await runGit(repoRoot, ['config', 'user.name', 'ddudu-test']);
+    await runGit(repoRoot, ['config', 'user.email', 'ddudu@test.local']);
+
+    await writeFile(resolve(repoRoot, 'app.txt'), 'hello\n', 'utf8');
+    await runGit(repoRoot, ['add', 'app.txt']);
+    await runGit(repoRoot, ['commit', '-m', 'init']);
+
+    const manager = new WorktreeManager(repoRoot, '.ddudu/test-worktrees');
+    const workspace = await manager.create('repair-pass');
+    assert.ok(workspace, 'expected an isolated workspace');
+
+    await writeFile(resolve(workspace.path, 'app.txt'), 'hello fixed\n', 'utf8');
+    await writeFile(resolve(workspace.path, 'new-file.txt'), 'fresh file\n', 'utf8');
+
+    const result = await manager.applyToBase(workspace);
+    assert.equal(result.applied, true);
+    assert.equal(result.empty, false);
+
+    assert.equal(await readFile(resolve(repoRoot, 'app.txt'), 'utf8'), 'hello fixed\n');
+    assert.equal(await readFile(resolve(repoRoot, 'new-file.txt'), 'utf8'), 'fresh file\n');
+
+    await manager.remove(workspace);
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});

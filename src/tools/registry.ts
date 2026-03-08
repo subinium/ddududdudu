@@ -131,6 +131,18 @@ export class ToolRegistry {
     return this.tools.get(name);
   }
 
+  public unregister(name: string): void {
+    this.tools.delete(name);
+  }
+
+  public removeMatching(predicate: (name: string) => boolean): number {
+    const names = Array.from(this.tools.keys()).filter(predicate);
+    for (const name of names) {
+      this.tools.delete(name);
+    }
+    return names.length;
+  }
+
   public list(): ToolDefinition[] {
     return Array.from(this.tools.values()).map((tool) => tool.definition);
   }

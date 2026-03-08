@@ -221,6 +221,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           parentSessionId: current.sessionId,
           cwd: current.cwd,
           isolatedLabel: `background-${current.preferredMode ?? current.purpose ?? 'general'}`,
+          applyWorkspaceChanges: current.purpose === 'execution' || current.purpose === 'design',
           verificationMode: verificationModeForJob(current),
           contextSnapshot: current.contextSnapshot ?? undefined,
           artifacts: current.artifacts ?? [],
@@ -283,6 +284,15 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           model: result.model,
           remoteSessionId: result.remoteSessionId,
           workspacePath: result.workspace?.path,
+          workspaceApply: result.workspaceApply
+            ? {
+                attempted: result.workspaceApply.attempted,
+                applied: result.workspaceApply.applied,
+                empty: result.workspaceApply.empty,
+                summary: result.workspaceApply.summary,
+                error: result.workspaceApply.error,
+              }
+            : undefined,
           verification: result.verification
             ? {
                 status: result.verification.status,
@@ -296,8 +306,13 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       );
 
       current = await store.update(current.id, {
-        status: 'done',
-        detail: result.verification?.summary ?? latestDetail,
+        status: result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty ? 'error' : 'done',
+        detail:
+          result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+            ? `apply failed · ${result.workspaceApply.error ?? result.workspaceApply.summary}`
+            : result.workspaceApply?.applied
+              ? `applied · ${result.workspaceApply.summary}`
+              : result.verification?.summary ?? latestDetail,
         finishedAt: Date.now(),
         pid: null,
         result: {
@@ -307,6 +322,15 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           mode: result.mode,
           remoteSessionId: result.remoteSessionId ?? null,
           workspacePath: result.workspace?.path ?? null,
+          workspaceApply: result.workspaceApply
+            ? {
+                attempted: result.workspaceApply.attempted,
+                applied: result.workspaceApply.applied,
+                empty: result.workspaceApply.empty,
+                summary: result.workspaceApply.summary,
+                error: result.workspaceApply.error,
+              }
+            : null,
           verification: result.verification ?? null,
           usage: result.usage,
         },
@@ -316,8 +340,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           label: result.mode,
           mode: result.mode,
           purpose: result.purpose ?? 'general',
-          status: result.verification?.status === 'failed' ? 'error' : 'done',
-          detail: result.verification?.summary ?? previewText(finalText, 72),
+          status:
+            result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+              ? 'error'
+              : result.verification?.status === 'failed'
+                ? 'error'
+                : 'done',
+          detail:
+            result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+              ? result.workspaceApply.error ?? result.workspaceApply.summary
+              : result.verification?.summary ?? previewText(finalText, 72),
           workspacePath: result.workspace?.path ?? null,
           updatedAt: Date.now(),
         }),
