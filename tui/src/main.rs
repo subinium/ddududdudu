@@ -1,4 +1,5 @@
 use std::cmp::min;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -830,18 +831,27 @@ impl App {
         };
         let show_sidebar = root.len() > 1;
         let main = root[0];
+        let queue_height = if !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none() {
+            let visible = self.state.queued_prompts.len().min(3);
+            let more_row = usize::from(self.state.queued_prompts.len() > visible);
+            (visible + more_row) as u16
+        } else {
+            0
+        };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
                 Constraint::Length(1),
+                Constraint::Length(queue_height),
                 Constraint::Length(6),
             ])
             .split(main);
 
         self.render_transcript(frame, chunks[0]);
         self.render_status_line(frame, chunks[1]);
-        let composer_metrics = self.render_composer(frame, chunks[2]);
+        self.render_queue_preview(frame, chunks[2]);
+        let composer_metrics = self.render_composer(frame, chunks[3]);
 
         if show_sidebar {
             self.draw_sidebar_divider(frame, root[1].x, frame.area());
@@ -1005,18 +1015,6 @@ impl App {
     ) {
         lines.push(sidebar_header("Activity"));
         let mut has_activity = false;
-        if self.state.loading {
-            has_activity = true;
-            push_sidebar_rail_item(
-                lines,
-                SPINNER_FRAMES[self.spinner_index],
-                ACCENT,
-                "foreground request".to_string(),
-                Some(preview_line(&self.state.loading_label, 28)),
-                FG,
-                ACCENT_DIM,
-            );
-        }
         if !self.state.agent_activities.is_empty() {
             has_activity = true;
         }
@@ -1051,6 +1049,49 @@ impl App {
             *item_index += 1;
             if index >= 3 {
                 break;
+            }
+        }
+
+        let recent_tools = collect_recent_tool_calls(&self.state.messages, 4);
+        if !recent_tools.is_empty() {
+            has_activity = true;
+            if !self.state.agent_activities.is_empty() {
+                lines.push(Line::from(Span::raw("")));
+            }
+            lines.push(sidebar_header(if recent_tools
+                .iter()
+                .any(|tool| tool.status == "running" || tool.status == "pending")
+            {
+                "Tools"
+            } else {
+                "Recent Tools"
+            }));
+
+            for tool in recent_tools {
+                let (marker, color) = match tool.status.as_str() {
+                    "running" => (SPINNER_FRAMES[self.spinner_index], TOOL_RUNNING),
+                    "pending" => ("·", TOOL_RUNNING),
+                    "done" => ("·", TOOL_MUTED),
+                    "error" => ("!", ERROR),
+                    _ => ("·", TOOL_MUTED),
+                };
+                let detail = match tool.status.as_str() {
+                    "running" | "pending" => Some(preview_line(&tool.summary, 28)),
+                    _ => tool
+                        .result
+                        .as_ref()
+                        .map(|result| preview_line(result, 28))
+                        .or_else(|| Some(preview_line(&tool.summary, 28))),
+                };
+                push_sidebar_rail_item(
+                    lines,
+                    marker,
+                    color,
+                    preview_line(&tool.name.replace('_', " "), 28),
+                    detail,
+                    FG,
+                    ACCENT_DIM,
+                );
             }
         }
 
@@ -1616,6 +1657,42 @@ impl App {
         );
     }
 
+    fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {
+        if area.height == 0 || self.state.queued_prompts.is_empty() || self.state.ask_user.is_some() {
+            return;
+        }
+
+        let preview_rows = self.state.queued_prompts.len().min(3);
+        let mut lines = Vec::new();
+        for (index, prompt) in self.state.queued_prompts.iter().take(preview_rows).enumerate() {
+            let marker = format!("{:>2}. ", index + 1);
+            let marker_width = marker.width();
+            lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(ACCENT_DIM)),
+                Span::styled(
+                    preview_line(prompt, area.width.saturating_sub(marker_width as u16) as usize),
+                    Style::default().fg(FG),
+                ),
+            ]));
+        }
+
+        let remaining = self.state.queued_prompts.len().saturating_sub(preview_rows);
+        if remaining > 0 {
+            lines.push(Line::from(vec![
+                Span::styled("… ", Style::default().fg(ACCENT_DIM)),
+                Span::styled(
+                    format!("+{} more queued", format_count(remaining as u64)),
+                    Style::default().fg(ACCENT_DIM),
+                ),
+            ]));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+            area,
+        );
+    }
+
     fn render_composer(&self, frame: &mut Frame, area: Rect) -> (u16, u16) {
         let divider = Span::styled(
             "─".repeat(area.width as usize),
@@ -1646,23 +1723,8 @@ impl App {
 
         let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
-        let queue_visible = !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none();
         let paste_visible = self.pending_paste.is_some();
         let footer_rows = 1usize;
-        let min_editor_rows = if inner.height > 3 { 2usize } else { 1usize };
-        let max_queue_rows = if queue_visible {
-            self.state
-                .queued_prompts
-                .len()
-                .min((inner.height as usize).saturating_sub(footer_rows + min_editor_rows + usize::from(paste_visible)))
-        } else {
-            0usize
-        };
-        let queue_preview_rows = if queue_visible && self.state.queued_prompts.len() > max_queue_rows && max_queue_rows > 0 {
-            max_queue_rows.saturating_sub(1)
-        } else {
-            max_queue_rows
-        };
         let metrics = wrap_editor_text(
             &self.composer.text,
             self.composer.cursor,
@@ -1670,7 +1732,7 @@ impl App {
         );
         let max_visible = inner
             .height
-            .saturating_sub((footer_rows + max_queue_rows + usize::from(paste_visible)) as u16) as usize;
+            .saturating_sub((footer_rows + usize::from(paste_visible)) as u16) as usize;
         let start = metrics
             .lines
             .len()
@@ -1699,35 +1761,6 @@ impl App {
                 ),
                 Span::styled("] Enter insert · Esc cancel", Style::default().fg(ACCENT_DIM)),
             ]));
-        }
-        if queue_visible && max_queue_rows > 0 {
-            for (index, prompt) in self
-                .state
-                .queued_prompts
-                .iter()
-                .take(queue_preview_rows)
-                .enumerate()
-            {
-                let marker = format!("{:>2}. ", index + 1);
-                let marker_width = marker.width();
-                lines.push(Line::from(vec![
-                    Span::styled(marker, Style::default().fg(ACCENT_DIM)),
-                    Span::styled(
-                        preview_line(prompt, content_width.saturating_sub(marker_width)),
-                        Style::default().fg(FG),
-                    ),
-                ]));
-            }
-            let remaining = self.state.queued_prompts.len().saturating_sub(queue_preview_rows);
-            if remaining > 0 {
-                lines.push(Line::from(vec![
-                    Span::styled("… ", Style::default().fg(ACCENT_DIM)),
-                    Span::styled(
-                        format!("+{} more queued", format_count(remaining as u64)),
-                        Style::default().fg(ACCENT_DIM),
-                    ),
-                ]));
-            }
         }
 
         if visible_lines.is_empty() {
@@ -1764,9 +1797,7 @@ impl App {
         );
 
         let cursor_x = inner.x + prompt_prefix.width() as u16 + metrics.cursor_col as u16;
-        let cursor_y = inner.y
-            + max_queue_rows as u16
-            + (metrics.cursor_row.saturating_sub(start) as u16);
+        let cursor_y = inner.y + (metrics.cursor_row.saturating_sub(start) as u16);
         (
             cursor_x.min(inner.right().saturating_sub(1)),
             cursor_y.min(inner.bottom().saturating_sub(2)),
@@ -3179,23 +3210,28 @@ fn looks_like_url_token(token: &str) -> bool {
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
 }
 
-fn tool_status_color(status: &str) -> Color {
-    match status {
-        "done" => TOOL_MUTED,
-        "error" => ERROR,
-        "running" => TOOL_RUNNING,
-        _ => TOOL_MUTED,
-    }
-}
+fn collect_recent_tool_calls(messages: &[NativeMessageState], limit: usize) -> Vec<NativeToolCallState> {
+    let mut seen = HashSet::new();
+    let mut running = Vec::new();
+    let mut recent = Vec::new();
 
-fn tool_status_label(status: &str) -> &'static str {
-    match status {
-        "done" => "done",
-        "error" => "error",
-        "running" => "running",
-        "pending" => "pending",
-        _ => "idle",
+    for message in messages.iter().rev() {
+        for tool in message.tool_calls.iter().rev() {
+            if !seen.insert(tool.id.clone()) {
+                continue;
+            }
+
+            if tool.status == "running" || tool.status == "pending" {
+                running.push(tool.clone());
+            } else {
+                recent.push(tool.clone());
+            }
+        }
     }
+
+    running.extend(recent);
+    running.truncate(limit);
+    running
 }
 
 fn format_elapsed(started_at_ms: Option<u64>) -> String {
@@ -3781,8 +3817,10 @@ fn build_transcript_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let width = width.max(10);
+    let _ = fold_tool_calls;
 
     for message in messages {
+        let mut rendered_any = false;
         let (prefix, prefix_style, text_style) = match message.role.as_str() {
             "user" => (
                 "› ",
@@ -3809,6 +3847,7 @@ fn build_transcript_lines(
                 Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(format!("{folded}  [folded]"), Style::default().fg(TOOL_MUTED)),
             ]));
+            rendered_any = true;
         } else if !message.content.trim().is_empty() || message.tool_calls.is_empty() {
             let mut first_visual_line = true;
             if message.role == "assistant" {
@@ -3847,6 +3886,7 @@ fn build_transcript_lines(
                         prefix_style,
                         &mut first_visual_line,
                     );
+                    rendered_any = true;
                 }
             } else {
                 for raw_line in message.content.split('\n') {
@@ -3863,6 +3903,7 @@ fn build_transcript_lines(
                             Span::styled(gutter, prefix_style),
                             Span::styled(chunk, text_style),
                         ]));
+                        rendered_any = true;
                     }
 
                     if raw_line.is_empty() {
@@ -3876,52 +3917,8 @@ fn build_transcript_lines(
                             Span::styled(gutter, prefix_style),
                             Span::styled(String::new(), text_style),
                         ]));
+                        rendered_any = true;
                     }
-                }
-            }
-        }
-
-        if fold_tool_calls && !message.tool_calls.is_empty() {
-            let summary = message
-                .tool_calls
-                .iter()
-                .map(|tool| tool.summary.as_str())
-                .take(2)
-                .collect::<Vec<_>>()
-                .join(" · ");
-            lines.push(Line::from(vec![
-                Span::styled("  ↳ ", Style::default().fg(TOOL_MUTED)),
-                Span::styled(
-                    format!(
-                        "{} tool calls folded{}",
-                        format_count(message.tool_calls.len() as u64),
-                        if summary.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" · {}", preview_line(&summary, width.saturating_sub(24)))
-                        }
-                    ),
-                    Style::default().fg(TOOL_MUTED),
-                ),
-            ]));
-        } else {
-            for tool in &message.tool_calls {
-                let color = tool_status_color(&tool.status);
-                let mut tool_text = format!("{} · {}", tool.summary, tool_status_label(&tool.status));
-                if let Some(result) = &tool.result {
-                    let detail = preview_line(result, 72);
-                    if !detail.is_empty() {
-                        tool_text.push_str(" · ");
-                        tool_text.push_str(&detail);
-                    }
-                }
-                let wrapped_tool = wrap_plain(&tool_text, width.saturating_sub(4));
-                for (index, chunk) in wrapped_tool.iter().enumerate() {
-                    let gutter = if index == 0 { "  ↳ " } else { "    " };
-                    lines.push(Line::from(vec![
-                        Span::styled(gutter, Style::default().fg(color)),
-                        Span::styled(chunk.clone(), Style::default().fg(color)),
-                    ]));
                 }
             }
         }
@@ -3931,9 +3928,12 @@ fn build_transcript_lines(
                 "  streaming…",
                 Style::default().fg(ACCENT_DIM),
             )));
+            rendered_any = true;
         }
 
-        lines.push(Line::from(Span::raw("")));
+        if rendered_any {
+            lines.push(Line::from(Span::raw("")));
+        }
     }
 
     lines
