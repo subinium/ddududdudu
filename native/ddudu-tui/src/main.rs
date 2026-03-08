@@ -485,7 +485,7 @@ impl App {
         let root = if frame.area().width >= 100 {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(20), Constraint::Length(42)])
+                .constraints([Constraint::Min(20), Constraint::Length(44)])
                 .split(frame.area())
         } else {
             Layout::default()
@@ -612,103 +612,143 @@ impl App {
         };
 
         let mut lines = Vec::new();
-        lines.push(Line::from(Span::styled(
-            "Status",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!("context {:>5.1}%", self.state.context_percent * 100.0),
-            Style::default().fg(FG),
-        )));
-        lines.push(Line::from(Span::styled(
-            format!(
-                "window  {} / {}",
+        lines.push(sidebar_header("Context"));
+        push_sidebar_rail_item(
+            &mut lines,
+            "◉",
+            ACCENT,
+            format!("{:>5.1}% footprint", self.state.context_percent * 100.0),
+            Some(format!(
+                "{}  {} / {}",
+                context_meter(self.state.context_percent, 10),
                 format_count(self.state.context_tokens),
                 format_count(self.state.context_limit)
-            ),
-            Style::default().fg(FG),
-        )));
+            )),
+            FG,
+            ACCENT_DIM,
+        );
         if let Some(remote_session_id) = &self.state.remote_session_id {
-            lines.push(Line::from(Span::styled(
-                format!("bridge  {}", preview_line(remote_session_id, 18)),
-                Style::default().fg(FG),
-            )));
+            push_sidebar_rail_item(
+                &mut lines,
+                "◎",
+                SUCCESS,
+                format!("bridge {}", preview_line(remote_session_id, 16)),
+                Some("active remote session".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
         } else if self.state.remote_session_count > 0 {
-            lines.push(Line::from(Span::styled(
-                format!("bridge  {} saved", format_count(self.state.remote_session_count)),
-                Style::default().fg(ACCENT_DIM),
-            )));
+            push_sidebar_rail_item(
+                &mut lines,
+                "◎",
+                ACCENT_DIM,
+                format!("bridge {}", format_count(self.state.remote_session_count)),
+                Some("saved remote sessions".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
         }
-        lines.push(Line::from(Span::styled(
+        push_sidebar_rail_item(
+            &mut lines,
+            if self.state.playing_with_fire { "✦" } else { "·" },
             if self.state.playing_with_fire {
-                "fire    on"
-            } else {
-                "fire    off"
-            },
-            Style::default().fg(if self.state.playing_with_fire {
                 ERROR
             } else {
                 ACCENT_DIM
-            }),
-        )));
+            },
+            if self.state.playing_with_fire {
+                "fire on".to_string()
+            } else {
+                "fire off".to_string()
+            },
+            None,
+            FG,
+            ACCENT_DIM,
+        );
         lines.push(Line::from(Span::raw("")));
 
-        lines.push(Line::from(Span::styled(
-            "Background",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(sidebar_header("Background"));
         if self.state.loading {
             let elapsed = format_elapsed(self.state.loading_since);
-            lines.push(Line::from(vec![
-                Span::styled("↻ ", Style::default().fg(ACCENT)),
-                Span::styled(format!("request {elapsed}"), Style::default().fg(FG)),
-            ]));
+            push_sidebar_rail_item(
+                &mut lines,
+                SPINNER_FRAMES[self.spinner_index],
+                ACCENT,
+                format!("request {elapsed}"),
+                Some(if self.state.loading_label.is_empty() {
+                    "running".to_string()
+                } else {
+                    self.state.loading_label.clone()
+                }),
+                FG,
+                ACCENT_DIM,
+            );
             if let Some(estimate) = &self.state.request_estimate {
-                lines.push(Line::from(Span::styled(
-                    format!("next    {} ~{}", estimate.mode, format_count(estimate.total)),
-                    Style::default().fg(ACCENT_DIM),
-                )));
-                if let Some(note) = &estimate.note {
-                    lines.push(Line::from(Span::styled(
-                        preview_line(note, 28),
-                        Style::default().fg(ACCENT_DIM),
-                    )));
-                }
+                push_sidebar_rail_item(
+                    &mut lines,
+                    "⋯",
+                    ACCENT_DIM,
+                    format!("next {} ~{}", estimate.mode, format_count(estimate.total)),
+                    estimate.note.as_ref().map(|note| preview_line(note, 32)),
+                    FG,
+                    ACCENT_DIM,
+                );
             }
-            lines.push(Line::from(Span::styled(
-                "Esc interrupt",
-                Style::default().fg(ACCENT_DIM),
-            )));
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "Esc to interrupt".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
         } else {
-            lines.push(Line::from(Span::styled(
-                "No running request",
-                Style::default().fg(ACCENT_DIM),
-            )));
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "idle".to_string(),
+                Some("no running request".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
         }
         for prompt in self.state.queued_prompts.iter().take(3) {
-            lines.push(Line::from(vec![
-                Span::styled("• ", Style::default().fg(ACCENT_DIM)),
-                Span::styled(preview_line(prompt, 24), Style::default().fg(FG)),
-            ]));
+            push_sidebar_rail_item(
+                &mut lines,
+                "•",
+                ACCENT_DIM,
+                preview_line(prompt, 26),
+                Some("queued".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
         }
 
         lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            "Work",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(sidebar_header("Tools"));
 
         let mut shown = 0usize;
         for message in self.state.messages.iter().rev() {
             for tool in message.tool_calls.iter().rev() {
                 let color = tool_status_color(&tool.status);
-                lines.push(Line::from(vec![
-                    Span::styled("↳ ", Style::default().fg(color)),
-                    Span::styled(
-                        preview_line(&tool_sidebar_text(tool), 26),
-                        Style::default().fg(color),
-                    ),
-                ]));
+                push_sidebar_rail_item(
+                    &mut lines,
+                    status_marker(&tool.status),
+                    color,
+                    preview_line(&tool.summary, 26),
+                    Some(format!(
+                        "{}{}",
+                        tool_status_label(&tool.status),
+                        tool.result
+                            .as_ref()
+                            .map(|result| format!(" · {}", preview_line(result, 22)))
+                            .unwrap_or_default()
+                    )),
+                    color,
+                    ACCENT_DIM,
+                );
                 shown += 1;
                 if shown >= 8 {
                     break;
@@ -720,24 +760,33 @@ impl App {
         }
 
         if shown == 0 {
-            lines.push(Line::from(Span::styled(
-                "No tool activity",
-                Style::default().fg(ACCENT_DIM),
-            )));
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "no tool activity".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
         }
 
         lines.push(Line::from(Span::raw("")));
-        lines.push(Line::from(Span::styled(
-            "Providers",
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
+        lines.push(sidebar_header("Providers"));
         for provider in &self.state.providers {
-            let status = if provider.available { "●" } else { "○" };
             let color = if provider.available { SUCCESS } else { ACCENT_DIM };
-            lines.push(Line::from(vec![
-                Span::styled(format!("{status} "), Style::default().fg(color)),
-                Span::styled(&provider.name, Style::default().fg(FG)),
-            ]));
+            push_sidebar_rail_item(
+                &mut lines,
+                if provider.available { "●" } else { "○" },
+                color,
+                title_case_label(&provider.name),
+                provider
+                    .source
+                    .as_ref()
+                    .map(|source| preview_line(source, 28)),
+                FG,
+                ACCENT_DIM,
+            );
         }
 
         frame.render_widget(
@@ -856,46 +905,20 @@ impl App {
             }
         }
 
-        let mode_label = self
-            .state
-            .modes
-            .iter()
-            .find(|mode| mode.active)
-            .map(|mode| mode.label.as_str())
-            .unwrap_or(self.state.mode.as_str());
-        let auth_label = self
-            .state
-            .auth_type
-            .as_deref()
-            .unwrap_or("auth?");
-        let short_remote = self
-            .state
-            .remote_session_id
-            .as_ref()
-            .map(|value| preview_line(value, 8))
-            .unwrap_or_else(|| "new".into());
-        let statusline = format!(
-            "{} · {} · {} · {} · {}",
-            mode_label, self.state.provider, self.state.model, auth_label, short_remote
-        );
-        let footer = if let Some(prompt) = &self.state.ask_user {
-            let selected = prompt
-                .options
-                .get(self.ask_user_selection)
-                .map(|value| format!("  ·  selected {}", value))
-                .unwrap_or_default();
-            format!("{statusline}  ·  ↑/↓ move option  Enter send  Ctrl+J newline{selected}")
+        let mut footer_spans = build_mode_badge_spans(&self.state);
+        if let Some(prompt) = &self.state.ask_user {
+            if let Some(selected) = prompt.options.get(self.ask_user_selection) {
+                footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+                footer_spans.push(Span::styled(selected.clone(), Style::default().fg(FG)));
+            }
         } else if let Some(notice) = &self.notice {
-            format!("{statusline}  ·  switched {notice_text}", notice_text = notice.text)
-        } else {
-            format!(
-                "{statusline}  ·  ↑/↓ scroll log  PgUp/PgDn jump  End follow  Shift+Tab mode"
-            )
-        };
-        lines.push(Line::from(Span::styled(
-            footer,
-            Style::default().fg(ACCENT_DIM),
-        )));
+            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+            footer_spans.push(Span::styled(
+                format!("switched {}", notice.text),
+                Style::default().fg(ACCENT_DIM),
+            ));
+        }
+        lines.push(Line::from(footer_spans));
 
         frame.render_widget(
             Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
@@ -1051,6 +1074,11 @@ impl App {
         }
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j') {
+            self.composer.insert_text("\n");
+            return Ok(());
+        }
+
+        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
             self.composer.insert_text("\n");
             return Ok(());
         }
@@ -1413,11 +1441,6 @@ fn build_welcome_lines(width: usize) -> Vec<Line<'static>> {
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(Span::raw("")));
-    lines.push(Line::from(Span::styled(
-        center_with_padding("Type a prompt. Shift+Tab cycles mode. Ctrl+J inserts a newline.", width),
-        Style::default().fg(ACCENT_DIM),
-    )));
-
     lines
 }
 
@@ -1442,6 +1465,114 @@ fn format_count(value: u64) -> String {
     }
 
     out.chars().rev().collect()
+}
+
+fn title_case_label(value: &str) -> String {
+    let lower = value.trim().to_lowercase();
+    let mut chars = lower.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+
+    format!("{}{}", first.to_uppercase(), chars.collect::<String>())
+}
+
+fn display_model_name(model: &str) -> String {
+    if let Some(version) = model.strip_prefix("claude-opus-") {
+        return format!("Opus {}", version.replace('-', "."));
+    }
+
+    if let Some(version) = model.strip_prefix("claude-sonnet-") {
+        return format!("Sonnet {}", version.replace('-', "."));
+    }
+
+    if let Some(version) = model.strip_prefix("claude-haiku-") {
+        return format!("Haiku {}", version.replace('-', "."));
+    }
+
+    if let Some(version) = model.strip_prefix("gpt-") {
+        return format!("GPT-{}", version);
+    }
+
+    if let Some(version) = model.strip_prefix("gemini-") {
+        let pretty = version
+            .split('-')
+            .map(|segment| match segment {
+                "pro" => "Pro".to_string(),
+                "flash" => "Flash".to_string(),
+                value => value.to_string(),
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!("Gemini {}", pretty);
+    }
+
+    model.to_string()
+}
+
+fn build_mode_badge_spans(state: &NativeTuiState) -> Vec<Span<'static>> {
+    if let Some(mode) = state.modes.iter().find(|mode| mode.active) {
+        return vec![
+            Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                title_case_label(&mode.label),
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" (", Style::default().fg(ACCENT_DIM)),
+            Span::styled(mode.tagline.clone(), Style::default().fg(FG)),
+            Span::styled(" - ", Style::default().fg(ACCENT_DIM)),
+            Span::styled(display_model_name(&mode.model), Style::default().fg(ACCENT_DIM)),
+            Span::styled(")", Style::default().fg(ACCENT_DIM)),
+        ];
+    }
+
+    vec![Span::styled(
+        format!(
+            "● {} ({})",
+            title_case_label(&state.mode),
+            display_model_name(&state.model)
+        ),
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )]
+}
+
+fn sidebar_header(title: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("• ", Style::default().fg(ACCENT)),
+        Span::styled(
+            title.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn push_sidebar_rail_item(
+    lines: &mut Vec<Line<'static>>,
+    marker: &str,
+    marker_color: Color,
+    title: String,
+    detail: Option<String>,
+    title_color: Color,
+    detail_color: Color,
+) {
+    lines.push(Line::from(vec![
+        Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
+        Span::styled(title, Style::default().fg(title_color)),
+    ]));
+
+    if let Some(detail) = detail {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", Style::default().fg(marker_color)),
+            Span::styled(detail, Style::default().fg(detail_color)),
+        ]));
+    }
+}
+
+fn context_meter(percent: f64, width: usize) -> String {
+    let width = width.max(4);
+    let filled = ((percent.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let filled = filled.min(width);
+    format!("{}{}", "■".repeat(filled), "·".repeat(width.saturating_sub(filled)))
 }
 
 fn looks_like_path_token(token: &str) -> bool {
@@ -1486,17 +1617,14 @@ fn tool_status_label(status: &str) -> &'static str {
     }
 }
 
-fn tool_sidebar_text(tool: &NativeToolCallState) -> String {
-    let mut text = format!("{} · {}", tool.summary, tool_status_label(&tool.status));
-    if let Some(result) = &tool.result {
-        let detail = preview_line(result, 40);
-        if !detail.is_empty() {
-            text.push_str(" · ");
-            text.push_str(&detail);
-        }
+fn status_marker(status: &str) -> &'static str {
+    match status {
+        "done" => "●",
+        "error" => "✕",
+        "running" => "↻",
+        "pending" => "◌",
+        _ => "·",
     }
-
-    text
 }
 
 fn format_elapsed(started_at_ms: Option<u64>) -> String {

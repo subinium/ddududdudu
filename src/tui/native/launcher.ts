@@ -38,7 +38,11 @@ const resolveNativeBinary = async (): Promise<string | null> => {
   return null;
 };
 
-export const startNativeTui = async (): Promise<void> => {
+export interface NativeTuiLaunchOptions {
+  resumeSessionId?: string;
+}
+
+export const startNativeTui = async (options: NativeTuiLaunchOptions = {}): Promise<void> => {
   if (process.env.DDUDU_TUI === 'ink') {
     const configModule = await import('../../core/config.js');
     const config = await configModule.loadConfig();
@@ -65,6 +69,9 @@ export const startNativeTui = async (): Promise<void> => {
       env: {
         ...process.env,
         DDUDU_TUI: 'native',
+        ...(options.resumeSessionId
+          ? { DDUDU_RESUME_SESSION_ID: options.resumeSessionId }
+          : {}),
       },
     },
   );

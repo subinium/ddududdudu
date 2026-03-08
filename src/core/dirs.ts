@@ -7,6 +7,7 @@ export interface DduduPaths {
   globalConfig: string;
   globalPrompts: string;
   globalRules: string;
+  globalHooks: string;
   globalSkills: string;
   globalSessions: string;
   globalAuth: string;
@@ -15,6 +16,7 @@ export interface DduduPaths {
   projectConfig: string;
   projectPrompts: string;
   projectRules: string;
+  projectHooks: string;
   projectInstructions: string;
   projectSessions: string;
 }
@@ -31,6 +33,7 @@ export const getDduduPaths = (cwd?: string): DduduPaths => {
     globalConfig: resolve(globalDir, 'config.yaml'),
     globalPrompts: resolve(globalDir, 'prompts'),
     globalRules: resolve(globalDir, 'rules'),
+    globalHooks: resolve(globalDir, 'hooks'),
     globalSkills: resolve(globalDir, 'skills'),
     globalSessions: resolve(globalDir, 'sessions'),
     globalAuth: resolve(globalDir, 'auth.json'),
@@ -39,6 +42,7 @@ export const getDduduPaths = (cwd?: string): DduduPaths => {
     projectConfig: resolve(projectDir, 'config.yaml'),
     projectPrompts: resolve(projectDir, 'prompts'),
     projectRules: resolve(projectDir, 'rules'),
+    projectHooks: resolve(projectDir, 'hooks'),
     projectInstructions: resolve(projectDir, 'DDUDU.md'),
     projectSessions: resolve(projectDir, 'sessions'),
   };
@@ -51,6 +55,7 @@ export const ensureGlobalDirs = async (): Promise<void> => {
     mkdir(paths.globalDir, { recursive: true }),
     mkdir(paths.globalPrompts, { recursive: true }),
     mkdir(paths.globalRules, { recursive: true }),
+    mkdir(paths.globalHooks, { recursive: true }),
     mkdir(paths.globalSkills, { recursive: true }),
     mkdir(paths.globalSessions, { recursive: true }),
   ]);
@@ -63,6 +68,7 @@ export const ensureProjectDirs = async (cwd?: string): Promise<void> => {
     mkdir(paths.projectDir, { recursive: true }),
     mkdir(paths.projectPrompts, { recursive: true }),
     mkdir(paths.projectRules, { recursive: true }),
+    mkdir(paths.projectHooks, { recursive: true }),
     mkdir(paths.projectSessions, { recursive: true }),
   ]);
 };

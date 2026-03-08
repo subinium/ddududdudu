@@ -26,11 +26,10 @@ const printUsage = (): void => {
     `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
     `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
     `  ${P}ddudu session${X} list|resume    ${D}Session management${X}`,
-    `  ${P}ddudu status${X}                ${D}Show multiplexer status${X}`,
     '',
     `${PL}Shortcuts (TUI)${X}`,
-    `  Ctrl+T  new tab     Ctrl+W  close tab`,
-    `  Ctrl+L  clear       Ctrl+C  quit`,
+    `  Shift+Tab  cycle mode   Esc  interrupt`,
+    `  Ctrl+J     newline      Enter submit`,
     '',
     `  ${D}https://github.com/subinium/ddududdudu${X}`,
     '',
@@ -297,7 +296,8 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
       throw new Error(`Session not found: ${id}`);
     }
 
-    process.stdout.write(`Resuming session ${id}\n`);
+    const { startNativeTui } = await import('./tui/native/launcher.js');
+    await startNativeTui({ resumeSessionId: id });
     return;
   }
 

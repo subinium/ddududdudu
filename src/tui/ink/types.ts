@@ -110,6 +110,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/config', description: 'Show current configuration', value: '/config' },
   { label: '/help', description: 'Show available commands', value: '/help' },
   { label: '/doctor', description: 'Check system health', value: '/doctor' },
+  { label: '/review', description: 'Run code review checks', value: '/review' },
   { label: '/quit', description: 'Exit ddudu', value: '/quit' },
   { label: '/fire', description: 'Toggle PLAYING_WITH_FIRE mode', value: '/fire' },
   { label: '/init', description: 'Initialize project config', value: '/init' },

@@ -104,6 +104,10 @@ export const initializeProject = async (
     created.push('.ddudu/DDUDU.md');
   }
 
+  if (!(await exists(paths.projectHooks))) {
+    created.push('.ddudu/hooks/');
+  }
+
   return {
     projectDir: paths.projectDir,
     created,

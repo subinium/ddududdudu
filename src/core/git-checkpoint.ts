@@ -112,10 +112,14 @@ export class GitCheckpoint {
 
     try {
       if (fromHash) {
-        return await runGit(this.cwd, ['diff', '--stat', `${fromHash}..HEAD`]);
+        return await runGit(this.cwd, ['diff', `${fromHash}..HEAD`]);
       }
 
-      return await runGit(this.cwd, ['diff', '--stat', 'HEAD~1..HEAD']);
+      if (await hasChangesToCommit(this.cwd)) {
+        return await runGit(this.cwd, ['diff', 'HEAD']);
+      }
+
+      return await runGit(this.cwd, ['diff', 'HEAD~1..HEAD']);
     } catch {
       return '';
     }

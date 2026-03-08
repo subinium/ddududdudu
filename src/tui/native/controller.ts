@@ -7,23 +7,33 @@ import { createClient, type ApiClient, type StreamEvent } from '../../api/client
 import type { ToolResultBlock, ToolUseBlock } from '../../api/tool-executor.js';
 import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
+import { ChecksRunner } from '../../core/checks.js';
 import { loadConfig } from '../../core/config.js';
 import { CompactionEngine } from '../../core/compaction.js';
+import { deriveContextProfile, type ContextProfile } from '../../core/context-profile.js';
+import { DelegationRuntime, type DelegationPurpose } from '../../core/delegation.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../../core/default-prompts.js';
+import { GitCheckpoint } from '../../core/git-checkpoint.js';
+import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
 import { loadMemory } from '../../core/memory.js';
+import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
-import { SkillLoader } from '../../core/skill-loader.js';
+import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
+import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
-import type { DduduConfig, NamedMode } from '../../core/types.js';
+import type { DduduConfig, LoadedSession, NamedMode, SessionEntry } from '../../core/types.js';
+import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
 import type { ToolContext } from '../../tools/index.js';
+import type { Tool, ToolParameter } from '../../tools/index.js';
 import { ToolRegistry } from '../../tools/registry.js';
 import { discoverToolboxTools } from '../../tools/toolbox.js';
 import { BLACKPINK_MODES, BP_LYRICS, MODE_ORDER } from '../ink/theme.js';
 import { SLASH_COMMANDS } from '../ink/types.js';
 import {
   buildCompactionMessages,
+  type CompactionBuildOptions,
   type BridgeRequestMode,
   type BridgeSessionState,
   countApiMessageTokens,
@@ -59,6 +69,7 @@ type AskUserResolver = {
 
 const MAX_TOOL_TURNS_FALLBACK = 25;
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
 
 const normalizeProviders = (
   providers: Map<string, ProviderAuth>,
@@ -126,13 +137,13 @@ const resolveProviderConfigName = (provider: string): string => {
   return provider;
 };
 
-const buildSystemPrompt = (mode: NamedMode): string => {
+const buildFallbackSystemPrompt = (mode: NamedMode, model?: string): string => {
   const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
   const cwd = process.cwd();
   const projectName = basename(cwd) || 'unknown-project';
 
   return DEFAULT_SYSTEM_PROMPT
-    .replace(/\$\{model\}/g, modeConfig.model)
+    .replace(/\$\{model\}/g, model ?? modeConfig.model)
     .replace(/\$\{provider\}/g, modeConfig.provider)
     .replace(/\$\{cwd\}/g, cwd)
     .replace(/\$\{projectName\}/g, projectName)
@@ -292,7 +303,151 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
 };
 
 const summarizeToolResult = (result: string): string => {
-  return previewText(result, 88);
+  return previewText(result.replace(/\s+/g, ' ').trim(), 160);
+};
+
+const hasMeaningfulMemory = (memory: string): boolean => {
+  return memory
+    .replace(/## Global Memory/gu, '')
+    .replace(/## Project Memory/gu, '')
+    .trim()
+    .length > 0;
+};
+
+const getEntryString = (entry: SessionEntry, key: string): string => {
+  const value = entry.data[key];
+  return typeof value === 'string' ? value : '';
+};
+
+const findModeForProviderModel = (
+  provider: string | undefined,
+  model: string | undefined,
+): NamedMode | null => {
+  if (!provider && !model) {
+    return null;
+  }
+
+  for (const mode of MODE_ORDER) {
+    const modeConfig = BLACKPINK_MODES[mode];
+    if (!modeConfig) {
+      continue;
+    }
+
+    if (provider && model) {
+      if (modeConfig.provider === provider && modeConfig.model === model) {
+        return mode;
+      }
+      continue;
+    }
+
+    if (provider && modeConfig.provider === provider) {
+      return mode;
+    }
+
+    if (model && modeConfig.model === model) {
+      return mode;
+    }
+  }
+
+  return null;
+};
+
+const isObject = (value: unknown): value is Record<string, unknown> => {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+};
+
+const toToolParameter = (
+  schema: unknown,
+  requiredFields: Set<string> = new Set(),
+  name?: string,
+): ToolParameter => {
+  if (!isObject(schema)) {
+    return {
+      type: 'string',
+      description: name ? `${name} parameter` : 'parameter',
+      required: name ? requiredFields.has(name) : undefined,
+    };
+  }
+
+  const schemaType = typeof schema.type === 'string' ? schema.type : 'string';
+  const type: ToolParameter['type'] =
+    schemaType === 'number' || schemaType === 'boolean' || schemaType === 'array' || schemaType === 'object'
+      ? schemaType
+      : 'string';
+
+  const parameter: ToolParameter = {
+    type,
+    description:
+      typeof schema.description === 'string' && schema.description.trim().length > 0
+        ? schema.description.trim()
+        : name
+        ? `${name} parameter`
+        : 'parameter',
+    required: name ? requiredFields.has(name) : undefined,
+  };
+
+  if (Array.isArray(schema.enum)) {
+    parameter.enum = schema.enum.filter(
+      (entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+    );
+  }
+
+  if (type === 'array') {
+    parameter.items = toToolParameter(schema.items);
+  }
+
+  if (type === 'object' && isObject(schema.properties)) {
+    const childRequired = new Set(
+      Array.isArray(schema.required)
+        ? schema.required.filter(
+            (entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+          )
+        : [],
+    );
+    const properties: Record<string, ToolParameter> = {};
+    for (const [key, value] of Object.entries(schema.properties)) {
+      properties[key] = toToolParameter(value, childRequired, key);
+    }
+    parameter.properties = properties;
+  }
+
+  return parameter;
+};
+
+const buildMcpTool = (manager: McpManager, tool: McpTool): Tool => {
+  const rootSchema = isObject(tool.inputSchema) ? tool.inputSchema : {};
+  const required = new Set(
+    Array.isArray(rootSchema.required)
+      ? rootSchema.required.filter(
+          (entry: unknown): entry is string => typeof entry === 'string' && entry.trim().length > 0,
+        )
+      : [],
+  );
+  const parameters: Record<string, ToolParameter> = {};
+  const properties = isObject(rootSchema.properties) ? rootSchema.properties : {};
+
+  for (const [name, value] of Object.entries(properties)) {
+    parameters[name] = toToolParameter(value, required, name);
+  }
+
+  return {
+    definition: {
+      name: tool.name,
+      description: tool.description || `MCP tool ${tool.name}`,
+      parameters,
+    },
+    async execute(args): Promise<{ output: string; isError?: boolean }> {
+      try {
+        const output = await manager.callTool(tool.name, args);
+        return { output };
+      } catch (error: unknown) {
+        return {
+          output: serializeError(error),
+          isError: true,
+        };
+      }
+    },
+  };
 };
 
 export class NativeBridgeController {
@@ -342,13 +497,20 @@ export class NativeBridgeController {
   private activeClient: ApiClient | null = null;
   private toolRegistry: ToolRegistry | null = null;
   private sessionManager: SessionManager | null = null;
+  private mcpManager: McpManager | null = null;
+  private readonly loadedSkills = new Map<string, LoadedSkill>();
   private tokenCounter = new TokenCounter(BLACKPINK_MODES.jennie.model);
-  private systemPrompt = buildSystemPrompt('jennie');
+  private systemPrompt = buildFallbackSystemPrompt('jennie');
   private abortController: AbortController | null = null;
+  private activeOperation: 'request' | 'team' | null = null;
   private activeAssistantMessageId: string | null = null;
   private queuedPrompts: string[] = [];
   private pendingAskUser: AskUserResolver | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
+  private teamRunSince: number | null = null;
+  private teamRunStrategy: 'parallel' | 'sequential' | 'delegate' | null = null;
+  private teamRunTask: string | null = null;
+  private teamLastSummary: string | null = null;
   private readonly compactionEngine = new CompactionEngine();
   private readonly hookRegistry = new HookRegistry();
   private readonly remoteSessions = new Map<string, BridgeSessionState>();
@@ -362,7 +524,10 @@ export class NativeBridgeController {
     this.currentMode = clampMode(this.config.mode);
     this.state.mode = this.currentMode;
     this.state.playingWithFire = this.config.tools.permission === 'auto';
-    this.systemPrompt = buildSystemPrompt(this.currentMode);
+    this.systemPrompt = buildFallbackSystemPrompt(
+      this.currentMode,
+      this.selectedModels[this.currentMode],
+    );
 
     for (const modeName of MODE_ORDER) {
       this.selectedModels[modeName] = BLACKPINK_MODES[modeName].model;
@@ -382,22 +547,39 @@ export class NativeBridgeController {
       this.appendSystemMessage(`[toolbox] ${serializeError(error)}`);
     }
 
+    try {
+      await this.initializeMcpTools();
+    } catch (error: unknown) {
+      this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
+    }
+
+    try {
+      await loadHookFiles(process.cwd(), this.hookRegistry);
+    } catch (error: unknown) {
+      this.appendSystemMessage(`[hooks] ${serializeError(error)}`);
+    }
+
     this.sessionManager = new SessionManager(this.config.session.directory);
     try {
-      const session = await this.sessionManager.create({
-        provider: this.getCurrentProvider(),
-        model: this.getCurrentModel(),
-      });
-      this.state.sessionId = session.id;
+      const resumed = await this.resumeRequestedSession();
+      if (!resumed) {
+        const session = await this.sessionManager.create({
+          provider: this.getCurrentProvider(),
+          model: this.getCurrentModel(),
+        });
+        this.state.sessionId = session.id;
+      }
       await this.hookRegistry.emit('onSessionStart', {
-        sessionId: session.id,
+        sessionId: this.state.sessionId,
         provider: this.getCurrentProvider(),
         model: this.getCurrentModel(),
+        resumed,
       });
     } catch (error: unknown) {
       this.appendSystemMessage(`[session] ${serializeError(error)}`);
     }
 
+    await this.refreshSystemPrompt();
     this.reconfigureClient();
     this.state.ready = true;
     this.emitStateNow();
@@ -416,6 +598,7 @@ export class NativeBridgeController {
         model: this.getCurrentModel(),
       });
     }
+    this.mcpManager?.disconnectAll();
     this.abortCurrentRequest();
   }
 
@@ -479,7 +662,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /memory, /session, /config, /help, /doctor, /quit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /memory, /session, /config, /help, /doctor, /review, /quit, /fire, /init, /skill, /hook, /mcp, /team',
         );
         return;
       case '/config':
@@ -488,6 +671,9 @@ export class NativeBridgeController {
       case '/doctor':
         this.appendSystemMessage(this.formatDoctorSummary());
         return;
+      case '/review':
+        this.appendSystemMessage(await this.runReviewSummary());
+        return;
       case '/session':
         this.appendSystemMessage(await this.formatSessionSummary());
         return;
@@ -495,7 +681,11 @@ export class NativeBridgeController {
         this.appendSystemMessage(await this.formatMemorySummary());
         return;
       case '/skill':
-        this.appendSystemMessage(await this.formatSkillSummary());
+        if (rest.length === 0) {
+          this.appendSystemMessage(await this.formatSkillSummary());
+        } else {
+          this.appendSystemMessage(await this.loadSkillSummary(rest.join(' ')));
+        }
         return;
       case '/mcp':
         this.appendSystemMessage(this.formatMcpSummary());
@@ -504,7 +694,7 @@ export class NativeBridgeController {
         this.appendSystemMessage(this.formatHookSummary());
         return;
       case '/team':
-        this.appendSystemMessage(this.formatTeamSummary());
+        this.appendSystemMessage(await this.runTeamCommand(rest));
         return;
       case '/init':
         this.appendSystemMessage(await this.runInitSummary());
@@ -528,8 +718,8 @@ export class NativeBridgeController {
     const previousMode = this.currentMode;
     this.currentMode = clampMode(mode);
     this.state.mode = this.currentMode;
-    this.systemPrompt = buildSystemPrompt(this.currentMode);
     this.reconfigureClient();
+    void this.refreshSystemPrompt();
     void this.hookRegistry.emit('onModeSwitch', {
       from: previousMode,
       to: this.currentMode,
@@ -548,6 +738,7 @@ export class NativeBridgeController {
 
     this.selectedModels[this.currentMode] = model;
     this.reconfigureClient();
+    void this.refreshSystemPrompt();
     this.scheduleStatePush();
   }
 
@@ -587,7 +778,7 @@ export class NativeBridgeController {
       this.finishMessage(this.activeAssistantMessageId, '[request aborted]');
     }
 
-    if (this.isBridgeBackedProvider()) {
+    if (this.activeOperation === 'request' && this.isBridgeBackedProvider()) {
       this.invalidateRemoteSession(this.getCurrentProvider());
     }
 
@@ -595,6 +786,10 @@ export class NativeBridgeController {
     this.state.loadingLabel = '';
     this.state.loadingSince = null;
     this.state.requestEstimate = null;
+    this.activeOperation = null;
+    this.teamRunSince = null;
+    this.teamRunStrategy = null;
+    this.teamRunTask = null;
     this.abortController = null;
     this.activeAssistantMessageId = null;
     this.scheduleStatePush();
@@ -615,7 +810,9 @@ export class NativeBridgeController {
 
     const mode = this.currentMode;
     const model = this.getCurrentModel();
+    await this.refreshSystemPrompt();
     this.tokenCounter.setModel(model);
+    await this.maybeAutoCompact(trimmedContent);
 
     const userMessage: NativeMessageState = {
       id: randomUUID(),
@@ -655,6 +852,7 @@ export class NativeBridgeController {
 
     const controller = new AbortController();
     this.abortController = controller;
+    this.activeOperation = 'request';
 
     const tools = this.toolRegistry ? formatToolsForApi(this.toolRegistry) : undefined;
     const maxTokens = this.config ? getMaxTokens(this.config) : undefined;
@@ -833,6 +1031,9 @@ export class NativeBridgeController {
       if (this.abortController === controller) {
         this.abortController = null;
       }
+      if (this.activeOperation === 'request') {
+        this.activeOperation = null;
+      }
 
       if (this.activeAssistantMessageId === assistantMessage.id) {
         this.activeAssistantMessageId = null;
@@ -1010,6 +1211,9 @@ export class NativeBridgeController {
           abortSignal: context.signal,
           authToken: anthropicAuth?.token,
           authBaseUrl: process.env.ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
+          delegation: this.createDelegationRuntime(),
+          sessionId: this.state.sessionId ?? undefined,
+          currentMode: this.currentMode,
           askUser: (question: string, options?: string[]): Promise<string> => {
             return new Promise<string>((resolve, reject) => {
               this.pendingAskUser = { resolve, reject };
@@ -1083,6 +1287,178 @@ export class NativeBridgeController {
     );
   }
 
+  private async refreshSystemPrompt(): Promise<void> {
+    const mode = this.currentMode;
+    const model = this.getCurrentModel();
+    const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
+    const cwd = process.cwd();
+    const projectName = basename(cwd) || 'unknown-project';
+    const loadedSkills = Array.from(this.loadedSkills.values());
+
+    try {
+      let prompt = await loadSystemPrompt({
+        model,
+        provider: modeConfig.provider,
+        cwd,
+        projectName,
+        version: PROMPT_VERSION,
+        timestamp: new Date().toISOString(),
+        rules: [],
+        skills: loadedSkills.map((skill) => skill.name),
+        userInstructions: modeConfig.promptAddition.trim(),
+      });
+
+      if (loadedSkills.length > 0) {
+        prompt += `\n\n${loadedSkills
+          .map(
+            (skill) =>
+              `<skill name="${skill.name}">\n${skill.content.trim()}\n</skill>`,
+          )
+          .join('\n\n')}`;
+      }
+
+      try {
+        const memory = await loadMemory(cwd);
+        if (hasMeaningfulMemory(memory)) {
+          prompt += `\n\n<memory>\n${memory}\n</memory>`;
+        }
+      } catch {
+        // Memory is optional; keep prompt generation resilient.
+      }
+
+      this.systemPrompt = prompt;
+    } catch {
+      this.systemPrompt = buildFallbackSystemPrompt(mode, model);
+    }
+
+    this.syncUsageState();
+  }
+
+  private async resumeRequestedSession(): Promise<boolean> {
+    const requestedSessionId = process.env.DDUDU_RESUME_SESSION_ID?.trim();
+    if (!requestedSessionId || !this.sessionManager) {
+      return false;
+    }
+
+    try {
+      const loaded = await this.sessionManager.load(requestedSessionId);
+      this.restoreSession(loaded);
+      return true;
+    } catch (error: unknown) {
+      this.appendSystemMessage(
+        `[session] Failed to resume ${requestedSessionId}: ${serializeError(error)}`,
+      );
+      return false;
+    }
+  }
+
+  private restoreSession(session: LoadedSession): void {
+    let restoredMessages: NativeMessageState[] = [];
+    let restoredMode: NamedMode | null = null;
+
+    for (const entry of session.entries) {
+      const timestamp = Date.parse(entry.timestamp);
+      const baseTimestamp = Number.isNaN(timestamp) ? Date.now() : timestamp;
+
+      if (entry.type === 'compaction') {
+        const summary = getEntryString(entry, 'summary');
+        if (!summary) {
+          continue;
+        }
+
+        restoredMessages = [
+          {
+            id: randomUUID(),
+            role: 'user',
+            content: summary,
+            timestamp: baseTimestamp,
+          },
+          {
+            id: randomUUID(),
+            role: 'assistant',
+            content: 'Context compacted. Ready to continue.',
+            timestamp: baseTimestamp + 1,
+          },
+        ];
+        continue;
+      }
+
+      if (entry.type !== 'message') {
+        continue;
+      }
+
+      const user = getEntryString(entry, 'user');
+      const assistant = getEntryString(entry, 'assistant');
+      const mode = getEntryString(entry, 'mode');
+      const entryMode =
+        mode === 'jennie' || mode === 'lisa' || mode === 'rosé' || mode === 'jisoo'
+          ? mode
+          : null;
+
+      if (entryMode) {
+        restoredMode = entryMode;
+      }
+
+      if (user) {
+        restoredMessages.push({
+          id: randomUUID(),
+          role: 'user',
+          content: user,
+          timestamp: baseTimestamp,
+        });
+      }
+
+      if (assistant) {
+        restoredMessages.push({
+          id: randomUUID(),
+          role: 'assistant',
+          content: assistant,
+          timestamp: baseTimestamp + 1,
+        });
+      }
+    }
+
+    const inferredMode =
+      restoredMode ??
+      findModeForProviderModel(session.header.provider, session.header.model) ??
+      this.currentMode;
+
+    this.currentMode = inferredMode;
+    this.state.mode = inferredMode;
+
+    if (session.header.model) {
+      this.selectedModels[inferredMode] = session.header.model;
+    }
+
+    this.state.sessionId = session.header.id;
+    this.state.messages = restoredMessages;
+    this.remoteSessions.clear();
+    this.updateRemoteSessionState();
+  }
+
+  private async initializeMcpTools(): Promise<void> {
+    if (!this.config || !this.toolRegistry) {
+      return;
+    }
+
+    const entries = Object.entries(this.config.mcp.servers ?? {});
+    if (entries.length === 0) {
+      return;
+    }
+
+    const manager = new McpManager();
+    for (const [name, config] of entries) {
+      manager.addServer(name, config as McpServerConfig);
+    }
+
+    await manager.connectAll();
+    for (const tool of manager.getAllTools()) {
+      this.toolRegistry.register(buildMcpTool(manager, tool));
+    }
+
+    this.mcpManager = manager;
+  }
+
   private buildProviderState(): NativeProviderState[] {
     return PROVIDER_NAMES.map((provider) => {
       const auth = this.availableProviders.get(provider);
@@ -1147,8 +1523,7 @@ export class NativeBridgeController {
       this.state.error = `No auth found for ${provider}. Run: ddudu auth login`;
     }
 
-    this.systemPrompt = buildSystemPrompt(this.currentMode)
-      .replace(/\$\{model\}/g, model)
+    this.systemPrompt = buildFallbackSystemPrompt(this.currentMode, model)
       .replace(/\$\{provider\}/g, modeConfig.provider);
 
     this.updateRemoteSessionState();
@@ -1183,6 +1558,57 @@ export class NativeBridgeController {
     this.state.contextPercent = context.percent;
     this.state.contextTokens = context.tokens;
     this.state.contextLimit = context.limit;
+  }
+
+  private getContextProfile(provider: string = this.getCurrentProvider(), model: string = this.getCurrentModel()): ContextProfile {
+    const triggerRatio = this.config?.compaction.trigger ?? 0.8;
+    return deriveContextProfile({
+      provider,
+      model,
+      providerWindowTokens: this.tokenCounter.getContextLimitFor(model),
+      bridgeBacked: this.isBridgeBackedProvider(provider),
+      triggerRatio,
+    });
+  }
+
+  private getCompactionBuildOptions(provider: string = this.getCurrentProvider()): CompactionBuildOptions {
+    const profile = this.getContextProfile(provider);
+    return {
+      assistantChars: profile.assistantChars,
+      userChars: profile.userChars,
+      systemChars: profile.systemChars,
+      toolResultChars: profile.toolResultChars,
+      maxToolCallsPerMessage: profile.maxToolCallsPerMessage,
+    };
+  }
+
+  private createDelegationRuntime(): DelegationRuntime {
+    return new DelegationRuntime({
+      cwd: process.cwd(),
+      availableProviders: this.availableProviders,
+      sessionManager: this.sessionManager,
+      resolveModel: (mode: NamedMode): string => {
+        return this.selectedModels[mode] ?? BLACKPINK_MODES[mode].model;
+      },
+    });
+  }
+
+  private async maybeAutoCompact(nextUserPrompt: string): Promise<void> {
+    const profile = this.getContextProfile();
+    const projectedTokens =
+      this.estimateCurrentContextFootprint().tokens + this.tokenCounter.countTokens(nextUserPrompt);
+    if (projectedTokens < profile.autoCompactAtTokens) {
+      return;
+    }
+
+    if (this.getCanonicalConversationCount() <= Math.max(4, (this.config?.compaction.preserve_recent_turns ?? 5) * 2)) {
+      return;
+    }
+
+    await this.compactContext(
+      `Auto compacted canonical session at ${projectedTokens.toLocaleString()} tokens to stay within the working set.`,
+      'Auto-compact canonical context before the next request.',
+    );
   }
 
   private estimateRequestForPlan(plan: RequestPlan): NativeRequestEstimateState {
@@ -1229,11 +1655,13 @@ export class NativeBridgeController {
       `auth: ${authLabel}`,
       `fire mode: ${this.state.playingWithFire ? 'on' : 'off'}`,
       `session: ${this.state.sessionId ?? 'none'}`,
+      `skills loaded: ${this.loadedSkills.size}`,
       `tools: ${this.toolRegistry?.list().length ?? 0}`,
     ].join('\n');
   }
 
   private formatDoctorSummary(): string {
+    const profile = this.getContextProfile();
     const estimate =
       this.state.requestEstimate ??
       createRequestEstimate({
@@ -1255,8 +1683,10 @@ export class NativeBridgeController {
       `model: ${this.state.model}`,
       `auth: ${this.state.authType ?? 'missing'}${this.state.authSource ? ` via ${this.state.authSource}` : ''}`,
       `context: ${this.state.contextTokens.toLocaleString()} / ${this.state.contextLimit.toLocaleString()} (${(this.state.contextPercent * 100).toFixed(1)}%)`,
+      `working set: ${profile.canonicalWorkingSetTokens.toLocaleString()} · auto compact at ${profile.autoCompactAtTokens.toLocaleString()}`,
       `next ${estimate.mode}: system ${estimate.system.toLocaleString()} + history ${estimate.history.toLocaleString()} + tools ${estimate.tools.toLocaleString()} + prompt ${estimate.prompt.toLocaleString()} = ~${estimate.total.toLocaleString()}`,
       ...(estimate.note ? [`note: ${estimate.note}`] : []),
+      `skills loaded: ${this.loadedSkills.size}`,
       `remote bridge sessions: ${this.remoteSessions.size}`,
       `background queue: ${queue}`,
     ].join('\n');
@@ -1297,6 +1727,9 @@ export class NativeBridgeController {
   private async formatMemorySummary(): Promise<string> {
     try {
       const memory = await loadMemory(process.cwd());
+      if (!hasMeaningfulMemory(memory)) {
+        return 'Memory is empty.';
+      }
       const preview = previewText(memory, 400);
       return preview ? `Memory\n${preview}` : 'Memory is empty.';
     } catch (error: unknown) {
@@ -1313,9 +1746,53 @@ export class NativeBridgeController {
         return 'No skills discovered.';
       }
 
-      return ['Skills', ...skills.slice(0, 12).map((skill) => `${skill.name} · ${skill.description}`)].join('\n');
+      return [
+        'Skills',
+        ...skills.slice(0, 12).map((skill) => {
+          const loaded = this.loadedSkills.has(skill.name) ? 'loaded' : 'available';
+          return `${skill.name} · ${loaded} · ${skill.description}`;
+        }),
+      ].join('\n');
     } catch (error: unknown) {
       return `Skill scan failed: ${serializeError(error)}`;
+    }
+  }
+
+  private async loadSkillSummary(name: string): Promise<string> {
+    try {
+      const loader = new SkillLoader(process.cwd());
+      await loader.scan();
+      const skill = await loader.load(name);
+      if (!skill) {
+        return `Skill not found: ${name}`;
+      }
+
+      this.loadedSkills.set(skill.name, skill);
+      await this.refreshSystemPrompt();
+      this.scheduleStatePush();
+      return `Skill loaded into context: ${skill.name}`;
+    } catch (error: unknown) {
+      return `Skill load failed: ${serializeError(error)}`;
+    }
+  }
+
+  private async runReviewSummary(): Promise<string> {
+    const git = new GitCheckpoint(process.cwd());
+    if (!(await git.isAvailable())) {
+      return 'Review unavailable: not a git repository.';
+    }
+
+    try {
+      const diff = await git.getDiff();
+      if (!diff.trim()) {
+        return 'Review skipped: no diff available.';
+      }
+
+      const runner = new ChecksRunner(process.cwd());
+      const report = await runner.runAllChecks(diff);
+      return runner.formatReport(report);
+    } catch (error: unknown) {
+      return `Review failed: ${serializeError(error)}`;
     }
   }
 
@@ -1325,7 +1802,20 @@ export class NativeBridgeController {
       return 'No MCP servers configured.';
     }
 
-    return ['MCP servers', ...entries.map(([name, config]) => `${name} · ${config.command}`)].join('\n');
+    const connected = new Set(this.mcpManager?.getConnectedServers() ?? []);
+    const toolCount = this.toolRegistry
+      ?.list()
+      .filter((tool) => tool.name.startsWith('mcp__')).length ?? 0;
+
+    return [
+      'MCP servers',
+      `connected: ${connected.size}/${entries.length}`,
+      `tools: ${toolCount}`,
+      ...entries.map(([name, config]) => {
+        const status = connected.has(name) ? 'connected' : 'disconnected';
+        return `${name} · ${config.command} · ${status}`;
+      }),
+    ].join('\n');
   }
 
   private formatHookSummary(): string {
@@ -1335,14 +1825,263 @@ export class NativeBridgeController {
   }
 
   private formatTeamSummary(): string {
-    const toolNames = this.toolRegistry?.list().map((tool) => tool.name) ?? [];
-    const hasTaskTool = toolNames.includes('task');
+    const availableModes = this.getTeamEligibleModes();
     return [
       'Team',
-      `task tool: ${hasTaskTool ? 'available' : 'missing'}`,
-      'core orchestrator: available',
+      `orchestrator: ${availableModes.length > 0 ? 'ready' : 'unavailable'}`,
       'strategies: parallel, sequential, delegate',
-      'native TUI team runs: use the task tool from the active session',
+      `available modes: ${availableModes.map((mode) => BLACKPINK_MODES[mode].label).join(', ') || 'none'}`,
+      this.teamRunStrategy && this.teamRunTask
+        ? `running: ${this.teamRunStrategy} · ${previewText(this.teamRunTask, 72)}`
+        : 'running: no active team run',
+      this.teamLastSummary ? `last: ${this.teamLastSummary}` : 'last: no completed team run yet',
+      'usage: /team run [parallel|sequential|delegate] <task>',
+    ].join('\n');
+  }
+
+  private getTeamEligibleModes(): NamedMode[] {
+    return this.createDelegationRuntime().listAvailableModes();
+  }
+
+  private async runTeamCommand(args: string[]): Promise<string> {
+    if (args.length === 0 || args[0] === 'status') {
+      return this.formatTeamSummary();
+    }
+
+    if (args[0] !== 'run') {
+      return 'Usage: /team run [parallel|sequential|delegate] <task>';
+    }
+
+    if (this.state.loading || this.abortController) {
+      return 'Team run unavailable while another request is active.';
+    }
+
+    const strategyToken = args[1];
+    const strategy =
+      strategyToken === 'parallel' || strategyToken === 'sequential' || strategyToken === 'delegate'
+        ? strategyToken
+        : 'parallel';
+    const taskStartIndex = strategyToken === strategy ? 2 : 1;
+    const task = args.slice(taskStartIndex).join(' ').trim();
+    if (!task) {
+      return 'Usage: /team run [parallel|sequential|delegate] <task>';
+    }
+
+    const teamAgents = this.buildTeamAgents();
+    if (teamAgents.length < 2) {
+      return 'Team run unavailable: need at least one lead and one worker with valid auth.';
+    }
+
+    const assistantMessageId = randomUUID();
+    this.state.messages.push({
+      id: randomUUID(),
+      role: 'system',
+      content: `Team run started · ${strategy} · ${previewText(task, 96)}`,
+      timestamp: Date.now(),
+    });
+    this.state.messages.push({
+      id: assistantMessageId,
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    });
+    this.state.loading = true;
+    this.state.loadingLabel = `team · ${strategy}`;
+    this.state.loadingSince = Date.now();
+    this.state.requestEstimate = null;
+    this.activeAssistantMessageId = assistantMessageId;
+    this.activeOperation = 'team';
+    this.teamRunSince = Date.now();
+    this.teamRunStrategy = strategy;
+    this.teamRunTask = task;
+    this.scheduleStatePush();
+
+    const controller = new AbortController();
+    this.abortController = controller;
+
+    try {
+      const orchestrator = new TeamOrchestrator({
+        name: 'ddudu-native-team',
+        agents: teamAgents,
+        strategy,
+        maxRounds: 2,
+        sharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
+        runAgent: async (agent, input, round) => this.executeTeamAgent(agent, input, round, controller.signal),
+        onMessage: (message) => {
+          this.updateMessage(
+            assistantMessageId,
+            this.formatTeamProgress(message),
+          );
+        },
+      });
+
+      const result = await orchestrator.run(task, controller.signal);
+      const formatted = this.formatTeamResult(strategy, task, teamAgents, result.messages, result.output, result.success, result.rounds);
+      this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
+      this.finishMessage(assistantMessageId, formatted);
+      return `Team run finished · ${this.teamLastSummary}`;
+    } catch (error: unknown) {
+      if (controller.signal.aborted) {
+        this.teamLastSummary = `${strategy} · aborted`;
+        return 'Team run aborted.';
+      }
+      const message = `Team run failed: ${serializeError(error)}`;
+      this.finishMessage(assistantMessageId, message);
+      return message;
+    } finally {
+      this.state.loading = false;
+      this.state.loadingLabel = '';
+      this.state.loadingSince = null;
+      this.state.requestEstimate = null;
+      this.abortController = null;
+      this.activeAssistantMessageId = null;
+      this.activeOperation = null;
+      this.teamRunSince = null;
+      this.teamRunStrategy = null;
+      this.teamRunTask = null;
+      this.scheduleStatePush();
+    }
+  }
+
+  private buildTeamAgents(): TeamAgentRole[] {
+    const availableModes = this.getTeamEligibleModes();
+    if (availableModes.length === 0) {
+      return [];
+    }
+
+    const leadMode = availableModes.includes('jennie') ? 'jennie' : availableModes[0];
+    const workerModes = availableModes.filter((mode) => mode !== leadMode);
+    const primaryWorkerMode = workerModes[0] ?? leadMode;
+    const secondaryWorkerMode = workerModes[1] ?? null;
+    const reviewerMode = workerModes[2] ?? secondaryWorkerMode ?? primaryWorkerMode ?? leadMode;
+
+    const makeAgent = (
+      id: string,
+      mode: NamedMode,
+      role: 'lead' | 'worker' | 'reviewer',
+      systemPrompt: string,
+    ): TeamAgentRole => {
+      const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
+      return {
+        id,
+        name: modeConfig.label,
+        mode,
+        role,
+        provider: modeConfig.provider,
+        model: this.selectedModels[mode] ?? modeConfig.model,
+        systemPrompt,
+      };
+    };
+
+    const agents: TeamAgentRole[] = [
+      makeAgent(
+        'lead',
+        leadMode,
+        'lead',
+        'Coordinate a coding team. Break the task down, synthesize worker outputs, and return the best merged answer.',
+      ),
+      makeAgent(
+        'worker_fast',
+        primaryWorkerMode,
+        'worker',
+        'Execute one focused subtask. Be concrete, direct, and implementation-oriented.',
+      ),
+    ];
+
+    if (secondaryWorkerMode) {
+      agents.push(
+        makeAgent(
+          'worker_deep',
+          secondaryWorkerMode,
+          'worker',
+          'Analyze edge cases and architecture risks for the assigned subtask before answering.',
+        ),
+      );
+    }
+
+    if (reviewerMode) {
+      agents.push(
+        makeAgent(
+          'reviewer',
+          reviewerMode,
+          'reviewer',
+          'Review the combined team output, point out risks, and suggest corrections if needed.',
+        ),
+      );
+    }
+
+    return agents;
+  }
+
+  private async executeTeamAgent(
+    agent: TeamAgentRole,
+    input: string,
+    round: number,
+    signal: AbortSignal,
+  ): Promise<string> {
+    const runtime = this.createDelegationRuntime();
+    const purpose: DelegationPurpose =
+      agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
+    const result = await runtime.run(
+      {
+        prompt: [
+          `Round ${round}`,
+          `Team task context for ${agent.name}:`,
+          input,
+        ].join('\n\n'),
+        purpose,
+        preferredMode: agent.mode,
+        preferredModel: agent.model,
+        systemPrompt: agent.systemPrompt,
+        maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+        parentSessionId: this.state.sessionId,
+      },
+      { signal },
+    );
+
+    return result.text.trim() || `[${agent.name}] no output`;
+  }
+
+  private formatTeamProgress(message: TeamMessage): string {
+    const meta = message.metadata && Object.keys(message.metadata).length > 0
+      ? ` ${JSON.stringify(message.metadata)}`
+      : '';
+    return [
+      `team · ${message.type}`,
+      `${message.from} → ${message.to}${meta}`,
+      '',
+      previewText(message.content, 320),
+    ].join('\n');
+  }
+
+  private formatTeamResult(
+    strategy: 'parallel' | 'sequential' | 'delegate',
+    task: string,
+    agents: TeamAgentRole[],
+    messages: TeamMessage[],
+    output: string,
+    success: boolean,
+    rounds: number,
+  ): string {
+    const recentMessages = messages
+      .slice(-6)
+      .map((message) => `- ${message.from} -> ${message.to} [${message.type}] ${previewText(message.content, 92)}`);
+
+    return [
+      '# Team Run',
+      '',
+      `status: ${success ? 'success' : 'incomplete'}`,
+      `strategy: ${strategy}`,
+      `rounds: ${rounds}`,
+      `task: ${task}`,
+      `agents: ${agents.map((agent) => `${agent.name}/${agent.model}`).join(', ')}`,
+      '',
+      '## Final Output',
+      output.trim() || 'No final output.',
+      '',
+      '## Recent Coordination',
+      ...(recentMessages.length > 0 ? recentMessages : ['- No coordination messages recorded.']),
     ].join('\n');
   }
 
@@ -1359,15 +2098,15 @@ export class NativeBridgeController {
     }
   }
 
-  private async compactContext(): Promise<void> {
-    const messages = buildCompactionMessages(this.state.messages);
+  private async compactContext(notice?: string, instructions?: string): Promise<void> {
+    const messages = buildCompactionMessages(this.state.messages, this.getCompactionBuildOptions());
     if (messages.length === 0) {
       this.appendSystemMessage('Nothing to compact.');
       return;
     }
 
     try {
-      const compacted = await this.compactionEngine.compact(messages);
+      const compacted = await this.compactionEngine.compact(messages, instructions);
       this.state.messages = [
         {
           id: randomUUID(),
@@ -1392,6 +2131,14 @@ export class NativeBridgeController {
           data: {
             summary: compacted,
           },
+        });
+      }
+      if (notice) {
+        this.state.messages.push({
+          id: randomUUID(),
+          role: 'system',
+          content: notice,
+          timestamp: Date.now(),
         });
       }
       this.scheduleStatePush();
@@ -1487,9 +2234,13 @@ export class NativeBridgeController {
     remoteSession: BridgeSessionState,
     nextPrompt: string,
   ): Promise<string> {
-    const compactionMessages = buildCompactionMessages(missingMessages);
+    const profile = this.getContextProfile(remoteSession.provider, remoteSession.lastModel);
+    const compactionMessages = buildCompactionMessages(
+      missingMessages,
+      this.getCompactionBuildOptions(remoteSession.provider),
+    );
     const delta =
-      missingMessages.length <= 4
+      missingMessages.length <= profile.hydrateInlineMessages
         ? compactionMessages.map((message) => `[${message.role}] ${message.content}`).join('\n')
         : await this.compactionEngine.compact(compactionMessages, 'Sync this provider session to ddudu canonical context.');
 

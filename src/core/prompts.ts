@@ -1,4 +1,4 @@
-import { readFile } from 'node:fs/promises';
+import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import { DEFAULT_ORCHESTRATOR_PROMPT, DEFAULT_SYSTEM_PROMPT } from './default-prompts.js';
@@ -23,6 +23,62 @@ const readOptionalFile = async (filePath: string): Promise<string> => {
   } catch {
     return '';
   }
+};
+
+const readOptionalDirectoryFiles = async (directoryPath: string): Promise<string[]> => {
+  try {
+    const entries = await readdir(directoryPath, { withFileTypes: true });
+    const files = entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+
+    const sections = await Promise.all(
+      files.map(async (fileName: string): Promise<string> => {
+        const filePath = resolve(directoryPath, fileName);
+        const content = await readOptionalFile(filePath);
+        if (!content) {
+          return '';
+        }
+
+        return `# Rule: ${fileName}\n${content}`;
+      }),
+    );
+
+    return sections.filter((section: string) => section.length > 0);
+  } catch {
+    return [];
+  }
+};
+
+const readLegacyInstructionFiles = async (context: PromptContext): Promise<string[]> => {
+  const provider = context.provider.trim().toLowerCase();
+  const providerFile =
+    provider === 'anthropic' || provider === 'claude'
+      ? 'CLAUDE.md'
+      : provider === 'openai' || provider === 'codex'
+        ? 'CODEX.md'
+        : provider === 'gemini' || provider === 'google'
+          ? 'GEMINI.md'
+          : null;
+
+  const candidates = [
+    ['AGENTS.md', resolve(context.cwd, 'AGENTS.md')],
+    ...(providerFile ? [[providerFile, resolve(context.cwd, providerFile)]] : []),
+  ] as const;
+
+  const sections = await Promise.all(
+    candidates.map(async ([label, filePath]): Promise<string> => {
+      const content = await readOptionalFile(filePath);
+      if (!content) {
+        return '';
+      }
+
+      return `# Imported: ${label}\n${content}`;
+    }),
+  );
+
+  return sections.filter((section: string) => section.length > 0);
 };
 
 const mergeSections = (sections: string[]): string => {
@@ -54,12 +110,22 @@ const interpolatePrompt = (template: string, variables: Record<string, string>):
 
 const loadInstructionText = async (context: PromptContext): Promise<string> => {
   const paths = getDduduPaths(context.cwd);
-  const [globalInstructions, projectInstructions] = await Promise.all([
+  const [globalInstructions, projectInstructions, legacyInstructions, globalRules, projectRules] = await Promise.all([
     readOptionalFile(paths.globalInstructions),
     readOptionalFile(paths.projectInstructions),
+    readLegacyInstructionFiles(context),
+    readOptionalDirectoryFiles(paths.globalRules),
+    readOptionalDirectoryFiles(paths.projectRules),
   ]);
 
-  return mergeSections([context.userInstructions, globalInstructions, projectInstructions]);
+  return mergeSections([
+    context.userInstructions,
+    globalInstructions,
+    projectInstructions,
+    ...legacyInstructions,
+    ...globalRules,
+    ...projectRules,
+  ]);
 };
 
 export const loadSystemPrompt = async (context: PromptContext): Promise<string> => {

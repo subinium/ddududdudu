@@ -1,7 +1,10 @@
+import type { NamedMode } from './types.js';
+
 export interface AgentRole {
   id: string;
   name: string;
   role: 'lead' | 'worker' | 'reviewer';
+  mode?: NamedMode;
   model: string;
   provider: string;
   systemPrompt: string;
@@ -23,6 +26,8 @@ export interface TeamConfig {
   strategy: 'parallel' | 'sequential' | 'delegate';
   maxRounds: number;
   sharedContext?: string;
+  runAgent?: (agent: AgentRole, input: string, round: number) => Promise<string>;
+  onMessage?: (message: TeamMessage) => void;
 }
 
 export interface TeamResult {
@@ -156,6 +161,7 @@ export class TeamOrchestrator {
 
   private routeMessage(msg: TeamMessage): void {
     this.messages.push(msg);
+    this.config.onMessage?.(msg);
 
     if (msg.to === 'broadcast') {
       for (const queue of this.messageQueues.values()) {
@@ -285,7 +291,11 @@ export class TeamOrchestrator {
     this.agentStates.set(workerId, 'working');
 
     const queue = this.messageQueues.get(workerId);
-    const assignedTask = queue?.shift();
+    const taskIndex = queue?.findIndex((message) => message.type === 'task') ?? -1;
+    const assignedTask =
+      queue && taskIndex >= 0
+        ? queue.splice(taskIndex, 1)[0]
+        : undefined;
     const taskContent = assignedTask?.content ?? this.buildWorkerSubtask(0, round, priorOutput);
 
     const workerOutput = await this.simulateAgentOutput(workerId, taskContent, round);
@@ -373,11 +383,14 @@ export class TeamOrchestrator {
 
   private async simulateAgentOutput(agentId: string, input: string, round: number): Promise<string> {
     this.ensureNotAborted();
-    await Promise.resolve();
 
     const agent = this.agentsById.get(agentId);
     if (agent === undefined) {
       throw new Error(`Unknown agent id: ${agentId}`);
+    }
+
+    if (this.config.runAgent) {
+      return this.config.runAgent(agent, input, round);
     }
 
     const roleLabel = agent.role.toUpperCase();

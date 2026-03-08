@@ -73,6 +73,7 @@ export interface AnthropicClientConfig {
 }
 
 const DEFAULT_MAX_TOKENS = 4096;
+const ANTHROPIC_1M_CONTEXT_BETA = 'context-1m-2025-08-07';
 
 const toError = (error: unknown, fallbackMessage: string): Error => {
   if (error instanceof Error) {
@@ -96,6 +97,15 @@ const toToolRecord = (tools: ApiToolDefinition[] | undefined): Record<string, Ai
   }
 
   return record;
+};
+
+const supportsAnthropic1MContext = (model: string, baseUrl: string): boolean => {
+  const normalizedModel = model.trim().toLowerCase();
+  if (!normalizedModel.startsWith('claude-sonnet-4')) {
+    return false;
+  }
+
+  return baseUrl.includes('api.anthropic.com');
 };
 
 const buildMessages = (messages: ApiMessage[]): ModelMessage[] => {
@@ -184,6 +194,9 @@ export class AnthropicClient {
         isOpenRouterAnthropicBaseUrl(this.config.baseUrl) || this.config.tokenType === 'oauth'
           ? this.config.token
           : undefined,
+      headers: supportsAnthropic1MContext(model, this.config.baseUrl)
+        ? { 'anthropic-beta': ANTHROPIC_1M_CONTEXT_BETA }
+        : undefined,
     });
 
     const aiTools = toToolRecord(tools);

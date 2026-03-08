@@ -92,6 +92,7 @@ ddudu init            # initialize .ddudu/ in current project
 ddudu doctor          # basic environment check
 ddudu config show     # print merged config
 ddudu session list    # list saved sessions
+ddudu session resume <id>  # reopen a saved local session in the native TUI
 ```
 
 ## TUI Shortcuts
@@ -119,6 +120,7 @@ Current native TUI commands:
 - `/config`
 - `/help`
 - `/doctor`
+- `/review`
 - `/fire`
 - `/init`
 - `/skill`
@@ -137,6 +139,8 @@ Typical setup:
 .ddudu/
 ├── config.yaml
 ├── DDUDU.md
+├── rules/
+├── prompts/
 └── sessions/
 ```
 

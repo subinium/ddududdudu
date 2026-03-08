@@ -6,7 +6,7 @@ export interface TokenUsage {
 }
 
 const MODEL_CONTEXT_LIMITS: { [model: string]: number } = {
-  'claude-sonnet-4-6': 200000,
+  'claude-sonnet-4-6': 1000000,
   'claude-opus-4-6': 200000,
   'claude-haiku-4-5': 200000,
   'claude-opus-4-5': 200000,
@@ -103,6 +103,10 @@ export class TokenCounter {
 
   public getContextLimit(): number {
     return MODEL_CONTEXT_LIMITS[this.model] ?? DEFAULT_CONTEXT_LIMIT;
+  }
+
+  public getContextLimitFor(model: string): number {
+    return MODEL_CONTEXT_LIMITS[model] ?? DEFAULT_CONTEXT_LIMIT;
   }
 
   public getUsagePercent(): number {

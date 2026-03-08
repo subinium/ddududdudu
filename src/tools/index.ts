@@ -1,3 +1,6 @@
+import type { DelegationRuntime } from '../core/delegation.js';
+import type { NamedMode } from '../core/types.js';
+
 export interface ToolParameter {
   type: 'string' | 'number' | 'boolean' | 'array' | 'object';
   description: string;
@@ -20,6 +23,9 @@ export interface ToolContext {
   askUser?: (question: string, options?: string[]) => Promise<string>;
   authToken?: string;
   authBaseUrl?: string;
+  delegation?: DelegationRuntime;
+  sessionId?: string;
+  currentMode?: NamedMode;
 }
 
 export interface ToolResult {

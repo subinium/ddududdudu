@@ -3,6 +3,7 @@ import { resolve } from 'node:path';
 
 import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
 import { AnthropicClient } from '../api/anthropic-client.js';
+import type { NamedMode } from '../core/types.js';
 import type { Tool } from './index.js';
 
 const DEFAULT_ORACLE_MODEL = 'claude-opus-4-5';
@@ -43,9 +44,15 @@ const buildFileContext = async (cwd: string, files: string[]): Promise<string> =
 export const oracleTool: Tool = {
   definition: {
     name: 'oracle',
-    description: 'Route a question to a stronger model with optional file context.',
+    description: 'Route a question to a stronger delegated mode with optional file context.',
     parameters: {
       question: { type: 'string', description: 'Question to ask the oracle.', required: true },
+      mode: {
+        type: 'string',
+        description: 'Optional explicit mode override for the oracle.',
+        enum: ['jennie', 'lisa', 'rosé', 'jisoo'],
+      },
+      model: { type: 'string', description: 'Optional model override.' },
       files: {
         type: 'array',
         description: 'Optional file paths to include as context.',
@@ -74,6 +81,46 @@ export const oracleTool: Tool = {
     const question = fileContext
       ? `Question:\n${args.question}\n\nContext files:\n${fileContext}`
       : args.question;
+
+    const preferredMode =
+      typeof args.mode === 'string' &&
+      ['jennie', 'lisa', 'rosé', 'jisoo'].includes(args.mode)
+        ? (args.mode as NamedMode)
+        : undefined;
+    const preferredModel =
+      typeof args.model === 'string' && args.model.trim().length > 0 ? args.model : undefined;
+
+    if (ctx.delegation) {
+      const result = await ctx.delegation.run(
+        {
+          prompt: question,
+          purpose: 'oracle',
+          preferredMode,
+          preferredModel,
+          parentSessionId: ctx.sessionId,
+        },
+        {
+          onText: (text: string) => {
+            ctx.onProgress?.(text);
+          },
+          signal: ctx.abortSignal,
+        },
+      );
+
+      return {
+        output: result.text,
+        metadata: {
+          mode: result.mode,
+          provider: result.provider,
+          model: result.model,
+          files,
+          usage: result.usage,
+          localSessionId: result.localSessionId,
+          remoteSessionId: result.remoteSessionId,
+          durationMs: result.durationMs,
+        },
+      };
+    }
 
     const client = new AnthropicClient({
       token,
