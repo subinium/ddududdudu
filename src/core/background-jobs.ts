@@ -10,6 +10,7 @@ import type { WorkflowArtifact } from './workflow-state.js';
 
 export type BackgroundJobKind = 'delegate' | 'team';
 export type BackgroundJobStatus = 'queued' | 'running' | 'done' | 'error';
+export type BackgroundJobChecklistStatus = 'pending' | 'in_progress' | 'completed' | 'error';
 
 export interface BackgroundJobAgentActivity {
   id: string;
@@ -19,6 +20,15 @@ export interface BackgroundJobAgentActivity {
   status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
   detail: string | null;
   workspacePath: string | null;
+  updatedAt: number;
+}
+
+export interface BackgroundJobChecklistItem {
+  id: string;
+  label: string;
+  owner: string | null;
+  status: BackgroundJobChecklistStatus;
+  detail: string | null;
   updatedAt: number;
 }
 
@@ -66,6 +76,7 @@ export interface BackgroundJobRecord {
   artifacts?: WorkflowArtifact[];
   teamAgents?: AgentRole[];
   teamSharedContext?: string | null;
+  checklist: BackgroundJobChecklistItem[];
   agentActivities: BackgroundJobAgentActivity[];
   result: BackgroundJobResult | null;
   artifact: WorkflowArtifact | null;
@@ -84,6 +95,8 @@ const isNamedMode = (value: unknown): value is NamedMode =>
 
 const isAgentStatus = (value: unknown): value is BackgroundJobAgentActivity['status'] =>
   value === 'queued' || value === 'running' || value === 'verifying' || value === 'done' || value === 'error';
+const isChecklistStatus = (value: unknown): value is BackgroundJobChecklistStatus =>
+  value === 'pending' || value === 'in_progress' || value === 'completed' || value === 'error';
 
 const parseJob = (raw: string): BackgroundJobRecord | null => {
   const parsed = JSON.parse(raw) as unknown;
@@ -112,6 +125,19 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
           status: isAgentStatus(item.status) ? item.status : 'running',
           detail: typeof item.detail === 'string' ? item.detail : null,
           workspacePath: typeof item.workspacePath === 'string' ? item.workspacePath : null,
+          updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
+        }))
+    : [];
+
+  const checklist = Array.isArray(parsed.checklist)
+    ? parsed.checklist
+        .filter((item): item is Record<string, unknown> => isRecord(item))
+        .map((item) => ({
+          id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
+          label: typeof item.label === 'string' ? item.label : 'step',
+          owner: typeof item.owner === 'string' ? item.owner : null,
+          status: isChecklistStatus(item.status) ? item.status : 'pending',
+          detail: typeof item.detail === 'string' ? item.detail : null,
           updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
         }))
     : [];
@@ -159,6 +185,7 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
     artifacts: Array.isArray(parsed.artifacts) ? (parsed.artifacts as WorkflowArtifact[]) : [],
     teamAgents: Array.isArray(parsed.teamAgents) ? (parsed.teamAgents as AgentRole[]) : [],
     teamSharedContext: typeof parsed.teamSharedContext === 'string' ? parsed.teamSharedContext : null,
+    checklist,
     agentActivities,
     result: isRecord(parsed.result) ? (parsed.result as unknown as BackgroundJobResult) : null,
     artifact: isRecord(parsed.artifact) ? (parsed.artifact as unknown as WorkflowArtifact) : null,

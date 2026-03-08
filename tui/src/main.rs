@@ -5,6 +5,8 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use crossterm::execute;
 use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
@@ -13,7 +15,7 @@ use crossterm::event::{
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
@@ -26,8 +28,11 @@ const ACCENT_DIM: Color = Color::Rgb(190, 120, 140);
 const SUCCESS: Color = Color::Rgb(80, 220, 120);
 const ERROR: Color = Color::Rgb(255, 90, 110);
 const MUTED: Color = Color::Rgb(128, 96, 108);
+const TOOL_MUTED: Color = Color::Rgb(144, 140, 146);
+const TOOL_RUNNING: Color = Color::Rgb(166, 160, 168);
 const LINK: Color = Color::Rgb(132, 203, 255);
 const PATH: Color = Color::Rgb(255, 208, 120);
+const PANEL_TOP_PADDING: u16 = 2;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
 const SPLASH_FULL: &[&str] = &[
@@ -177,6 +182,19 @@ struct NativeBackgroundJobState {
     result_preview: Option<String>,
     workspace_path: Option<String>,
     prompt_preview: Option<String>,
+    checklist: Vec<NativeJobChecklistItem>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeJobChecklistItem {
+    id: String,
+    label: String,
+    owner: Option<String>,
+    status: String,
+    detail: Option<String>,
+    updated_at: u64,
 }
 
 #[allow(dead_code)]
@@ -245,6 +263,7 @@ struct NativeTuiState {
     context_percent: f64,
     context_tokens: u64,
     context_limit: u64,
+    context_preview: Option<String>,
     request_estimate: Option<NativeRequestEstimateState>,
     queued_prompts: Vec<String>,
     providers: Vec<NativeProviderState>,
@@ -302,9 +321,98 @@ struct Suggestion {
     description: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarTab {
+    Jobs,
+    Plan,
+    Context,
+    Systems,
+}
+
+impl SidebarTab {
+    fn all() -> [Self; 4] {
+        [Self::Jobs, Self::Plan, Self::Context, Self::Systems]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Jobs => "Jobs",
+            Self::Plan => "Plan",
+            Self::Context => "Context",
+            Self::Systems => "Systems",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum SidebarTarget {
+    Agent(usize),
+    Job(usize),
+    Queue(usize),
+    Plan(usize),
+    ContextOverview,
+    ContextEstimate,
+    ContextPreview,
+    ContextDiff,
+    McpSummary,
+    LspSummary,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NoticeTone {
+    Info,
+    Success,
+    Error,
+}
+
 struct TransientNotice {
     text: String,
+    tone: NoticeTone,
     created_at: Instant,
+}
+
+struct PaletteState {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Clone)]
+enum PaletteAction {
+    InsertSlash(String),
+    SwitchTab(SidebarTab),
+    OpenTarget(SidebarTarget),
+    OpenContext,
+    OpenDiff(Option<String>),
+}
+
+#[derive(Clone)]
+struct PaletteItem {
+    label: String,
+    description: String,
+    action: PaletteAction,
+}
+
+#[derive(Clone)]
+enum InspectorKind {
+    Agent(usize),
+    Job(String),
+    Queue(usize),
+    Plan(usize),
+    Context,
+    McpSummary,
+    McpServer(usize),
+    LspSummary,
+    LspServer(usize),
+    Tool(usize, usize),
+    Diff { title: String, cwd: Option<String> },
+}
+
+struct InspectorState {
+    title: String,
+    body: Vec<String>,
+    footer: Option<String>,
+    scroll: usize,
+    kind: InspectorKind,
 }
 
 #[derive(Debug, Default)]
@@ -428,8 +536,21 @@ impl BridgeClient {
                             continue;
                         };
 
-                        serde_json::from_str::<BridgeEvent>(payload)
-                            .map_err(|error| anyhow!("failed to parse bridge event: {error}"))
+                        (|| -> Result<BridgeEvent> {
+                            let decoded = if payload.starts_with('{') {
+                                payload.to_owned()
+                            } else {
+                                let bytes = BASE64_STANDARD
+                                    .decode(payload)
+                                    .map_err(|error| anyhow!("failed to decode bridge event: {error}"))?;
+                                String::from_utf8(bytes).map_err(|error| {
+                                    anyhow!("failed to decode bridge event utf8: {error}")
+                                })?
+                            };
+
+                            serde_json::from_str::<BridgeEvent>(&decoded)
+                                .map_err(|error| anyhow!("failed to parse bridge event: {error}"))
+                        })()
                     }
                     Err(error) => Err(anyhow!("failed to read bridge event: {error}")),
                 };
@@ -473,12 +594,20 @@ struct App {
     scroll: usize,
     auto_scroll: bool,
     spinner_index: usize,
+    splash_phase: usize,
     selected_suggestion: usize,
     ask_user_selection: usize,
+    sidebar_tab: SidebarTab,
+    sidebar_selection: usize,
+    palette: Option<PaletteState>,
+    inspector: Option<InspectorState>,
+    fold_tool_calls: bool,
+    fold_system_messages: bool,
+    pending_paste: Option<String>,
     fatal_error: Option<String>,
     last_tick: Instant,
     should_quit: bool,
-    notice: Option<TransientNotice>,
+    notices: Vec<TransientNotice>,
 }
 
 impl App {
@@ -504,6 +633,7 @@ impl App {
                 context_percent: 0.0,
                 context_tokens: 0,
                 context_limit: 0,
+                context_preview: None,
                 request_estimate: None,
                 queued_prompts: Vec::new(),
                 providers: Vec::new(),
@@ -530,12 +660,20 @@ impl App {
             scroll: 0,
             auto_scroll: true,
             spinner_index: 0,
+            splash_phase: 0,
             selected_suggestion: 0,
             ask_user_selection: 0,
+            sidebar_tab: SidebarTab::Jobs,
+            sidebar_selection: 0,
+            palette: None,
+            inspector: None,
+            fold_tool_calls: false,
+            fold_system_messages: false,
+            pending_paste: None,
             fatal_error: None,
             last_tick: Instant::now(),
             should_quit: false,
-            notice: None,
+            notices: Vec::new(),
         }
     }
 
@@ -546,6 +684,13 @@ impl App {
                 let previous_mode = self.state.mode.clone();
                 let previous_model = self.state.model.clone();
                 let previous_provider = self.state.provider.clone();
+                let previous_jobs = self
+                    .state
+                    .background_jobs
+                    .iter()
+                    .map(|job| (job.id.clone(), job.status.clone()))
+                    .collect::<std::collections::HashMap<_, _>>();
+                let previous_verification = self.state.verification.as_ref().map(|item| item.status.clone());
                 self.state = state;
 
                 if !was_asking && self.state.ask_user.is_some() {
@@ -558,30 +703,78 @@ impl App {
                         || self.state.model != previous_model
                         || self.state.provider != previous_provider)
                 {
-                    let mode_label = self
-                        .state
-                        .modes
-                        .iter()
-                        .find(|mode| mode.active)
-                        .map(|mode| mode.label.clone())
-                        .unwrap_or_else(|| self.state.mode.to_uppercase());
-                    self.notice = Some(TransientNotice {
-                        text: format!(
-                            "{} · {} · {}",
-                            mode_label, self.state.provider, self.state.model
-                        ),
-                        created_at: Instant::now(),
-                    });
+                    let mode_label = self.current_mode_label();
+                    self.push_notice(
+                        format!("{} · {} · {}", mode_label, self.state.provider, self.state.model),
+                        NoticeTone::Info,
+                    );
+                }
+
+                let mut pending_notices: Vec<(String, NoticeTone)> = Vec::new();
+                for job in &self.state.background_jobs {
+                    let previous = previous_jobs.get(&job.id);
+                    if matches!(previous.map(|value| value.as_str()), Some("running"))
+                        && job.status == "done"
+                    {
+                        pending_notices.push((format!("{} finished", job.label), NoticeTone::Success));
+                    } else if matches!(previous.map(|value| value.as_str()), Some("running" | "done"))
+                        && job.status == "error"
+                    {
+                        pending_notices.push((format!("{} failed", job.label), NoticeTone::Error));
+                    }
+                }
+                for (text, tone) in pending_notices {
+                    self.push_notice(text, tone);
+                }
+
+                let current_verification = self.state.verification.as_ref().map(|item| item.status.clone());
+                if previous_verification.as_deref() != current_verification.as_deref() {
+                    if let Some(status) = current_verification.as_deref() {
+                        match status {
+                            "passed" => self.push_notice("verification passed".to_string(), NoticeTone::Success),
+                            "failed" => self.push_notice("verification failed".to_string(), NoticeTone::Error),
+                            _ => {}
+                        }
+                    }
                 }
 
                 if self.auto_scroll {
                     self.scroll = usize::MAX;
                 }
+                self.prune_notices();
+                self.clamp_sidebar_selection();
+                self.refresh_open_inspector();
             }
             BridgeEvent::Fatal { message } => {
                 self.fatal_error = Some(message);
             }
         }
+    }
+
+    fn current_mode_label(&self) -> String {
+        self.state
+            .modes
+            .iter()
+            .find(|mode| mode.active)
+            .map(|mode| mode.label.clone())
+            .unwrap_or_else(|| self.state.mode.to_uppercase())
+    }
+
+    fn push_notice(&mut self, text: String, tone: NoticeTone) {
+        self.notices.push(TransientNotice {
+            text,
+            tone,
+            created_at: Instant::now(),
+        });
+        if self.notices.len() > 4 {
+            let overflow = self.notices.len().saturating_sub(4);
+            self.notices.drain(0..overflow);
+        }
+    }
+
+    fn prune_notices(&mut self) {
+        self.notices
+            .retain(|notice| notice.created_at.elapsed() <= Duration::from_secs(4));
     }
 
     fn sync_bridge(&mut self) {
@@ -599,14 +792,7 @@ impl App {
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             self.sync_bridge();
-            if self
-                .notice
-                .as_ref()
-                .map(|notice| notice.created_at.elapsed() > Duration::from_secs(3))
-                .unwrap_or(false)
-            {
-                self.notice = None;
-            }
+            self.prune_notices();
             terminal.draw(|frame| self.render(frame))?;
 
             let timeout = Duration::from_millis(50);
@@ -617,6 +803,7 @@ impl App {
 
             if self.last_tick.elapsed() >= Duration::from_millis(90) {
                 self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
+                self.splash_phase = self.splash_phase.wrapping_add(1);
                 self.last_tick = Instant::now();
             }
         }
@@ -663,11 +850,16 @@ impl App {
 
         if let Some((popup_area, suggestions)) = self.render_popup(frame, chunks[1]) {
             frame.render_widget(Clear, popup_area);
+            let selected_index = self
+                .palette
+                .as_ref()
+                .map(|palette| palette.selected)
+                .unwrap_or(self.selected_suggestion);
             let lines: Vec<Line> = suggestions
                 .iter()
                 .enumerate()
                 .map(|(index, suggestion)| {
-                    let selected = index == self.selected_suggestion;
+                    let selected = index == selected_index;
                     let marker = if selected { "› " } else { "  " };
                     let style = if selected {
                         Style::default()
@@ -693,6 +885,12 @@ impl App {
             frame.render_widget(block, popup_area);
         }
 
+        self.render_notices(frame);
+
+        if let Some(inspector) = &self.inspector {
+            self.render_inspector(frame, inspector);
+        }
+
         if let Some(error) = &self.fatal_error {
             let area = centered_rect(70, 5, frame.area());
             frame.render_widget(Clear, area);
@@ -710,7 +908,9 @@ impl App {
             );
         }
 
-        frame.set_cursor_position((composer_metrics.0, composer_metrics.1));
+        if self.palette.is_none() && self.inspector.is_none() && self.fatal_error.is_none() {
+            frame.set_cursor_position((composer_metrics.0, composer_metrics.1));
+        }
     }
     fn draw_sidebar_divider(&self, frame: &mut Frame, x: u16, area: Rect) {
         for row in area.top()..area.bottom() {
@@ -721,8 +921,14 @@ impl App {
     }
 
     fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
+        let area = top_padded_rect(area, PANEL_TOP_PADDING);
         let available_width = area.width.saturating_sub(1) as usize;
-        let lines = build_transcript_lines(&self.state.messages, available_width);
+        let lines = build_transcript_lines(
+            &self.state.messages,
+            available_width,
+            self.fold_tool_calls,
+            self.fold_system_messages,
+        );
         let height = area.height as usize;
         let max_scroll = lines.len().saturating_sub(height);
 
@@ -733,7 +939,7 @@ impl App {
         }
 
         let visible = if lines.is_empty() {
-            build_welcome_lines(available_width)
+            build_welcome_lines(available_width, self.splash_phase)
         } else {
             lines
                 .iter()
@@ -751,27 +957,312 @@ impl App {
         );
     }
 
-    fn render_sidebar(&self, frame: &mut Frame, area: Rect) {
-        let inner = Rect {
+    fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
+        let inner = top_padded_rect(
+            Rect {
             x: area.x + 2,
             y: area.y,
             width: area.width.saturating_sub(2),
             height: area.height,
-        };
+            },
+            PANEL_TOP_PADDING,
+        );
 
         let mut lines = Vec::new();
-        lines.push(sidebar_header("Context"));
         push_sidebar_rail_item(
             &mut lines,
             "·",
             ACCENT_DIM,
             format!("ddudu v{}", self.state.version),
-            None,
+            Some(if self.state.permission_profile == "permissionless" {
+                "fire on (permissionless)".to_string()
+            } else {
+                format!("fire off ({})", self.state.permission_profile)
+            }),
             FG,
             ACCENT_DIM,
         );
-        push_sidebar_rail_item(
-            &mut lines,
+        lines.push(Line::from(Span::raw("")));
+        let mut item_index = 0usize;
+        self.render_sidebar_jobs_tab(&mut lines, &mut item_index);
+        lines.push(Line::from(Span::raw("")));
+        self.render_sidebar_plan_tab(&mut lines, &mut item_index);
+        lines.push(Line::from(Span::raw("")));
+        self.render_sidebar_context_tab(&mut lines, &mut item_index);
+        lines.push(Line::from(Span::raw("")));
+        self.render_sidebar_systems_tab(&mut lines, &mut item_index);
+
+        frame.render_widget(
+            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+            inner,
+        );
+    }
+
+    fn render_sidebar_jobs_tab(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        item_index: &mut usize,
+    ) {
+        lines.push(sidebar_header("Activity"));
+        let mut has_activity = false;
+        if self.state.loading {
+            has_activity = true;
+            push_sidebar_rail_item(
+                lines,
+                SPINNER_FRAMES[self.spinner_index],
+                ACCENT,
+                "foreground request".to_string(),
+                Some(preview_line(&self.state.loading_label, 28)),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        if !self.state.agent_activities.is_empty() {
+            has_activity = true;
+        }
+        for (index, item) in self.state.agent_activities.iter().enumerate().take(4) {
+            let (marker, color) = match item.status.as_str() {
+                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                "verifying" => ("◌", ACCENT),
+                "done" => ("✓", SUCCESS),
+                "error" => ("!", ERROR),
+                "queued" => ("•", ACCENT_DIM),
+                _ => ("·", ACCENT_DIM),
+            };
+            let title = match (&item.mode, &item.purpose) {
+                (Some(mode), Some(purpose)) => format!("{} · {}", title_case_label(mode), purpose),
+                (Some(mode), None) => title_case_label(mode),
+                (None, Some(purpose)) => format!("{} · {}", item.label, purpose),
+                (None, None) => item.label.clone(),
+            };
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                marker,
+                color,
+                preview_line(&title, 28),
+                item.detail
+                    .as_ref()
+                    .map(|detail| preview_line(detail, 28))
+                    .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 28))),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
+            if index >= 3 {
+                break;
+            }
+        }
+
+        if !self.state.background_jobs.is_empty() {
+            has_activity = true;
+        }
+        for job in self.state.background_jobs.iter().take(4) {
+            let (marker, color) = match job.status.as_str() {
+                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                "done" => ("✓", SUCCESS),
+                "error" => ("!", ERROR),
+                _ => ("·", ACCENT_DIM),
+            };
+            let elapsed = format_elapsed(Some(job.started_at));
+            let retry = job
+                .attempt
+                .filter(|attempt| *attempt > 0)
+                .map(|attempt| format!(" · retry {}", format_count(attempt)));
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                marker,
+                color,
+                format!(
+                    "{}{} {elapsed}",
+                    preview_line(&job.label, 18),
+                    retry.as_deref().unwrap_or("")
+                ),
+                checklist_progress(&job.checklist)
+                    .or_else(|| job.detail.clone())
+                    .map(|detail| preview_line(&detail, 28))
+                    .or_else(|| job.detail
+                        .as_ref()
+                        .map(|detail| preview_line(detail, 28)))
+                    .or_else(|| job.result_preview.as_ref().map(|detail| preview_line(detail, 28)))
+                    .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28))),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
+        }
+
+        if !self.state.queued_prompts.is_empty() {
+            has_activity = true;
+        }
+        for (index, prompt) in self.state.queued_prompts.iter().enumerate().take(4) {
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                "•",
+                ACCENT_DIM,
+                format!("{}. {}", index + 1, preview_line(prompt, 24)),
+                Some("queued prompt".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
+        }
+
+        if !has_activity {
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "quiet".to_string(),
+                Some(if self.state.loading {
+                    "foreground request still running".to_string()
+                } else {
+                    "idle".to_string()
+                }),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+    }
+
+    fn render_sidebar_plan_tab(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        item_index: &mut usize,
+    ) {
+        lines.push(sidebar_header("Workflow"));
+        if let Some(workspace) = &self.state.workspace {
+            push_sidebar_rail_item(
+                lines,
+                "▣",
+                ACCENT,
+                preview_line(&workspace.label, 28),
+                Some(preview_line(&workspace.path, 28)),
+                FG,
+                ACCENT_DIM,
+            );
+        } else {
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "root workspace".to_string(),
+                Some(preview_line(&self.state.cwd, 28)),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        if let Some(verification) = &self.state.verification {
+            let (marker, color) = match verification.status.as_str() {
+                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                "passed" => ("✓", SUCCESS),
+                "failed" => ("!", ERROR),
+                _ => ("·", ACCENT_DIM),
+            };
+            push_sidebar_rail_item(
+                lines,
+                marker,
+                color,
+                format!("verify {}", verification.status),
+                verification
+                    .summary
+                    .as_ref()
+                    .map(|summary| preview_line(summary, 28))
+                    .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 28))),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        if self.state.todos.is_empty() {
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "no active plan".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
+            return;
+        }
+        for (index, item) in self.state.todos.iter().enumerate().take(10) {
+            let (marker, color) = match item.status.as_str() {
+                "completed" => ("✓", SUCCESS),
+                "in_progress" => ("→", ACCENT),
+                _ => ("·", ACCENT_DIM),
+            };
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                marker,
+                color,
+                preview_line(&item.step, 28),
+                item.owner
+                    .as_ref()
+                    .map(|owner| format!("{} · {}", owner, preview_line(&item.id, 8)))
+                    .or_else(|| Some(preview_line(&item.id, 8))),
+                FG,
+                ACCENT_DIM,
+            );
+            let _ = index;
+            *item_index += 1;
+        }
+
+        if let Some(active_job) = self
+            .state
+            .background_jobs
+            .iter()
+            .find(|job| job.status == "running" && !job.checklist.is_empty())
+            .or_else(|| self.state.background_jobs.iter().find(|job| !job.checklist.is_empty()))
+        {
+            lines.push(Line::from(Span::raw("")));
+            lines.push(sidebar_header("Task Progress"));
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                preview_line(&active_job.label, 28),
+                checklist_progress(&active_job.checklist),
+                FG,
+                ACCENT_DIM,
+            );
+
+            for item in active_job.checklist.iter().take(5) {
+                let (marker, color) = match item.status.as_str() {
+                    "completed" => ("✓", SUCCESS),
+                    "in_progress" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                    "error" => ("!", ERROR),
+                    _ => ("·", ACCENT_DIM),
+                };
+                let title = if let Some(owner) = &item.owner {
+                    format!("{} · {}", item.label, preview_line(owner, 10))
+                } else {
+                    item.label.clone()
+                };
+                push_sidebar_rail_item(
+                    lines,
+                    marker,
+                    color,
+                    preview_line(&title, 28),
+                    item.detail.as_ref().map(|detail| preview_line(detail, 28)),
+                    FG,
+                    ACCENT_DIM,
+                );
+            }
+        }
+    }
+
+    fn render_sidebar_context_tab(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        item_index: &mut usize,
+    ) {
+        lines.push(sidebar_header("Context"));
+        push_sidebar_selectable_item(
+            lines,
+            *item_index == self.sidebar_selection,
             "◉",
             ACCENT,
             format!("{:>5.1}% footprint", self.state.context_percent * 100.0),
@@ -784,445 +1275,116 @@ impl App {
             FG,
             ACCENT_DIM,
         );
+        *item_index += 1;
         push_sidebar_rail_item(
-            &mut lines,
-            if self.state.permission_profile == "permissionless" { "✦" } else { "·" },
-            if self.state.permission_profile == "permissionless" {
-                ERROR
-            } else {
-                ACCENT_DIM
-            },
-            if self.state.permission_profile == "permissionless" {
-                "fire on (permissionless)".to_string()
-            } else {
-                format!("fire off ({})", self.state.permission_profile)
-            },
-            None,
+            lines,
+            "·",
+            ACCENT_DIM,
+            format!("{} · {}", self.current_mode_label(), display_model_name(&self.state.model)),
+            Some(preview_line(&self.state.provider, 28)),
             FG,
             ACCENT_DIM,
         );
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(sidebar_header("Workspace"));
-        if let Some(workspace) = &self.state.workspace {
-            push_sidebar_rail_item(
-                &mut lines,
-                "▣",
+        if let Some(estimate) = &self.state.request_estimate {
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                "→",
                 ACCENT,
-                preview_line(&workspace.label, 28),
-                Some(preview_line(&workspace.path, 30)),
-                FG,
-                ACCENT_DIM,
-            );
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                workspace.kind.clone(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        } else {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "root workspace".to_string(),
-                Some(preview_line(&self.state.cwd, 30)),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        if let Some(verification) = &self.state.verification {
-            let color = match verification.status.as_str() {
-                "passed" => SUCCESS,
-                "failed" => ERROR,
-                "running" => ACCENT,
-                _ => ACCENT_DIM,
-            };
-            push_sidebar_rail_item(
-                &mut lines,
-                if verification.status == "running" {
-                    SPINNER_FRAMES[self.spinner_index]
-                } else if verification.status == "passed" {
-                    "✓"
-                } else if verification.status == "failed" {
-                    "!"
-                } else {
-                    "·"
-                },
-                color,
-                format!("verify {}", verification.status),
-                verification
-                    .summary
-                    .as_ref()
-                    .map(|summary| preview_line(summary, 30))
-                    .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 30))),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(sidebar_header("Plan"));
-        if self.state.todos.is_empty() {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "no active plan".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        } else {
-            for item in self.state.todos.iter().take(6) {
-                let (marker, color) = match item.status.as_str() {
-                    "completed" => ("✓", SUCCESS),
-                    "in_progress" => ("→", ACCENT),
-                    _ => ("·", ACCENT_DIM),
-                };
-                let detail = item
-                    .owner
-                    .as_ref()
-                    .map(|owner| format!("{} · {}", owner, preview_line(&item.id, 6)))
-                    .or_else(|| Some(preview_line(&item.id, 6)));
-                push_sidebar_rail_item(
-                    &mut lines,
-                    marker,
-                    color,
-                    preview_line(&item.step, 28),
-                    detail,
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-        }
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(sidebar_header("Subagents"));
-        let queued_count = self
-            .state
-            .agent_activities
-            .iter()
-            .filter(|item| item.status == "queued")
-            .count();
-        let running_count = self
-            .state
-            .agent_activities
-            .iter()
-            .filter(|item| item.status == "running" || item.status == "verifying")
-            .count();
-        let done_count = self
-            .state
-            .agent_activities
-            .iter()
-            .filter(|item| item.status == "done")
-            .count();
-        if let Some(strategy) = &self.state.team_run_strategy {
-            let elapsed = format_elapsed(self.state.team_run_since);
-            let counts = format!(
-                "{} running · {} queued · {} done",
-                format_count(running_count as u64),
-                format_count(queued_count as u64),
-                format_count(done_count as u64)
-            );
-            push_sidebar_rail_item(
-                &mut lines,
-                if running_count > 0 {
-                    SPINNER_FRAMES[self.spinner_index]
-                } else {
-                    "◎"
-                },
-                if running_count > 0 { ACCENT } else { SUCCESS },
-                format!("{} {elapsed}", strategy),
-                self.state
-                    .team_run_task
-                    .as_ref()
-                    .map(|task| format!("{} · {}", counts, preview_line(task, 20)))
-                    .or_else(|| Some(counts)),
-                FG,
-                ACCENT_DIM,
-            );
-        } else if !self.state.agent_activities.is_empty() {
-            push_sidebar_rail_item(
-                &mut lines,
-                if running_count > 0 {
-                    SPINNER_FRAMES[self.spinner_index]
-                } else {
-                    "◎"
-                },
-                if running_count > 0 { ACCENT } else { ACCENT_DIM },
-                "delegated runs".to_string(),
+                format!("{} request", estimate.mode),
                 Some(format!(
-                    "{} running · {} queued",
-                    format_count(running_count as u64),
-                    format_count(queued_count as u64)
+                    "system {} · history {} · tools {} · prompt {}",
+                    format_count(estimate.system),
+                    format_count(estimate.history),
+                    format_count(estimate.tools),
+                    format_count(estimate.prompt)
                 )),
                 FG,
                 ACCENT_DIM,
             );
+            *item_index += 1;
         }
-        if self.state.agent_activities.is_empty() {
+
+        if let Some(preview) = &self.state.context_preview {
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                "≡",
+                ACCENT_DIM,
+                "context preview".to_string(),
+                Some(preview_line(preview, 28)),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
+        }
+
+        push_sidebar_selectable_item(
+            lines,
+            *item_index == self.sidebar_selection,
+            "∆",
+            ACCENT_DIM,
+            "open diff viewer".to_string(),
+            Some("current workspace".to_string()),
+            FG,
+            ACCENT_DIM,
+        );
+        *item_index += 1;
+    }
+
+    fn render_sidebar_systems_tab(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        item_index: &mut usize,
+    ) {
+        lines.push(sidebar_header("Systems"));
+        if let Some(mcp) = &self.state.mcp {
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                if mcp.connected_servers > 0 { "◎" } else { "○" },
+                if mcp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                format!(
+                    "{} / {} connected",
+                    format_count(mcp.connected_servers),
+                    format_count(mcp.configured_servers)
+                ),
+                Some(format!("{} tools", format_count(mcp.tool_count))),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
+        } else {
             push_sidebar_rail_item(
-                &mut lines,
+                lines,
                 "·",
                 ACCENT_DIM,
-                "no active subagents".to_string(),
+                "no mcp servers".to_string(),
                 None,
                 FG,
                 ACCENT_DIM,
             );
-        } else {
-            for item in self.state.agent_activities.iter().take(6) {
-                let (marker, color) = match item.status.as_str() {
-                    "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
-                    "verifying" => ("◌", ACCENT),
-                    "done" => ("✓", SUCCESS),
-                    "error" => ("!", ERROR),
-                    "queued" => ("•", ACCENT_DIM),
-                    _ => ("·", ACCENT_DIM),
-                };
-                let title = match (&item.mode, &item.purpose) {
-                    (Some(mode), Some(purpose)) => format!("agent {} · {}", title_case_label(mode), purpose),
-                    (Some(mode), None) => title_case_label(mode),
-                    (None, Some(purpose)) => format!("agent {} · {}", item.label, purpose),
-                    (None, None) => format!("agent {}", item.label),
-                };
-                let detail = item
-                    .detail
-                    .as_ref()
-                    .map(|detail| preview_line(detail, 26))
-                    .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 26)));
-                push_sidebar_rail_item(
-                    &mut lines,
-                    marker,
-                    color,
-                    preview_line(&title, 28),
-                    detail,
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-        }
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(sidebar_header("Background"));
-        let running_jobs = self
-            .state
-            .background_jobs
-            .iter()
-            .filter(|job| job.status == "running")
-            .count();
-        let done_jobs = self
-            .state
-            .background_jobs
-            .iter()
-            .filter(|job| job.status == "done")
-            .count();
-        let error_jobs = self
-            .state
-            .background_jobs
-            .iter()
-            .filter(|job| job.status == "error")
-            .count();
-        if !self.state.background_jobs.is_empty() || !self.state.queued_prompts.is_empty() {
-            push_sidebar_rail_item(
-                &mut lines,
-                if running_jobs > 0 {
-                    SPINNER_FRAMES[self.spinner_index]
-                } else {
-                    "·"
-                },
-                if running_jobs > 0 { ACCENT } else { ACCENT_DIM },
-                format!(
-                    "{} running · {} done · {} error",
-                    format_count(running_jobs as u64),
-                    format_count(done_jobs as u64),
-                    format_count(error_jobs as u64)
-                ),
-                Some(format!("{} queued", format_count(self.state.queued_prompts.len() as u64))),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        for job in self.state.background_jobs.iter().take(4) {
-            let (marker, color) = match job.status.as_str() {
-                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
-                "done" => ("✓", SUCCESS),
-                "error" => ("!", ERROR),
-                _ => ("·", ACCENT_DIM),
-            };
-            let elapsed = format_elapsed(Some(job.started_at));
-            let attempt = job
-                .attempt
-                .filter(|attempt| *attempt > 0)
-                .map(|attempt| format!(" · retry {}", format_count(attempt)));
-            push_sidebar_rail_item(
-                &mut lines,
-                marker,
-                color,
-                format!(
-                    "{}{} {elapsed}",
-                    preview_line(&job.label, 18),
-                    attempt.as_deref().unwrap_or("")
-                ),
-                match job.status.as_str() {
-                    "done" => job
-                        .result_preview
-                        .as_ref()
-                        .map(|detail| preview_line(detail, 28))
-                        .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28)))
-                        .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28))),
-                    _ => job
-                        .detail
-                        .as_ref()
-                        .map(|detail| preview_line(detail, 28))
-                        .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28)))
-                        .or_else(|| {
-                            let note = [
-                                job.purpose.as_ref().map(|value| value.as_str()),
-                                job.strategy.as_ref().map(|value| value.as_str()),
-                                job.preferred_mode.as_ref().map(|value| value.as_str()),
-                                job.prompt_preview.as_ref().map(|value| value.as_str()),
-                            ]
-                            .into_iter()
-                            .flatten()
-                            .next();
-                            note.map(|value| preview_line(value, 28))
-                        })
-                        .or_else(|| Some(job.kind.clone())),
-                },
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        for (index, prompt) in self.state.queued_prompts.iter().take(6).enumerate() {
-            push_sidebar_rail_item(
-                &mut lines,
-                "•",
-                ACCENT_DIM,
-                format!("{}. {}", index + 1, preview_line(prompt, 22)),
-                Some("queued".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        if self.state.background_jobs.is_empty() && self.state.queued_prompts.is_empty() {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                if self.state.loading {
-                    "foreground active".to_string()
-                } else {
-                    "idle".to_string()
-                },
-                Some(if self.state.loading {
-                    if self.state.loading_label.is_empty() {
-                        "request running".to_string()
-                    } else {
-                        preview_line(&self.state.loading_label, 28)
-                    }
-                } else {
-                    "no background work".to_string()
-                }),
-                FG,
-                ACCENT_DIM,
-            );
         }
 
-        lines.push(Line::from(Span::raw("")));
-        lines.push(sidebar_header("MCP"));
-        if let Some(mcp) = &self.state.mcp {
-            if mcp.configured_servers == 0 {
-                push_sidebar_rail_item(
-                    &mut lines,
-                    "·",
-                    ACCENT_DIM,
-                    "no mcp servers".to_string(),
-                    None,
-                    FG,
-                    ACCENT_DIM,
-                );
-            } else {
-                let connected = format!(
-                    "{} / {} connected",
-                    format_count(mcp.connected_servers),
-                    format_count(mcp.configured_servers)
-                );
-                push_sidebar_rail_item(
-                    &mut lines,
-                    if mcp.connected_servers > 0 { "◎" } else { "○" },
-                    if mcp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
-                    connected,
-                    Some(format!("{} tools", format_count(mcp.tool_count))),
-                    FG,
-                    ACCENT_DIM,
-                );
-                for server in mcp.server_names.iter().take(5) {
-                    let connected_server = mcp.connected_names.iter().any(|name| name == server);
-                    push_sidebar_rail_item(
-                        &mut lines,
-                        if connected_server { "•" } else { "·" },
-                        if connected_server { ACCENT } else { ACCENT_DIM },
-                        preview_line(server, 28),
-                        None,
-                        FG,
-                        ACCENT_DIM,
-                    );
-                }
-            }
-        }
-
-        lines.push(Line::from(Span::raw("")));
-        lines.push(sidebar_header("LSP"));
         if let Some(lsp) = &self.state.lsp {
-            if lsp.available_servers == 0 {
-                push_sidebar_rail_item(
-                    &mut lines,
-                    "·",
-                    ACCENT_DIM,
-                    "no language servers".to_string(),
-                    None,
-                    FG,
-                    ACCENT_DIM,
-                );
-            } else {
-                push_sidebar_rail_item(
-                    &mut lines,
-                    if lsp.connected_servers > 0 { "◎" } else { "○" },
-                    if lsp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
-                    format!(
-                        "{} / {} connected",
-                        format_count(lsp.connected_servers),
-                        format_count(lsp.available_servers)
-                    ),
-                    Some(preview_line(&lsp.server_labels.join(" · "), 30)),
-                    FG,
-                    ACCENT_DIM,
-                );
-                for server in lsp.server_labels.iter().take(5) {
-                    let connected = lsp.connected_labels.iter().any(|item| item == server);
-                    push_sidebar_rail_item(
-                        &mut lines,
-                        if connected { "•" } else { "·" },
-                        if connected { ACCENT } else { ACCENT_DIM },
-                        preview_line(server, 28),
-                        Some(if connected {
-                            "connected".to_string()
-                        } else {
-                            "available".to_string()
-                        }),
-                        FG,
-                        ACCENT_DIM,
-                    );
-                }
-            }
+            push_sidebar_selectable_item(
+                lines,
+                *item_index == self.sidebar_selection,
+                if lsp.connected_servers > 0 { "◎" } else { "○" },
+                if lsp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                format!(
+                    "{} / {} connected",
+                    format_count(lsp.connected_servers),
+                    format_count(lsp.available_servers)
+                ),
+                Some(preview_line(&lsp.server_labels.join(" · "), 28)),
+                FG,
+                ACCENT_DIM,
+            );
+            *item_index += 1;
         } else {
             push_sidebar_rail_item(
-                &mut lines,
+                lines,
                 "·",
                 ACCENT_DIM,
                 "no language servers".to_string(),
@@ -1232,53 +1394,176 @@ impl App {
             );
         }
 
-        lines.push(Line::from(Span::raw("")));
-        lines.push(sidebar_header("Tools"));
+    }
 
-        let mut shown = 0usize;
-        for message in self.state.messages.iter().rev() {
-            for tool in message.tool_calls.iter().rev() {
-                let color = tool_status_color(&tool.status);
-                push_sidebar_rail_item(
-                    &mut lines,
-                    status_marker(&tool.status),
-                    color,
-                    preview_line(&tool.summary, 26),
-                    Some(format!(
-                        "{}{}",
-                        tool_status_label(&tool.status),
-                        tool.result
-                            .as_ref()
-                            .map(|result| format!(" · {}", preview_line(result, 22)))
-                            .unwrap_or_default()
-                    )),
-                    color,
-                    ACCENT_DIM,
-                );
-                shown += 1;
-                if shown >= 8 {
-                    break;
-                }
-            }
-            if shown >= 8 {
-                break;
-            }
+    fn sidebar_targets(&self) -> Vec<SidebarTarget> {
+        let mut targets = Vec::new();
+        targets.extend(
+            self.state
+                .agent_activities
+                .iter()
+                .enumerate()
+                .take(4)
+                .map(|(index, _)| SidebarTarget::Agent(index)),
+        );
+        targets.extend(
+            self.state
+                .background_jobs
+                .iter()
+                .enumerate()
+                .take(4)
+                .map(|(index, _)| SidebarTarget::Job(index)),
+        );
+        targets.extend(
+            self.state
+                .queued_prompts
+                .iter()
+                .enumerate()
+                .take(4)
+                .map(|(index, _)| SidebarTarget::Queue(index)),
+        );
+        targets.extend(
+            self.state
+                .todos
+                .iter()
+                .enumerate()
+                .take(10)
+                .map(|(index, _)| SidebarTarget::Plan(index)),
+        );
+        targets.push(SidebarTarget::ContextOverview);
+        if self.state.request_estimate.is_some() {
+            targets.push(SidebarTarget::ContextEstimate);
+        }
+        if self.state.context_preview.is_some() {
+            targets.push(SidebarTarget::ContextPreview);
+        }
+        targets.push(SidebarTarget::ContextDiff);
+        if self.state.mcp.is_some() {
+            targets.push(SidebarTarget::McpSummary);
+        }
+        if self.state.lsp.is_some() {
+            targets.push(SidebarTarget::LspSummary);
+        }
+        targets
+    }
+
+    fn clamp_sidebar_selection(&mut self) {
+        let total = self.sidebar_targets().len();
+        if total == 0 {
+            self.sidebar_selection = 0;
+        } else if self.sidebar_selection >= total {
+            self.sidebar_selection = total - 1;
+        }
+    }
+
+    fn set_sidebar_tab(&mut self, tab: SidebarTab) {
+        self.sidebar_tab = tab;
+        self.sidebar_selection = self.section_start_index(tab);
+        self.clamp_sidebar_selection();
+    }
+
+    fn section_start_index(&self, tab: SidebarTab) -> usize {
+        let jobs_len = self.state.agent_activities.iter().take(4).count()
+            + self.state.background_jobs.iter().take(4).count()
+            + self.state.queued_prompts.iter().take(4).count();
+        let plan_len = self.state.todos.iter().take(10).count();
+        let context_len = 1
+            + usize::from(self.state.request_estimate.is_some())
+            + usize::from(self.state.context_preview.is_some())
+            + 1;
+        match tab {
+            SidebarTab::Jobs => 0,
+            SidebarTab::Plan => jobs_len,
+            SidebarTab::Context => jobs_len + plan_len,
+            SidebarTab::Systems => jobs_len + plan_len + context_len,
+        }
+    }
+
+    fn render_notices(&self, frame: &mut Frame) {
+        if self.notices.is_empty() {
+            return;
         }
 
-        if shown == 0 {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "no tool activity".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
+        let width = self
+            .notices
+            .iter()
+            .map(|notice| notice.text.width() + 4)
+            .max()
+            .unwrap_or(24)
+            .min(frame.area().width.saturating_sub(4) as usize) as u16;
+
+        for (index, notice) in self.notices.iter().rev().take(3).enumerate() {
+            let area = Rect {
+                x: frame.area().right().saturating_sub(width + 2),
+                y: frame.area().y + 1 + (index as u16 * 3),
+                width,
+                height: 3,
+            };
+            frame.render_widget(Clear, area);
+            let color = match notice.tone {
+                NoticeTone::Info => ACCENT,
+                NoticeTone::Success => SUCCESS,
+                NoticeTone::Error => ERROR,
+            };
+            frame.render_widget(
+                Paragraph::new(Text::from(vec![
+                    Line::from(Span::styled(
+                        preview_line(&notice.text, width.saturating_sub(4) as usize),
+                        Style::default().fg(FG),
+                    )),
+                ]))
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .style(Style::default().bg(BG).fg(color))
+                        .border_style(Style::default().fg(color)),
+                ),
+                area,
             );
         }
+    }
+
+    fn render_inspector(&self, frame: &mut Frame, inspector: &InspectorState) {
+        let area = centered_rect(72, frame.area().height.saturating_sub(6).min(24), frame.area());
+        frame.render_widget(Clear, area);
+        let inner = Rect {
+            x: area.x + 1,
+            y: area.y + 1,
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(2),
+        };
+
+        let body_height = inner.height.saturating_sub(2) as usize;
+        let max_scroll = inspector.body.len().saturating_sub(body_height);
+        let scroll = inspector.scroll.min(max_scroll);
+        let visible = inspector
+            .body
+            .iter()
+            .skip(scroll)
+            .take(body_height)
+            .map(|line| render_inspector_line(line, inner.width as usize))
+            .collect::<Vec<_>>();
+
+        let footer = inspector
+            .footer
+            .as_ref()
+            .map(|footer| Line::from(Span::styled(footer.clone(), Style::default().fg(ACCENT_DIM))))
+            .unwrap_or_else(|| Line::from(Span::raw("")));
+
+        let mut content = vec![Line::from(Span::styled(
+            inspector.title.clone(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))];
+        content.extend(visible);
+        content.push(footer);
 
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+            Paragraph::new(Text::from(content)).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(Style::default().bg(BG).fg(FG))
+                    .border_style(Style::default().fg(ACCENT)),
+            ),
             inner,
         );
     }
@@ -1362,13 +1647,14 @@ impl App {
         let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
         let queue_visible = !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none();
+        let paste_visible = self.pending_paste.is_some();
         let footer_rows = 1usize;
         let min_editor_rows = if inner.height > 3 { 2usize } else { 1usize };
         let max_queue_rows = if queue_visible {
             self.state
                 .queued_prompts
                 .len()
-                .min((inner.height as usize).saturating_sub(footer_rows + min_editor_rows))
+                .min((inner.height as usize).saturating_sub(footer_rows + min_editor_rows + usize::from(paste_visible)))
         } else {
             0usize
         };
@@ -1384,7 +1670,7 @@ impl App {
         );
         let max_visible = inner
             .height
-            .saturating_sub((footer_rows + max_queue_rows) as u16) as usize;
+            .saturating_sub((footer_rows + max_queue_rows + usize::from(paste_visible)) as u16) as usize;
         let start = metrics
             .lines
             .len()
@@ -1399,6 +1685,21 @@ impl App {
             .collect::<Vec<_>>();
 
         let mut lines = Vec::new();
+        if paste_visible {
+            let line_count = self
+                .pending_paste
+                .as_ref()
+                .map(|value| value.lines().count().max(1))
+                .unwrap_or(1);
+            lines.push(Line::from(vec![
+                Span::styled("[Paste ", Style::default().fg(ACCENT_DIM)),
+                Span::styled(
+                    format!("{} Lines", format_count(line_count as u64)),
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("] Enter insert · Esc cancel", Style::default().fg(ACCENT_DIM)),
+            ]));
+        }
         if queue_visible && max_queue_rows > 0 {
             for (index, prompt) in self
                 .state
@@ -1454,12 +1755,6 @@ impl App {
                 footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
                 footer_spans.push(Span::styled(selected.clone(), Style::default().fg(FG)));
             }
-        } else if let Some(notice) = &self.notice {
-            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            footer_spans.push(Span::styled(
-                format!("switched {}", notice.text),
-                Style::default().fg(ACCENT_DIM),
-            ));
         }
         lines.push(Line::from(footer_spans));
 
@@ -1479,6 +1774,33 @@ impl App {
     }
 
     fn render_popup(&self, _frame: &mut Frame, body_area: Rect) -> Option<(Rect, Vec<Suggestion>)> {
+        if let Some(palette) = &self.palette {
+            let items = self.current_palette_items(&palette.query);
+            let _width = items
+                .iter()
+                .map(|item| item.label.width() + item.description.width() + 6)
+                .max()
+                .unwrap_or(28)
+                .min(body_area.width.saturating_sub(6) as usize) as u16;
+            let height = min(items.len().max(1), 10) as u16;
+            let area = centered_rect(
+                72,
+                height.saturating_add(3).min(body_area.height.saturating_sub(1)),
+                body_area,
+            );
+            return Some((
+                area,
+                items.into_iter()
+                    .take(10)
+                    .map(|item| Suggestion {
+                        kind: SuggestionKind::Slash,
+                        value: item.label,
+                        description: item.description,
+                    })
+                    .collect(),
+            ));
+        }
+
         let suggestions = self.current_suggestions();
         if suggestions.is_empty() {
             return None;
@@ -1558,6 +1880,74 @@ impl App {
             .collect()
     }
 
+    fn current_palette_items(&self, query: &str) -> Vec<PaletteItem> {
+        let q = query.trim().to_lowercase();
+        let mut items = Vec::new();
+
+        items.extend(self.state.slash_commands.iter().filter_map(|command| {
+            let haystack = format!("{} {}", command.value, command.description).to_lowercase();
+            if !q.is_empty() && !haystack.contains(&q) {
+                return None;
+            }
+            Some(PaletteItem {
+                label: command.value.clone(),
+                description: command.description.clone(),
+                action: PaletteAction::InsertSlash(command.value.clone()),
+            })
+        }));
+
+        for tab in SidebarTab::all() {
+            let label = format!("Jump to {} section", tab.label());
+            if q.is_empty() || label.to_lowercase().contains(&q) {
+                items.push(PaletteItem {
+                    label,
+                    description: "sidebar".to_string(),
+                    action: PaletteAction::SwitchTab(tab),
+                });
+            }
+        }
+
+        if q.is_empty() || "context inspector".contains(&q) {
+            items.push(PaletteItem {
+                label: "Open context inspector".to_string(),
+                description: "context".to_string(),
+                action: PaletteAction::OpenContext,
+            });
+        }
+
+        if q.is_empty() || "diff viewer".contains(&q) {
+            items.push(PaletteItem {
+                label: "Open diff viewer".to_string(),
+                description: "workspace".to_string(),
+                action: PaletteAction::OpenDiff(None),
+            });
+        }
+
+        for (index, job) in self.state.background_jobs.iter().enumerate().take(6) {
+            let label = format!("Inspect job · {}", preview_line(&job.label, 28));
+            if q.is_empty() || label.to_lowercase().contains(&q) {
+                items.push(PaletteItem {
+                    label,
+                    description: job.status.clone(),
+                    action: PaletteAction::OpenTarget(SidebarTarget::Job(index)),
+                });
+            }
+        }
+
+        for (index, prompt) in self.state.queued_prompts.iter().enumerate().take(6) {
+            let label = format!("Inspect queue {} · {}", index + 1, preview_line(prompt, 28));
+            if q.is_empty() || label.to_lowercase().contains(&q) {
+                items.push(PaletteItem {
+                    label,
+                    description: "queued prompt".to_string(),
+                    action: PaletteAction::OpenTarget(SidebarTarget::Queue(index)),
+                });
+            }
+        }
+
+        items
+    }
+
     fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
             Event::Key(key) => self.handle_key(key),
@@ -1576,7 +1966,20 @@ impl App {
                 Ok(())
             }
             Event::Paste(text) => {
-                self.composer.insert_text(&text);
+                if text.contains('\n') || text.contains('\r') {
+                    self.pending_paste = Some(text);
+                    let line_count = self
+                        .pending_paste
+                        .as_ref()
+                        .map(|value| value.lines().count().max(1))
+                        .unwrap_or(1);
+                    self.push_notice(
+                        format!("paste held · {} lines", format_count(line_count as u64)),
+                        NoticeTone::Info,
+                    );
+                } else {
+                    self.composer.insert_text(&text);
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -1585,7 +1988,7 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
         let suggestions = self.current_suggestions();
-        let popup_visible = !suggestions.is_empty();
+        let popup_visible = self.palette.is_some() || !suggestions.is_empty();
         let composer_empty = self.composer.trim().is_empty();
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
@@ -1595,6 +1998,43 @@ impl App {
                 self.should_quit = true;
             }
             return Ok(());
+        }
+
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('k') {
+            if self.palette.is_some() {
+                self.palette = None;
+            } else {
+                self.palette = Some(PaletteState {
+                    query: String::new(),
+                    selected: 0,
+                });
+                self.inspector = None;
+            }
+            return Ok(());
+        }
+
+        if self.inspector.is_some() {
+            return self.handle_inspector_key(key);
+        }
+
+        if self.palette.is_some() {
+            return self.handle_palette_key(key);
+        }
+
+        if self.pending_paste.is_some() {
+            match key.code {
+                KeyCode::Enter => {
+                    if let Some(paste) = self.pending_paste.take() {
+                        self.composer.insert_text(&paste);
+                    }
+                    return Ok(());
+                }
+                KeyCode::Esc => {
+                    self.pending_paste = None;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
         }
 
         if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
@@ -1849,6 +2289,482 @@ impl App {
 
         Ok(())
     }
+
+    fn handle_palette_key(&mut self, key: KeyEvent) -> Result<()> {
+        let mut apply: Option<PaletteAction> = None;
+        let Some((mut query, mut selected)) = self
+            .palette
+            .as_ref()
+            .map(|palette| (palette.query.clone(), palette.selected))
+        else {
+            return Ok(());
+        };
+
+        match key.code {
+            KeyCode::Esc => {
+                self.palette = None;
+                return Ok(());
+            }
+            KeyCode::Up => {
+                selected = selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                let len = self.current_palette_items(&query).len();
+                if selected + 1 < len {
+                    selected += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                query.pop();
+                selected = 0;
+            }
+            KeyCode::Enter => {
+                let items = self.current_palette_items(&query);
+                if let Some(item) = items.get(selected) {
+                    apply = Some(item.action.clone());
+                }
+            }
+            KeyCode::Char(ch) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                    query.push(ch);
+                    selected = 0;
+                }
+            }
+            _ => return Ok(()),
+        }
+
+        if let Some(palette) = &mut self.palette {
+            palette.query = query;
+            palette.selected = selected;
+        }
+
+        if let Some(action) = apply {
+            self.palette = None;
+            self.execute_palette_action(action)?;
+        }
+
+        Ok(())
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) -> Result<()> {
+        match action {
+            PaletteAction::InsertSlash(command) => {
+                self.composer.set_text(command);
+                self.selected_suggestion = 0;
+            }
+            PaletteAction::SwitchTab(tab) => self.set_sidebar_tab(tab),
+            PaletteAction::OpenTarget(target) => self.open_sidebar_target(target)?,
+            PaletteAction::OpenContext => self.open_context_inspector(),
+            PaletteAction::OpenDiff(cwd) => self.open_diff_viewer(cwd, "Workspace Diff".to_string())?,
+        }
+        Ok(())
+    }
+
+    fn handle_inspector_key(&mut self, key: KeyEvent) -> Result<()> {
+        let mut close = false;
+        let mut open_diff: Option<(Option<String>, String)> = None;
+        let mut run_command: Option<String> = None;
+
+        if let Some(inspector) = &mut self.inspector {
+            match key.code {
+                KeyCode::Esc => close = true,
+                KeyCode::Up => {
+                    inspector.scroll = inspector.scroll.saturating_sub(1);
+                }
+                KeyCode::Down => {
+                    inspector.scroll = inspector.scroll.saturating_add(1);
+                }
+                KeyCode::PageUp => {
+                    inspector.scroll = inspector.scroll.saturating_sub(8);
+                }
+                KeyCode::PageDown => {
+                    inspector.scroll = inspector.scroll.saturating_add(8);
+                }
+                KeyCode::Char('v') => match &inspector.kind {
+                    InspectorKind::Job(job_id) => {
+                        if let Some(job) = self.state.background_jobs.iter().find(|item| item.id == *job_id) {
+                            open_diff = Some((
+                                job.workspace_path.clone(),
+                                format!("Job Diff · {}", preview_line(&job.label, 24)),
+                            ));
+                        }
+                    }
+                    InspectorKind::Diff { .. } => close = true,
+                    _ => {
+                        open_diff = Some((None, "Workspace Diff".to_string()));
+                    }
+                },
+                KeyCode::Char('r') => match &inspector.kind {
+                    InspectorKind::Job(job_id) => {
+                        run_command = Some(format!("/jobs retry {}", short_job_ref(job_id)));
+                    }
+                    InspectorKind::Queue(index) => {
+                        run_command = Some(format!("/queue run {}", index + 1));
+                    }
+                    _ => {}
+                },
+                KeyCode::Char('p') => match &inspector.kind {
+                    InspectorKind::Job(job_id) => {
+                        run_command = Some(format!("/jobs promote {}", short_job_ref(job_id)));
+                    }
+                    InspectorKind::Queue(index) => {
+                        run_command = Some(format!("/queue promote {}", index + 1));
+                    }
+                    _ => {}
+                },
+                KeyCode::Char('d') => {
+                    if let InspectorKind::Queue(index) = &inspector.kind {
+                        run_command = Some(format!("/queue drop {}", index + 1));
+                    }
+                }
+                KeyCode::Char('c') => {
+                    if let InspectorKind::Job(job_id) = &inspector.kind {
+                        run_command = Some(format!("/jobs cancel {}", short_job_ref(job_id)));
+                    }
+                }
+                KeyCode::Char('l') => {
+                    if let InspectorKind::Job(job_id) = &inspector.kind {
+                        run_command = Some(format!("/jobs logs {}", short_job_ref(job_id)));
+                    }
+                }
+                KeyCode::Char('o') => {
+                    if let InspectorKind::Job(job_id) = &inspector.kind {
+                        run_command = Some(format!("/jobs result {}", short_job_ref(job_id)));
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if let Some(command) = run_command {
+            self.execute_slash_command(&command)?;
+            self.push_notice(command, NoticeTone::Info);
+        }
+        if let Some((cwd, title)) = open_diff {
+            self.open_diff_viewer(cwd, title)?;
+        }
+        if close {
+            self.inspector = None;
+        }
+
+        Ok(())
+    }
+
+    fn open_sidebar_target(&mut self, target: SidebarTarget) -> Result<()> {
+        let inspector = match target {
+            SidebarTarget::Agent(index) => self.build_agent_inspector(index),
+            SidebarTarget::Job(index) => self.build_job_inspector(index),
+            SidebarTarget::Queue(index) => self.build_queue_inspector(index),
+            SidebarTarget::Plan(index) => self.build_plan_inspector(index),
+            SidebarTarget::ContextOverview
+            | SidebarTarget::ContextEstimate
+            | SidebarTarget::ContextPreview => Some(self.build_context_inspector()),
+            SidebarTarget::ContextDiff => {
+                self.open_diff_viewer(None, "Workspace Diff".to_string())?;
+                return Ok(());
+            }
+            SidebarTarget::McpSummary => self.build_mcp_summary_inspector(),
+            SidebarTarget::LspSummary => self.build_lsp_summary_inspector(),
+        };
+        self.inspector = inspector;
+        Ok(())
+    }
+
+    fn open_context_inspector(&mut self) {
+        self.inspector = Some(self.build_context_inspector());
+    }
+
+    fn open_diff_viewer(&mut self, cwd: Option<String>, title: String) -> Result<()> {
+        let target_cwd = cwd.unwrap_or_else(|| self.state.cwd.clone());
+        let body = load_git_diff(&target_cwd)
+            .with_context(|| format!("failed to load git diff for {target_cwd}"))?;
+        if body.trim().is_empty() {
+            self.push_notice("no diff to show".to_string(), NoticeTone::Info);
+            return Ok(());
+        }
+
+        self.inspector = Some(InspectorState {
+            title,
+            body: body.lines().map(|line| line.to_string()).collect(),
+            footer: Some("Esc close · ↑↓ scroll · v close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Diff {
+                title: "Workspace Diff".to_string(),
+                cwd: Some(target_cwd),
+            },
+        });
+        Ok(())
+    }
+
+    fn build_agent_inspector(&self, index: usize) -> Option<InspectorState> {
+        let item = self.state.agent_activities.get(index)?;
+        Some(InspectorState {
+            title: format!("Subagent · {}", item.label),
+            body: vec![
+                format!("status: {}", item.status),
+                format!(
+                    "mode: {}",
+                    item.mode
+                        .as_ref()
+                        .map(|mode| title_case_label(mode))
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+                format!("purpose: {}", item.purpose.clone().unwrap_or_else(|| "general".to_string())),
+                format!("updated: {}", item.updated_at),
+                item.detail.clone().unwrap_or_else(|| "detail: n/a".to_string()),
+                item.workspace_path
+                    .as_ref()
+                    .map(|path| format!("workspace: {path}"))
+                    .unwrap_or_else(|| "workspace: n/a".to_string()),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Agent(index),
+        })
+    }
+
+    fn build_job_inspector(&self, index: usize) -> Option<InspectorState> {
+        let job = self.state.background_jobs.get(index)?;
+        Some(InspectorState {
+            title: format!("Job · {}", job.label),
+            body: vec![
+                format!("status: {}", job.status),
+                format!("kind: {}", job.kind),
+                format!("attempt: {}", format_count(job.attempt.unwrap_or(0))),
+                format!(
+                    "mode: {}",
+                    job.preferred_mode
+                        .as_ref()
+                        .map(|mode| title_case_label(mode))
+                        .unwrap_or_else(|| "n/a".to_string())
+                ),
+                format!("purpose: {}", job.purpose.clone().unwrap_or_else(|| "general".to_string())),
+                format!("started: {}", job.started_at),
+                format!("updated: {}", job.updated_at),
+                job.detail
+                    .as_ref()
+                    .map(|detail| format!("detail: {detail}"))
+                    .unwrap_or_else(|| "detail: n/a".to_string()),
+                job.result_preview
+                    .as_ref()
+                    .map(|detail| format!("result: {detail}"))
+                    .unwrap_or_else(|| "result: n/a".to_string()),
+                job.workspace_path
+                    .as_ref()
+                    .map(|path| format!("workspace: {path}"))
+                    .unwrap_or_else(|| "workspace: n/a".to_string()),
+            ],
+            footer: Some("r retry · p promote · c cancel · l logs · o result · v diff · Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Job(job.id.clone()),
+        })
+    }
+
+    fn build_queue_inspector(&self, index: usize) -> Option<InspectorState> {
+        let prompt = self.state.queued_prompts.get(index)?;
+        Some(InspectorState {
+            title: format!("Queue {}", index + 1),
+            body: vec![
+                "queued prompt".to_string(),
+                String::new(),
+                prompt.clone(),
+            ],
+            footer: Some("r run · p promote · d drop · Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Queue(index),
+        })
+    }
+
+    fn build_plan_inspector(&self, index: usize) -> Option<InspectorState> {
+        let item = self.state.todos.get(index)?;
+        Some(InspectorState {
+            title: format!("Plan {}", index + 1),
+            body: vec![
+                format!("status: {}", item.status),
+                format!("step: {}", item.step),
+                format!("owner: {}", item.owner.clone().unwrap_or_else(|| "n/a".to_string())),
+                format!("id: {}", item.id),
+                format!("updated: {}", item.updated_at),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Plan(index),
+        })
+    }
+
+    fn build_context_inspector(&self) -> InspectorState {
+        let mut body = vec![
+            format!("mode: {}", self.current_mode_label()),
+            format!("provider: {}", self.state.provider),
+            format!("model: {}", display_model_name(&self.state.model)),
+            format!("permission: {}", self.state.permission_profile),
+            format!(
+                "footprint: {:>5.1}% · {} / {}",
+                self.state.context_percent * 100.0,
+                format_count(self.state.context_tokens),
+                format_count(self.state.context_limit)
+            ),
+        ];
+        if let Some(estimate) = &self.state.request_estimate {
+            body.push(String::new());
+            body.push(format!("request mode: {}", estimate.mode));
+            body.push(format!(
+                "system {} · history {} · tools {} · prompt {} · total {}",
+                format_count(estimate.system),
+                format_count(estimate.history),
+                format_count(estimate.tools),
+                format_count(estimate.prompt),
+                format_count(estimate.total),
+            ));
+        }
+        if let Some(preview) = &self.state.context_preview {
+            body.push(String::new());
+            body.push("context preview".to_string());
+            body.extend(preview.lines().map(|line| line.to_string()));
+        }
+        InspectorState {
+            title: "Context Inspector".to_string(),
+            body,
+            footer: Some("v diff viewer · Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Context,
+        }
+    }
+
+    fn build_mcp_summary_inspector(&self) -> Option<InspectorState> {
+        let mcp = self.state.mcp.as_ref()?;
+        Some(InspectorState {
+            title: "MCP".to_string(),
+            body: vec![
+                format!("configured: {}", format_count(mcp.configured_servers)),
+                format!("connected: {}", format_count(mcp.connected_servers)),
+                format!("tools: {}", format_count(mcp.tool_count)),
+                String::new(),
+                format!("servers: {}", mcp.server_names.join(", ")),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::McpSummary,
+        })
+    }
+
+    fn build_mcp_server_inspector(&self, index: usize) -> Option<InspectorState> {
+        let mcp = self.state.mcp.as_ref()?;
+        let server = mcp.server_names.get(index)?;
+        let connected = mcp.connected_names.iter().any(|name| name == server);
+        Some(InspectorState {
+            title: format!("MCP Server · {server}"),
+            body: vec![
+                format!("status: {}", if connected { "connected" } else { "configured" }),
+                format!("server: {server}"),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::McpServer(index),
+        })
+    }
+
+    fn build_lsp_summary_inspector(&self) -> Option<InspectorState> {
+        let lsp = self.state.lsp.as_ref()?;
+        Some(InspectorState {
+            title: "LSP".to_string(),
+            body: vec![
+                format!("available: {}", format_count(lsp.available_servers)),
+                format!("connected: {}", format_count(lsp.connected_servers)),
+                String::new(),
+                format!("servers: {}", lsp.server_labels.join(", ")),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::LspSummary,
+        })
+    }
+
+    fn build_lsp_server_inspector(&self, index: usize) -> Option<InspectorState> {
+        let lsp = self.state.lsp.as_ref()?;
+        let server = lsp.server_labels.get(index)?;
+        let connected = lsp.connected_labels.iter().any(|item| item == server);
+        Some(InspectorState {
+            title: format!("LSP Server · {server}"),
+            body: vec![
+                format!("status: {}", if connected { "connected" } else { "available" }),
+                format!("server: {server}"),
+            ],
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::LspServer(index),
+        })
+    }
+
+    fn build_tool_inspector(&self, message_index: usize, tool_index: usize) -> Option<InspectorState> {
+        let tool = self.state.messages.get(message_index)?.tool_calls.get(tool_index)?;
+        let mut body = vec![
+            format!("status: {}", tool.status),
+            format!("tool: {}", tool.name),
+            format!("summary: {}", tool.summary),
+        ];
+        if !tool.args.trim().is_empty() {
+            body.push(String::new());
+            body.push("args".to_string());
+            body.extend(tool.args.lines().map(|line| line.to_string()));
+        }
+        if let Some(result) = &tool.result {
+            body.push(String::new());
+            body.push("result".to_string());
+            body.extend(result.lines().map(|line| line.to_string()));
+        }
+        Some(InspectorState {
+            title: format!("Tool · {}", tool.name),
+            body,
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Tool(message_index, tool_index),
+        })
+    }
+
+    fn refresh_open_inspector(&mut self) {
+        let Some(existing) = &self.inspector else {
+            return;
+        };
+        let scroll = existing.scroll;
+        let replacement = match existing.kind.clone() {
+            InspectorKind::Agent(index) => self.build_agent_inspector(index),
+            InspectorKind::Job(job_id) => self
+                .state
+                .background_jobs
+                .iter()
+                .position(|job| job.id == job_id)
+                .and_then(|index| self.build_job_inspector(index)),
+            InspectorKind::Queue(index) => self.build_queue_inspector(index),
+            InspectorKind::Plan(index) => self.build_plan_inspector(index),
+            InspectorKind::Context => Some(self.build_context_inspector()),
+            InspectorKind::McpSummary => self.build_mcp_summary_inspector(),
+            InspectorKind::McpServer(index) => self.build_mcp_server_inspector(index),
+            InspectorKind::LspSummary => self.build_lsp_summary_inspector(),
+            InspectorKind::LspServer(index) => self.build_lsp_server_inspector(index),
+            InspectorKind::Tool(message_index, tool_index) => {
+                self.build_tool_inspector(message_index, tool_index)
+            }
+            InspectorKind::Diff { title, cwd } => {
+                let body = cwd
+                    .as_ref()
+                    .and_then(|path| load_git_diff(path).ok())
+                    .unwrap_or_default();
+                Some(InspectorState {
+                    title,
+                    body: body.lines().map(|line| line.to_string()).collect(),
+                    footer: Some("Esc close · ↑↓ scroll · v close".to_string()),
+                    scroll,
+                    kind: InspectorKind::Diff { title: "Workspace Diff".to_string(), cwd },
+                })
+            }
+        };
+
+        self.inspector = replacement.map(|mut inspector| {
+            inspector.scroll = scroll;
+            inspector
+        });
+    }
 }
 
 struct WrappedEditor {
@@ -1934,16 +2850,6 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn center_with_padding(line: &str, width: usize) -> String {
-    let line_width = UnicodeWidthStr::width(line);
-    if width <= line_width {
-        return line.to_string();
-    }
-
-    let left_pad = (width - line_width) / 2;
-    format!("{}{}", " ".repeat(left_pad), line)
-}
-
 fn pad_art_lines(lines: &[&str]) -> Vec<String> {
     let max_width = lines
         .iter()
@@ -1959,7 +2865,42 @@ fn pad_art_lines(lines: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn build_welcome_lines(width: usize) -> Vec<Line<'static>> {
+fn shimmer_centered_line(
+    line: &str,
+    width: usize,
+    phase: usize,
+    offset: usize,
+    base: Color,
+    highlight: Color,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    let content_width = UnicodeWidthStr::width(line);
+    let left_pad = width.saturating_sub(content_width) / 2;
+    if left_pad > 0 {
+        spans.push(Span::raw(" ".repeat(left_pad)));
+    }
+
+    let graphemes = UnicodeSegmentation::graphemes(line, true).collect::<Vec<_>>();
+    let cycle_width = graphemes.len().saturating_add(10).max(1);
+    let sweep = ((phase + offset * 4) % cycle_width) as isize - 5;
+    for (index, grapheme) in graphemes.iter().enumerate() {
+        let distance = (index as isize - sweep).abs();
+        let style = if distance <= 1 {
+            Style::default()
+                .fg(highlight)
+                .add_modifier(Modifier::BOLD)
+        } else if distance <= 4 {
+            Style::default().fg(base).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(ACCENT_DIM)
+        };
+        spans.push(Span::styled((*grapheme).to_string(), style));
+    }
+
+    Line::from(spans)
+}
+
+fn build_welcome_lines(width: usize, phase: usize) -> Vec<Line<'static>> {
     let art = if width < 64 {
         Vec::new()
     } else if width < 100 {
@@ -1971,20 +2912,28 @@ fn build_welcome_lines(width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(Span::raw("")));
     lines.push(Line::from(Span::raw("")));
-    for line in art {
-        lines.push(Line::from(Span::styled(
-            center_with_padding(&line, width),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )));
+    for (index, line) in art.into_iter().enumerate() {
+        lines.push(shimmer_centered_line(
+            &line,
+            width,
+            phase,
+            index,
+            ACCENT,
+            FG,
+        ));
     }
 
     if !lines.is_empty() {
         lines.push(Line::from(Span::raw("")));
     }
-    lines.push(Line::from(Span::styled(
-        center_with_padding("BL4CKP1NK 1N Y0UR AREA", width),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )));
+    lines.push(shimmer_centered_line(
+        "BL4CKP1NK 1N Y0UR AREA",
+        width,
+        phase + 6,
+        0,
+        ACCENT,
+        FG,
+    ));
     lines.push(Line::from(Span::raw("")));
     lines
 }
@@ -2010,6 +2959,29 @@ fn format_count(value: u64) -> String {
     }
 
     out.chars().rev().collect()
+}
+
+fn checklist_progress(checklist: &[NativeJobChecklistItem]) -> Option<String> {
+    if checklist.is_empty() {
+        return None;
+    }
+
+    let total = checklist.len();
+    let completed = checklist.iter().filter(|item| item.status == "completed").count();
+    let active = checklist.iter().filter(|item| item.status == "in_progress").count();
+    let blocked = checklist.iter().filter(|item| item.status == "error").count();
+
+    let summary = [
+        Some(format!("{completed}/{total} done")),
+        (active > 0).then(|| format!("{active} active")),
+        (blocked > 0).then(|| format!("{blocked} blocked")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ");
+
+    Some(summary)
 }
 
 fn title_case_label(value: &str) -> String {
@@ -2113,6 +3085,52 @@ fn push_sidebar_rail_item(
     }
 }
 
+fn push_sidebar_selectable_item(
+    lines: &mut Vec<Line<'static>>,
+    _selected: bool,
+    marker: &str,
+    marker_color: Color,
+    title: String,
+    detail: Option<String>,
+    title_color: Color,
+    detail_color: Color,
+) {
+    let selected_style = Style::default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("{marker} "),
+            selected_style.fg(marker_color),
+        ),
+        Span::styled(title, selected_style.fg(title_color)),
+    ]));
+
+    if let Some(detail) = detail {
+        lines.push(Line::from(vec![
+            Span::styled("│ ", selected_style.fg(marker_color)),
+            Span::styled(detail, selected_style.fg(detail_color)),
+        ]));
+    }
+}
+
+fn render_inspector_line(raw: &str, width: usize) -> Line<'static> {
+    let style = if raw.starts_with("+++") || raw.starts_with("---") || raw.starts_with("@@") {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else if raw.starts_with('+') {
+        Style::default().fg(SUCCESS)
+    } else if raw.starts_with('-') {
+        Style::default().fg(ERROR)
+    } else if raw.ends_with(':') {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(FG)
+    };
+
+    Line::from(Span::styled(
+        preview_line(raw, width.max(1)),
+        style,
+    ))
+}
+
 fn context_meter(percent: f64, width: usize) -> String {
     let width = width.max(4);
     let filled = ((percent.clamp(0.0, 1.0)) * width as f64).round() as usize;
@@ -2145,10 +3163,10 @@ fn looks_like_url_token(token: &str) -> bool {
 
 fn tool_status_color(status: &str) -> Color {
     match status {
-        "done" => SUCCESS,
+        "done" => TOOL_MUTED,
         "error" => ERROR,
-        "running" => ACCENT,
-        _ => ACCENT_DIM,
+        "running" => TOOL_RUNNING,
+        _ => TOOL_MUTED,
     }
 }
 
@@ -2159,16 +3177,6 @@ fn tool_status_label(status: &str) -> &'static str {
         "running" => "running",
         "pending" => "pending",
         _ => "idle",
-    }
-}
-
-fn status_marker(status: &str) -> &'static str {
-    match status {
-        "done" => "●",
-        "error" => "✕",
-        "running" => "↻",
-        "pending" => "◌",
-        _ => "·",
     }
 }
 
@@ -2186,6 +3194,29 @@ fn format_elapsed(started_at_ms: Option<u64>) -> String {
     let seconds = elapsed_secs % 60;
 
     format!("{minutes:02}:{seconds:02}")
+}
+
+fn short_job_ref(job_id: &str) -> &str {
+    job_id.get(..8).unwrap_or(job_id)
+}
+
+fn load_git_diff(cwd: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["diff", "--no-ext-diff", "--stat=120", "--patch", "--"])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git diff in {cwd}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(if stderr.is_empty() {
+            "git diff failed".to_string()
+        } else {
+            stderr
+        }));
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn push_run(runs: &mut Vec<(Style, String)>, style: Style, text: &str) {
@@ -2724,7 +3755,12 @@ fn append_guttered_span_lines(
     }
 }
 
-fn build_transcript_lines(messages: &[NativeMessageState], width: usize) -> Vec<Line<'static>> {
+fn build_transcript_lines(
+    messages: &[NativeMessageState],
+    width: usize,
+    fold_tool_calls: bool,
+    fold_system_messages: bool,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let width = width.max(10);
 
@@ -2749,7 +3785,13 @@ fn build_transcript_lines(messages: &[NativeMessageState], width: usize) -> Vec<
         };
 
         let prefix_width = prefix.width();
-        if !message.content.trim().is_empty() || message.tool_calls.is_empty() {
+        if fold_system_messages && message.role == "system" && !message.content.trim().is_empty() {
+            let folded = preview_line(&message.content, width.saturating_sub(prefix_width));
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), prefix_style),
+                Span::styled(format!("{folded}  [folded]"), Style::default().fg(TOOL_MUTED)),
+            ]));
+        } else if !message.content.trim().is_empty() || message.tool_calls.is_empty() {
             let mut first_visual_line = true;
             if message.role == "assistant" {
                 let mut in_code_block = false;
@@ -2821,23 +3863,48 @@ fn build_transcript_lines(messages: &[NativeMessageState], width: usize) -> Vec<
             }
         }
 
-        for tool in &message.tool_calls {
-            let color = tool_status_color(&tool.status);
-            let mut tool_text = format!("{} · {}", tool.summary, tool_status_label(&tool.status));
-            if let Some(result) = &tool.result {
-                let detail = preview_line(result, 72);
-                if !detail.is_empty() {
-                    tool_text.push_str(" · ");
-                    tool_text.push_str(&detail);
+        if fold_tool_calls && !message.tool_calls.is_empty() {
+            let summary = message
+                .tool_calls
+                .iter()
+                .map(|tool| tool.summary.as_str())
+                .take(2)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            lines.push(Line::from(vec![
+                Span::styled("  ↳ ", Style::default().fg(TOOL_MUTED)),
+                Span::styled(
+                    format!(
+                        "{} tool calls folded{}",
+                        format_count(message.tool_calls.len() as u64),
+                        if summary.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {}", preview_line(&summary, width.saturating_sub(24)))
+                        }
+                    ),
+                    Style::default().fg(TOOL_MUTED),
+                ),
+            ]));
+        } else {
+            for tool in &message.tool_calls {
+                let color = tool_status_color(&tool.status);
+                let mut tool_text = format!("{} · {}", tool.summary, tool_status_label(&tool.status));
+                if let Some(result) = &tool.result {
+                    let detail = preview_line(result, 72);
+                    if !detail.is_empty() {
+                        tool_text.push_str(" · ");
+                        tool_text.push_str(&detail);
+                    }
                 }
-            }
-            let wrapped_tool = wrap_plain(&tool_text, width.saturating_sub(4));
-            for (index, chunk) in wrapped_tool.iter().enumerate() {
-                let gutter = if index == 0 { "  ↳ " } else { "    " };
-                lines.push(Line::from(vec![
-                    Span::styled(gutter, Style::default().fg(color)),
-                    Span::styled(chunk.clone(), Style::default().fg(color)),
-                ]));
+                let wrapped_tool = wrap_plain(&tool_text, width.saturating_sub(4));
+                for (index, chunk) in wrapped_tool.iter().enumerate() {
+                    let gutter = if index == 0 { "  ↳ " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(gutter, Style::default().fg(color)),
+                        Span::styled(chunk.clone(), Style::default().fg(color)),
+                    ]));
+                }
             }
         }
 
@@ -2861,6 +3928,16 @@ fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
         y: area.y + area.height.saturating_sub(height) / 2,
         width,
         height,
+    }
+}
+
+fn top_padded_rect(area: Rect, padding: u16) -> Rect {
+    let inset = padding.min(area.height.saturating_sub(1));
+    Rect {
+        x: area.x,
+        y: area.y + inset,
+        width: area.width,
+        height: area.height.saturating_sub(inset),
     }
 }
 

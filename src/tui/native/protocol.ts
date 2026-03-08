@@ -102,6 +102,14 @@ export interface NativeBackgroundJobState {
   resultPreview?: string | null;
   workspacePath?: string | null;
   promptPreview?: string | null;
+  checklist: {
+    id: string;
+    label: string;
+    owner: string | null;
+    status: 'pending' | 'in_progress' | 'completed' | 'error';
+    detail: string | null;
+    updatedAt: number;
+  }[];
 }
 
 export interface NativeArtifactState extends Omit<WorkflowArtifact, 'kind'> {
@@ -149,6 +157,7 @@ export interface NativeTuiState {
   contextPercent: number;
   contextTokens: number;
   contextLimit: number;
+  contextPreview: string | null;
   requestEstimate: NativeRequestEstimateState | null;
   queuedPrompts: string[];
   providers: NativeProviderState[];

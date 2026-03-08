@@ -30,7 +30,7 @@ Users switch modes with Shift+Tab. Mode determines which provider/model handles 
 Toggle fast with /fire, or set explicitly with /permissions.
 
 ## Capabilities
-- Multi-tab TUI with Ctrl+B prefix shortcuts (tmux-like)
+- Native Rust TUI with detached jobs, queue management, and live checklists
 - Multi-agent orchestration — spawn, route, and aggregate specialist agents via \`task\` tool
 - Context management — canonical sessions, compaction, session persistence, git-aware retrieval
 - Memory system — persistent context in global/project/working/episodic/semantic/procedural layers

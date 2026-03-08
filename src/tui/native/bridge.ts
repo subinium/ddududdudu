@@ -7,7 +7,8 @@ import { NativeBridgeController } from './controller.js';
 const BRIDGE_EVENT_PREFIX = '__DDUDU_BRIDGE__ ';
 
 const writeEvent = (event: NativeBridgeEvent): void => {
-  process.stdout.write(`${BRIDGE_EVENT_PREFIX}${JSON.stringify(event)}\n`);
+  const encoded = Buffer.from(JSON.stringify(event), 'utf8').toString('base64');
+  process.stdout.write(`${BRIDGE_EVENT_PREFIX}${encoded}\n`);
 };
 
 const redirectConsoleToStderr = (): void => {

@@ -2,7 +2,11 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { spawn } from 'node:child_process';
 
-import type { MentionItem } from '../tui/components/mention-resolver.js';
+export interface MentionItem {
+  type: 'file' | 'codebase' | 'git' | 'session';
+  name: string;
+  path?: string;
+}
 
 const MAX_FILE_BYTES = 50 * 1024;
 

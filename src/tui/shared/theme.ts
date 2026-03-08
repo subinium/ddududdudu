@@ -1,19 +1,4 @@
-export const BP = {
-  pink: '#f7a7bb',
-  pinkLight: '#fcd2de',
-  pinkDim: '#be788c',
-  black: '#000000',
-  darkGray: '#121212',
-  gray: '#646464',
-  white: '#ffffff',
-  red: '#ff5050',
-  green: '#50dc78',
-  yellow: '#ffc83c',
-} as const;
-
-export type BPColor = (typeof BP)[keyof typeof BP];
-
-export interface BlackpinkMode {
+export interface HarnessModeTheme {
   name: string;
   provider: 'anthropic' | 'openai' | 'gemini';
   model: string;
@@ -23,7 +8,7 @@ export interface BlackpinkMode {
   promptAddition: string;
 }
 
-export const BLACKPINK_MODES: Record<string, BlackpinkMode> = {
+export const HARNESS_MODES: Record<string, HarnessModeTheme> = {
   jennie: {
     name: 'jennie',
     provider: 'anthropic',
@@ -110,5 +95,3 @@ export const BP_LYRICS: string[] = [
   'Not a comeback, never left...',
   'Now burn, baby, burn...',
 ];
-
-export const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];

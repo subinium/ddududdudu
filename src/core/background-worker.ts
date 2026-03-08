@@ -1,6 +1,12 @@
 import { discoverAllProviders } from '../auth/discovery.js';
 import { loadConfig } from './config.js';
-import { BackgroundJobStore, resolveBackgroundJobDirectory, type BackgroundJobAgentActivity, type BackgroundJobRecord } from './background-jobs.js';
+import {
+  BackgroundJobStore,
+  resolveBackgroundJobDirectory,
+  type BackgroundJobAgentActivity,
+  type BackgroundJobChecklistItem,
+  type BackgroundJobRecord,
+} from './background-jobs.js';
 import { DelegationRuntime, type DelegationCredentials, type DelegationPurpose } from './delegation.js';
 import { SessionManager } from './session.js';
 import { TeamOrchestrator, type AgentRole, type TeamMessage } from './team-agent.js';
@@ -126,6 +132,22 @@ const updateActivity = (
   return [next, ...activities].slice(0, 12);
 };
 
+const updateChecklistItem = (
+  items: BackgroundJobChecklistItem[],
+  id: string,
+  patch: Partial<BackgroundJobChecklistItem>,
+): BackgroundJobChecklistItem[] =>
+  items.map((item) =>
+    item.id === id
+      ? {
+          ...item,
+          ...patch,
+          id: item.id,
+          updatedAt: Date.now(),
+        }
+      : item,
+  );
+
 const formatTeamProgress = (message: TeamMessage): string =>
   `${message.type} · ${message.from} → ${message.to} · ${previewText(message.content, 120)}`;
 
@@ -184,6 +206,23 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
     startedAt: job.startedAt ?? Date.now(),
     finishedAt: null,
     detail: job.detail ?? 'starting…',
+    checklist:
+      job.kind === 'delegate'
+        ? updateChecklistItem(
+            updateChecklistItem(job.checklist, 'route', {
+              status: 'completed',
+              detail: 'worker selected',
+            }),
+            'execute',
+            {
+              status: 'in_progress',
+              detail: 'booting delegated worker',
+            },
+          )
+        : updateChecklistItem(job.checklist, 'fanout', {
+            status: 'in_progress',
+            detail: 'starting team workers',
+          }),
   });
 
   let persistChain = Promise.resolve();
@@ -234,14 +273,26 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               return;
             }
             latestDetail = previewText(delta, 72);
-            queuePersist({ detail: latestDetail });
+            queuePersist({
+              detail: latestDetail,
+              checklist: updateChecklistItem(current.checklist, 'execute', {
+                status: 'in_progress',
+                detail: latestDetail,
+              }),
+            });
           },
           onToolState: (states) => {
             const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
             if (!activeTool) {
               return;
             }
-            queuePersist({ detail: `${activeTool.name} ${activeTool.status}` });
+            queuePersist({
+              detail: `${activeTool.name} ${activeTool.status}`,
+              checklist: updateChecklistItem(current.checklist, 'execute', {
+                status: 'in_progress',
+                detail: `${activeTool.name} ${activeTool.status}`,
+              }),
+            });
           },
           onVerificationState: (state) => {
             const activity = updateActivity(current.agentActivities, {
@@ -262,6 +313,22 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
             queuePersist({
               agentActivities: activity,
               detail: state.summary ?? current.detail,
+              checklist: updateChecklistItem(
+                updateChecklistItem(current.checklist, 'execute', {
+                  status: state.status === 'running' ? 'completed' : current.checklist.find((item) => item.id === 'execute')?.status ?? 'completed',
+                  detail: current.checklist.find((item) => item.id === 'execute')?.detail ?? current.detail,
+                }),
+                'verify',
+                {
+                  status:
+                    state.status === 'running'
+                      ? 'in_progress'
+                      : state.status === 'passed' || state.status === 'skipped'
+                        ? 'completed'
+                        : 'error',
+                  detail: state.summary ?? null,
+                },
+              ),
             });
           },
         },
@@ -335,6 +402,54 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           usage: result.usage,
         },
         artifact,
+        checklist: [
+          ...updateChecklistItem(current.checklist, 'execute', {
+            status: 'completed',
+            detail: result.verification?.summary ?? previewText(finalText, 72),
+          }),
+        ]
+          .map((item) => {
+            if (item.id === 'verify') {
+              return {
+                ...item,
+                status:
+                  result.verification?.status === 'failed'
+                    ? 'error'
+                    : result.verification
+                      ? 'completed'
+                      : item.status,
+                detail: result.verification?.summary ?? item.detail,
+                updatedAt: Date.now(),
+              };
+            }
+            if (item.id === 'apply') {
+              return {
+                ...item,
+                status:
+                  result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+                    ? 'error'
+                    : result.workspaceApply
+                      ? 'completed'
+                      : item.status,
+                detail: result.workspaceApply?.summary ?? item.detail,
+                updatedAt: Date.now(),
+              };
+            }
+            if (item.id === 'report') {
+              return {
+                ...item,
+                status:
+                  result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+                    ? 'error'
+                    : result.verification?.status === 'failed'
+                      ? 'error'
+                      : 'completed',
+                detail: previewText(finalText, 72),
+                updatedAt: Date.now(),
+              };
+            }
+            return item;
+          }),
         agentActivities: updateActivity(current.agentActivities, {
           id: `job:${current.id}:route`,
           label: result.mode,
@@ -384,6 +499,10 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               updatedAt: Date.now(),
             }),
             detail: `${agent.name} · round ${round}`,
+            checklist: updateChecklistItem(current.checklist, 'fanout', {
+              status: 'in_progress',
+              detail: `${agent.name} · round ${round}`,
+            }),
           });
 
           const result = await runtime.run(
@@ -419,6 +538,10 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     updatedAt: Date.now(),
                   }),
                   detail: `${agent.name} · ${previewText(delta, 64)}`,
+                  checklist: updateChecklistItem(current.checklist, 'fanout', {
+                    status: 'in_progress',
+                    detail: `${agent.name} · ${previewText(delta, 64)}`,
+                  }),
                 });
               },
               onToolState: (states) => {
@@ -438,6 +561,10 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     updatedAt: Date.now(),
                   }),
                   detail: `${agent.name} · ${activeTool.name} ${activeTool.status}`,
+                  checklist: updateChecklistItem(current.checklist, 'fanout', {
+                    status: 'in_progress',
+                    detail: `${agent.name} · ${activeTool.name} ${activeTool.status}`,
+                  }),
                 });
               },
               onVerificationState: (state) => {
@@ -458,6 +585,15 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                     updatedAt: Date.now(),
                   }),
                   detail: state.summary ?? current.detail,
+                  checklist: updateChecklistItem(current.checklist, 'verify', {
+                    status:
+                      state.status === 'running'
+                        ? 'in_progress'
+                        : state.status === 'passed' || state.status === 'skipped'
+                          ? 'completed'
+                          : 'error',
+                    detail: state.summary ?? null,
+                  }),
                 });
               },
             },
@@ -470,7 +606,13 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           return result.text.trim() || `[${agent.name}] no output`;
         },
         onMessage: (message) => {
-          queuePersist({ detail: formatTeamProgress(message) });
+          queuePersist({
+            detail: formatTeamProgress(message),
+            checklist: updateChecklistItem(current.checklist, 'synthesize', {
+              status: 'in_progress',
+              detail: formatTeamProgress(message),
+            }),
+          });
         },
       });
 
@@ -513,6 +655,28 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           model: teamAgents.map((agent) => agent.model).join(', '),
         },
         artifact,
+        checklist: current.checklist.map((item) => {
+          if (item.id === 'fanout' || item.id === 'synthesize' || item.id === 'report') {
+            return {
+              ...item,
+              status: 'completed',
+              detail:
+                item.id === 'report'
+                  ? previewText(finalText, 72)
+                  : item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
+              updatedAt: Date.now(),
+            };
+          }
+          if (item.id === 'verify') {
+            return {
+              ...item,
+              status: result.success ? 'completed' : 'error',
+              detail: result.success ? 'team output verified' : 'team output incomplete',
+              updatedAt: Date.now(),
+            };
+          }
+          return item;
+        }),
       });
     }
 
@@ -524,6 +688,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       detail,
       finishedAt: Date.now(),
       pid: null,
+      checklist: current.checklist.map((item) =>
+        item.status === 'in_progress'
+          ? {
+              ...item,
+              status: 'error',
+              detail,
+              updatedAt: Date.now(),
+            }
+          : item,
+      ),
     });
     await persistChain;
     if (!abortController.signal.aborted) {

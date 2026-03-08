@@ -52,6 +52,14 @@ export interface WorkflowBackgroundJobSnapshot {
   hasResult?: boolean;
   resultPreview?: string | null;
   workspacePath?: string | null;
+  checklist?: {
+    id: string;
+    label: string;
+    owner: string | null;
+    status: 'pending' | 'in_progress' | 'completed' | 'error';
+    detail: string | null;
+    updatedAt: number;
+  }[];
 }
 
 export interface WorkflowStateSnapshot {

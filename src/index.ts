@@ -395,32 +395,8 @@ const handleDoctor = async (): Promise<void> => {
 };
 
 const handleStatus = async (): Promise<void> => {
-  const multiplexerModule = await import('./multiplexer/detect.js');
-  const mux = multiplexerModule.getMultiplexer();
-  let paneCount = 0;
-  try {
-    paneCount = (await mux.listPanes()).length;
-  } catch {
-    paneCount = 0;
-  }
-
-  process.stdout.write(`backend: ${mux.name}\n`);
-  process.stdout.write(`panes: ${paneCount}\n`);
+  process.stdout.write(`backend: native\n`);
   process.stdout.write(`cwd: ${process.cwd()}\n`);
-};
-
-const handleTab = async (parsed: ParsedCommand): Promise<void> => {
-  if (parsed.subcommand === 'new') {
-    const [name] = parsed.args;
-    const tabName = name ?? 'new-tab';
-    throw new Error(`No running TUI instance for tab '${tabName}'. Start ddudu first.`);
-  }
-
-  if (parsed.subcommand === 'list') {
-    throw new Error('No running TUI instance. Start ddudu first.');
-  }
-
-  throw new Error('Unknown tab subcommand');
 };
 
 const startTui = async (): Promise<void> => {
@@ -457,11 +433,6 @@ const runCommand = async (parsed: ParsedCommand): Promise<void> => {
 
   if (parsed.command === 'run') {
     await handleRun(parsed.args, parsed.flags);
-    return;
-  }
-
-  if (parsed.command === 'tab') {
-    await handleTab(parsed);
     return;
   }
 

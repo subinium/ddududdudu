@@ -12,7 +12,12 @@ import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
 import { ChecksRunner } from '../../core/checks.js';
 import { loadConfig } from '../../core/config.js';
-import { BackgroundJobStore, resolveBackgroundJobDirectory, type BackgroundJobRecord } from '../../core/background-jobs.js';
+import {
+  BackgroundJobStore,
+  resolveBackgroundJobDirectory,
+  type BackgroundJobChecklistItem,
+  type BackgroundJobRecord,
+} from '../../core/background-jobs.js';
 import { CompactionEngine, type CompactionMessage } from '../../core/compaction.js';
 import { DriftDetector } from '../../core/drift-detector.js';
 import { EpistemicStateManager } from '../../core/epistemic-state.js';
@@ -49,8 +54,8 @@ import type { ToolContext } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
 import { ToolRegistry } from '../../tools/registry.js';
 import { discoverToolboxTools } from '../../tools/toolbox.js';
-import { BLACKPINK_MODES, BP_LYRICS, MODE_ORDER } from '../ink/theme.js';
-import { SLASH_COMMANDS } from '../ink/types.js';
+import { BP_LYRICS, HARNESS_MODES, MODE_ORDER } from '../shared/theme.js';
+import { SLASH_COMMANDS } from '../shared/types.js';
 import {
   buildCompactionMessages,
   type CompactionBuildOptions,
@@ -126,6 +131,7 @@ interface BackgroundJobState {
   hasResult?: boolean;
   resultPreview?: string | null;
   workspacePath?: string | null;
+  checklist: BackgroundJobChecklistItem[];
   controller?: AbortController | null;
 }
 
@@ -213,7 +219,7 @@ const resolveProviderConfigName = (provider: string): string => {
 };
 
 const buildFallbackSystemPrompt = (mode: NamedMode, model?: string): string => {
-  const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
+  const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
   const cwd = process.cwd();
   const projectName = basename(cwd) || 'unknown-project';
 
@@ -312,6 +318,74 @@ const previewText = (value: string, maxLength: number = 96): string => {
   }
 
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const createChecklistItem = (
+  id: string,
+  label: string,
+  status: BackgroundJobChecklistItem['status'],
+  options: { owner?: string | null; detail?: string | null } = {},
+): BackgroundJobChecklistItem => ({
+  id,
+  label,
+  owner: options.owner ?? null,
+  status,
+  detail: options.detail ?? null,
+  updatedAt: Date.now(),
+});
+
+const buildDelegateJobChecklist = (
+  purpose: DelegationPurpose | 'general',
+  mode: NamedMode | null,
+  verificationMode: VerificationMode | undefined,
+): BackgroundJobChecklistItem[] => {
+  const owner = mode ? HARNESS_MODES[mode].label : 'Delegate';
+  const items: BackgroundJobChecklistItem[] = [
+    createChecklistItem('route', 'Route the task', 'completed', { owner: 'ddudu' }),
+    createChecklistItem('execute', 'Run delegated work', 'in_progress', { owner }),
+  ];
+
+  if (verificationMode && verificationMode !== 'none') {
+    items.push(createChecklistItem('verify', 'Verify the result', 'pending', { owner }));
+  }
+
+  if (purpose === 'execution' || purpose === 'design') {
+    items.push(createChecklistItem('apply', 'Apply workspace changes', 'pending', { owner: 'ddudu' }));
+  }
+
+  items.push(createChecklistItem('report', 'Publish the result', 'pending', { owner: 'ddudu' }));
+  return items;
+};
+
+const buildTeamJobChecklist = (
+  teamAgents: TeamAgentRole[],
+  strategy: 'parallel' | 'sequential' | 'delegate',
+): BackgroundJobChecklistItem[] => [
+  createChecklistItem('fanout', `Launch ${teamAgents.length} agents`, 'in_progress', {
+    owner: `team ${strategy}`,
+  }),
+  createChecklistItem('synthesize', 'Synthesize agent outputs', 'pending', { owner: 'Jennie' }),
+  createChecklistItem('verify', 'Verify team result', 'pending', { owner: 'Jennie' }),
+  createChecklistItem('report', 'Publish the result', 'pending', { owner: 'ddudu' }),
+];
+
+const summarizeChecklistProgress = (checklist: BackgroundJobChecklistItem[]): string | null => {
+  if (checklist.length === 0) {
+    return null;
+  }
+
+  const completed = checklist.filter((item) => item.status === 'completed').length;
+  const inProgress = checklist.filter((item) => item.status === 'in_progress').length;
+  const failed = checklist.filter((item) => item.status === 'error').length;
+  const total = checklist.length;
+  const detail = [
+    `${completed}/${total} done`,
+    inProgress > 0 ? `${inProgress} active` : null,
+    failed > 0 ? `${failed} blocked` : null,
+  ]
+    .filter((part): part is string => Boolean(part))
+    .join(' · ');
+  return detail || `${completed}/${total} done`;
 };
 
 const readString = (value: unknown): string => {
@@ -469,7 +543,7 @@ const findModeForProviderModel = (
   }
 
   for (const mode of MODE_ORDER) {
-    const modeConfig = BLACKPINK_MODES[mode];
+      const modeConfig = HARNESS_MODES[mode];
     if (!modeConfig) {
       continue;
     }
@@ -601,7 +675,7 @@ export class NativeBridgeController {
     mode: 'jennie',
     modes: [],
     provider: 'anthropic',
-    model: BLACKPINK_MODES.jennie.model,
+    model: HARNESS_MODES.jennie.model,
     models: [],
     authType: null,
     authSource: null,
@@ -613,6 +687,7 @@ export class NativeBridgeController {
     contextPercent: 0,
     contextTokens: 0,
     contextLimit: 0,
+    contextPreview: null,
     requestEstimate: null,
     queuedPrompts: [],
     providers: [],
@@ -642,10 +717,10 @@ export class NativeBridgeController {
 
   private currentMode: NamedMode = 'jennie';
   private selectedModels: Record<NamedMode, string> = {
-    jennie: BLACKPINK_MODES.jennie.model,
-    lisa: BLACKPINK_MODES.lisa.model,
-    'rosé': BLACKPINK_MODES['rosé'].model,
-    jisoo: BLACKPINK_MODES.jisoo.model,
+    jennie: HARNESS_MODES.jennie.model,
+    lisa: HARNESS_MODES.lisa.model,
+    'rosé': HARNESS_MODES['rosé'].model,
+    jisoo: HARNESS_MODES.jisoo.model,
   };
   private availableProviders = new Map<string, ProviderCredentials>();
   private activeClient: ApiClient | null = null;
@@ -654,7 +729,7 @@ export class NativeBridgeController {
   private backgroundJobStore: BackgroundJobStore | null = null;
   private mcpManager: McpManager | null = null;
   private readonly loadedSkills = new Map<string, LoadedSkill>();
-  private tokenCounter = new TokenCounter(BLACKPINK_MODES.jennie.model);
+  private tokenCounter = new TokenCounter(HARNESS_MODES.jennie.model);
   private systemPrompt = buildFallbackSystemPrompt('jennie');
   private permissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private lastSafePermissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
@@ -702,7 +777,7 @@ export class NativeBridgeController {
     );
 
     for (const modeName of MODE_ORDER) {
-      this.selectedModels[modeName] = BLACKPINK_MODES[modeName].model;
+      this.selectedModels[modeName] = HARNESS_MODES[modeName].model;
     }
 
     const providers = await discoverAllProviders();
@@ -824,6 +899,7 @@ export class NativeBridgeController {
       hasResult: Boolean(job.result?.text || job.artifact),
       resultPreview: job.result?.text ? previewText(job.result.text, 160) : job.artifact?.summary ?? null,
       workspacePath: job.result?.workspacePath ?? null,
+      checklist: job.checklist.map((item) => ({ ...item })),
       controller: null,
     };
   }
@@ -1195,6 +1271,7 @@ export class NativeBridgeController {
     const requestSystemPrompt = requestContextSnapshot
       ? `${this.systemPrompt}\n\n${requestContextSnapshot}`
       : this.systemPrompt;
+    this.state.contextPreview = requestContextSnapshot || this.state.contextPreview;
     this.tokenCounter.setModel(model);
     await this.maybeAutoCompact(trimmedContent);
 
@@ -1543,7 +1620,7 @@ export class NativeBridgeController {
     }
 
     const modeLabel = decision.preferredMode
-      ? BLACKPINK_MODES[decision.preferredMode].label
+      ? HARNESS_MODES[decision.preferredMode].label
       : 'Auto';
     const purpose = decision.purpose ?? 'general';
     return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
@@ -1620,7 +1697,7 @@ export class NativeBridgeController {
     const backgroundJobId = randomUUID();
     const routeNotice = `${this.formatAutoRouteNotice(decision)} · background`;
     const label = decision.preferredMode
-      ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+      ? `${HARNESS_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
       : `delegate ${decision.purpose ?? 'general'}`;
 
     this.state.messages.push({
@@ -1656,6 +1733,11 @@ export class NativeBridgeController {
       artifacts,
       teamAgents: [],
       teamSharedContext: null,
+      checklist: buildDelegateJobChecklist(
+        decision.purpose ?? 'general',
+        decision.preferredMode ?? null,
+        this.verificationModeForPurpose(decision.purpose),
+      ),
       agentActivities: [
         {
           id: `job:${backgroundJobId}:route`,
@@ -1811,7 +1893,7 @@ export class NativeBridgeController {
         },
       );
 
-      const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
+      const finalText = result.text.trim() || `[${HARNESS_MODES[result.mode].label}] no output`;
       this.finishMessage(assistantMessage.id, finalText);
       this.rememberDelegationArtifact({
         purpose: result.purpose,
@@ -1851,7 +1933,7 @@ export class NativeBridgeController {
       });
       this.updateAgentActivity({
         id: routeActivityId,
-        label: BLACKPINK_MODES[result.mode].label,
+        label: HARNESS_MODES[result.mode].label,
         status: 'done',
         mode: result.mode,
         purpose: result.purpose,
@@ -2342,7 +2424,7 @@ export class NativeBridgeController {
   private async refreshSystemPrompt(): Promise<void> {
     const mode = this.currentMode;
     const model = this.getCurrentModel();
-    const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
+    const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
     const cwd = process.cwd();
     const projectName = basename(cwd) || 'unknown-project';
     const loadedSkills = Array.from(this.loadedSkills.values());
@@ -2384,10 +2466,12 @@ export class NativeBridgeController {
       if (contextSnapshot) {
         prompt += `\n\n${contextSnapshot}`;
       }
+      this.state.contextPreview = contextSnapshot || null;
 
       this.systemPrompt = prompt;
     } catch {
       this.systemPrompt = buildFallbackSystemPrompt(mode, model);
+      this.state.contextPreview = null;
     }
 
     this.syncUsageState();
@@ -2423,6 +2507,7 @@ export class NativeBridgeController {
         hasResult: job.hasResult ?? false,
         resultPreview: job.resultPreview ?? null,
         workspacePath: job.workspacePath ?? null,
+        checklist: job.checklist.map((item) => ({ ...item })),
       })),
     };
   }
@@ -2579,6 +2664,24 @@ export class NativeBridgeController {
                 typeof item.workspacePath === 'string' && item.workspacePath.trim()
                   ? item.workspacePath.trim()
                   : null,
+              checklist: Array.isArray(item.checklist)
+                ? item.checklist
+                    .filter((part): part is Record<string, unknown> => typeof part === 'object' && part !== null)
+                    .map((part) => ({
+                      id: typeof part.id === 'string' && part.id.trim() ? part.id.trim() : randomUUID(),
+                      label: typeof part.label === 'string' && part.label.trim() ? part.label.trim() : 'step',
+                      owner: typeof part.owner === 'string' && part.owner.trim() ? part.owner.trim() : null,
+                      status:
+                        part.status === 'pending' || part.status === 'in_progress' || part.status === 'completed' || part.status === 'error'
+                          ? part.status
+                          : 'pending',
+                      detail: typeof part.detail === 'string' && part.detail.trim() ? part.detail.trim() : null,
+                      updatedAt:
+                        typeof part.updatedAt === 'number' && Number.isFinite(part.updatedAt)
+                          ? part.updatedAt
+                          : Date.parse(entry.timestamp),
+                    }))
+                : [],
             };
           })
           .filter((item): item is WorkflowBackgroundJobSnapshot => item !== null)
@@ -2829,6 +2932,7 @@ export class NativeBridgeController {
           job.status === 'running'
             ? 'interrupted by restart'
             : job.detail,
+        checklist: Array.isArray(job.checklist) ? job.checklist.map((item) => ({ ...item })) : [],
         controller: null,
       }));
       this.syncBackgroundJobs();
@@ -2912,12 +3016,12 @@ export class NativeBridgeController {
   }
 
   private getCurrentProvider(): string {
-    const mode = BLACKPINK_MODES[this.currentMode] ?? BLACKPINK_MODES.jennie;
+    const mode = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
     return mode.provider;
   }
 
   private getCurrentModel(): string {
-    return this.selectedModels[this.currentMode] ?? BLACKPINK_MODES[this.currentMode].model;
+    return this.selectedModels[this.currentMode] ?? HARNESS_MODES[this.currentMode].model;
   }
 
   private resolveCurrentProviderModels(): string[] {
@@ -2933,13 +3037,13 @@ export class NativeBridgeController {
   private reconfigureClient(): void {
     const provider = this.getCurrentProvider();
     const model = this.getCurrentModel();
-    const modeConfig = BLACKPINK_MODES[this.currentMode] ?? BLACKPINK_MODES.jennie;
+    const modeConfig = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
 
     this.state.provider = provider;
     this.state.model = model;
     this.state.models = this.resolveCurrentProviderModels();
     this.state.modes = MODE_ORDER.map((modeName) => {
-      const modeEntry = BLACKPINK_MODES[modeName];
+      const modeEntry = HARNESS_MODES[modeName];
       return {
         name: modeName,
         label: modeEntry.label,
@@ -3032,7 +3136,7 @@ export class NativeBridgeController {
       sessionManager: this.sessionManager,
       worktreeManager: this.worktreeManager,
       resolveModel: (mode: NamedMode): string => {
-        return this.selectedModels[mode] ?? BLACKPINK_MODES[mode].model;
+        return this.selectedModels[mode] ?? HARNESS_MODES[mode].model;
       },
     });
   }
@@ -3088,7 +3192,7 @@ export class NativeBridgeController {
   }
 
   private formatConfigSummary(): string {
-    const modeEntry = BLACKPINK_MODES[this.currentMode] ?? BLACKPINK_MODES.jennie;
+    const modeEntry = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
     const authLabel = this.state.authType ?? 'missing';
 
     return [
@@ -3588,7 +3692,7 @@ export class NativeBridgeController {
     if (recentArtifacts.length > 0) {
       parts.push(
         ...recentArtifacts.map((artifact) => {
-          const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+          const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
           return `artifact: [${artifact.kind}] ${artifact.title}${mode} · ${previewText(artifact.summary, 140)}`;
         }),
       );
@@ -3636,7 +3740,7 @@ export class NativeBridgeController {
     if (activeAgents.length > 0) {
       parts.push(
         ...activeAgents.map((item) => {
-          const scope = [item.mode ? BLACKPINK_MODES[item.mode].label : item.label, item.purpose]
+          const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
             .filter((part): part is string => Boolean(part))
             .join(' · ');
           const detail = item.detail ? ` · ${previewText(item.detail, 120)}` : '';
@@ -3690,7 +3794,7 @@ export class NativeBridgeController {
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .slice(0, 6)
       .map((item) => {
-        const scope = [item.mode ? BLACKPINK_MODES[item.mode].label : item.label, item.purpose]
+        const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
           .filter((part): part is string => Boolean(part))
           .join(' · ');
         return `${scope} · ${item.status}${item.detail ? ` · ${previewText(item.detail, 120)}` : ''}`;
@@ -3704,7 +3808,7 @@ export class NativeBridgeController {
     const artifacts = this.artifacts
       .slice(0, 6)
       .map((artifact) => {
-        const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+        const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
         return `[${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
       });
 
@@ -3870,6 +3974,7 @@ export class NativeBridgeController {
         resultPreview: job.resultPreview ?? null,
         workspacePath: job.workspacePath ?? null,
         promptPreview: job.prompt ? previewText(job.prompt, 96) : null,
+        checklist: job.checklist.map((item) => ({ ...item })),
       }));
   }
 
@@ -3945,6 +4050,7 @@ export class NativeBridgeController {
     artifactTitle?: string | null;
     verificationSummary?: string | null;
     attempt?: number;
+    checklist?: BackgroundJobChecklistItem[];
     controller?: AbortController | null;
   }): void {
     const existing = this.backgroundJobs.find((job) => job.id === update.id);
@@ -3964,6 +4070,7 @@ export class NativeBridgeController {
       existing.verificationSummary = update.verificationSummary ?? existing.verificationSummary;
       existing.attempt = update.attempt ?? existing.attempt;
       existing.hasResult = update.status === 'done' ? true : existing.hasResult;
+      existing.checklist = update.checklist ?? existing.checklist;
       existing.controller = update.controller ?? existing.controller;
       existing.updatedAt = Date.now();
     } else {
@@ -3989,6 +4096,7 @@ export class NativeBridgeController {
         hasResult: update.status === 'done',
         resultPreview: null,
         workspacePath: null,
+        checklist: update.checklist ?? [],
         controller: update.controller ?? null,
       });
     }
@@ -4046,7 +4154,7 @@ export class NativeBridgeController {
     text: string;
   }): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(result.purpose);
-    const title = `${BLACKPINK_MODES[result.mode].label} ${kind}`;
+    const title = `${HARNESS_MODES[result.mode].label} ${kind}`;
     return this.rememberArtifact({
       kind,
       title,
@@ -4061,7 +4169,7 @@ export class NativeBridgeController {
     text: string,
   ): WorkflowArtifact {
     const kind = this.artifactKindForPurpose(purpose === 'general' ? undefined : purpose);
-    const title = `${BLACKPINK_MODES[this.currentMode].label} ${kind}`;
+    const title = `${HARNESS_MODES[this.currentMode].label} ${kind}`;
     return this.rememberArtifact({
       kind,
       title,
@@ -4204,7 +4312,7 @@ export class NativeBridgeController {
   }): WorkflowArtifact {
     return this.rememberArtifact({
       kind: 'patch',
-      title: `${BLACKPINK_MODES[input.mode].label} repair patch`,
+      title: `${HARNESS_MODES[input.mode].label} repair patch`,
       summary: [
         `purpose: ${input.purpose}`,
         `verification: ${input.verification.summary}`,
@@ -4358,7 +4466,7 @@ export class NativeBridgeController {
     this.rememberVerificationArtifact(
       verification,
       this.currentMode,
-      `${BLACKPINK_MODES[this.currentMode].label} verification`,
+      `${HARNESS_MODES[this.currentMode].label} verification`,
     );
     await this.ensureVerificationTodo(verification);
 
@@ -4546,7 +4654,7 @@ export class NativeBridgeController {
     return [
       'Artifacts',
       ...this.artifacts.slice(0, 8).map((artifact, index) => {
-        const mode = artifact.mode ? ` · ${BLACKPINK_MODES[artifact.mode].label}` : '';
+        const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
         return `${index + 1}. [${artifact.kind}] ${artifact.title}${mode} · ${artifact.summary}`;
       }),
     ].join('\n');
@@ -4667,8 +4775,9 @@ export class NativeBridgeController {
         const detail = job.status === 'done'
           ? job.resultPreview ?? job.workspacePath ?? job.detail ?? null
           : job.detail ?? job.resultPreview ?? job.workspacePath ?? null;
-        const suffix = detail ? ` · ${previewText(detail, 96)}` : '';
-        return `${index + 1}. ${job.label} [${job.status}]${suffix}`;
+        const progress = summarizeChecklistProgress(job.checklist);
+        const suffix = [progress, detail ? previewText(detail, 96) : null].filter((part): part is string => Boolean(part)).join(' · ');
+        return `${index + 1}. ${job.label} [${job.status}]${suffix ? ` · ${suffix}` : ''}`;
       }),
     ].join('\n');
   }
@@ -4681,10 +4790,11 @@ export class NativeBridgeController {
       `kind: ${job.kind}`,
       `status: ${job.status}`,
       job.purpose ? `purpose: ${job.purpose}` : null,
-      job.preferredMode ? `mode: ${BLACKPINK_MODES[job.preferredMode].label}` : null,
+      job.preferredMode ? `mode: ${HARNESS_MODES[job.preferredMode].label}` : null,
       job.strategy ? `strategy: ${job.strategy}` : null,
       job.reason ? `reason: ${job.reason}` : null,
       job.attempt && job.attempt > 0 ? `attempt: ${job.attempt}` : null,
+      job.checklist.length > 0 ? `progress: ${summarizeChecklistProgress(job.checklist)}` : null,
       `started: ${new Date(job.startedAt).toISOString()}`,
       `updated: ${new Date(job.updatedAt).toISOString()}`,
       job.finishedAt ? `finished: ${new Date(job.finishedAt).toISOString()}` : null,
@@ -4705,7 +4815,7 @@ export class NativeBridgeController {
       return [
         `${artifact.title}`,
         `source: ${artifact.source}`,
-        artifact.mode ? `mode: ${BLACKPINK_MODES[artifact.mode].label}` : null,
+        artifact.mode ? `mode: ${HARNESS_MODES[artifact.mode].label}` : null,
         `created: ${artifact.createdAt}`,
         '',
         artifact.summary,
@@ -4733,7 +4843,7 @@ export class NativeBridgeController {
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .map((activity) => {
         const scope = [
-          activity.mode ? BLACKPINK_MODES[activity.mode].label : activity.label,
+          activity.mode ? HARNESS_MODES[activity.mode].label : activity.label,
           activity.purpose,
           activity.status,
         ]
@@ -4756,6 +4866,14 @@ export class NativeBridgeController {
       job.result?.workspaceApply
         ? `apply: ${job.result.workspaceApply.applied ? 'applied' : job.result.workspaceApply.empty ? 'empty' : 'failed'} · ${job.result.workspaceApply.summary}${job.result.workspaceApply.error ? ` · ${job.result.workspaceApply.error}` : ''}`
         : null,
+      '',
+      'Checklist:',
+      ...(job.checklist.length > 0
+        ? job.checklist.map(
+            (item) =>
+              `- [${item.status}] ${item.label}${item.owner ? ` · ${item.owner}` : ''}${item.detail ? ` · ${previewText(item.detail, 120)}` : ''}`,
+          )
+        : ['- no recorded checklist']),
       '',
       'Agent activity:',
       ...(activities.length > 0 ? activities : ['- no recorded agent activity']),
@@ -4917,7 +5035,7 @@ export class NativeBridgeController {
           `kind: ${stored.kind}`,
           `status: ${stored.status}`,
           stored.purpose ? `purpose: ${stored.purpose}` : null,
-          stored.preferredMode ? `mode: ${BLACKPINK_MODES[stored.preferredMode].label}` : null,
+          stored.preferredMode ? `mode: ${HARNESS_MODES[stored.preferredMode].label}` : null,
           stored.strategy ? `strategy: ${stored.strategy}` : null,
           stored.reason ? `reason: ${stored.reason}` : null,
           stored.attempt > 0 ? `attempt: ${stored.attempt}` : null,
@@ -4968,7 +5086,7 @@ export class NativeBridgeController {
         return [
           stored.artifact.title,
           `source: ${stored.artifact.source}`,
-          stored.artifact.mode ? `mode: ${BLACKPINK_MODES[stored.artifact.mode].label}` : null,
+          stored.artifact.mode ? `mode: ${HARNESS_MODES[stored.artifact.mode].label}` : null,
           `created: ${stored.artifact.createdAt}`,
           '',
           stored.artifact.summary,
@@ -5271,7 +5389,7 @@ export class NativeBridgeController {
       'Team',
       `orchestrator: ${availableModes.length > 0 ? 'ready' : 'unavailable'}`,
       'strategies: parallel, sequential, delegate',
-      `available modes: ${availableModes.map((mode) => BLACKPINK_MODES[mode].label).join(', ') || 'none'}`,
+      `available modes: ${availableModes.map((mode) => HARNESS_MODES[mode].label).join(', ') || 'none'}`,
       this.teamRunStrategy && this.teamRunTask
         ? `running: ${this.teamRunStrategy} · ${previewText(this.teamRunTask, 72)}`
         : 'running: no active team run',
@@ -5497,6 +5615,7 @@ export class NativeBridgeController {
       artifacts,
       teamAgents,
       teamSharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
+      checklist: buildTeamJobChecklist(teamAgents, strategy),
       agentActivities: teamAgents.map((agent) => ({
         id: `job:${backgroundJobId}:${agent.id}:queued`,
         label: agent.name,
@@ -5548,7 +5667,7 @@ export class NativeBridgeController {
       role: 'lead' | 'worker' | 'reviewer',
       systemPrompt: string,
     ): TeamAgentRole => {
-      const modeConfig = BLACKPINK_MODES[mode] ?? BLACKPINK_MODES.jennie;
+      const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
       return {
         id,
         name: modeConfig.label,

@@ -1,4 +1,3 @@
-import { discoverToken } from '../api/oauth-discovery.js';
 import { discoverClaudeToken } from './providers/claude.js';
 import { discoverCodexToken } from './providers/codex.js';
 import { discoverGeminiToken } from './providers/gemini.js';
@@ -11,14 +10,10 @@ export interface ProviderAuth {
 }
 
 export const discoverAllProviders = async (): Promise<Map<string, ProviderAuth>> => {
-  const [claude, codex, gemini, legacyClaude] = await Promise.all([
+  const [claude, codex, gemini] = await Promise.all([
     discoverClaudeToken(),
     discoverCodexToken(),
     discoverGeminiToken(),
-    discoverToken().catch((err: unknown) => {
-      void err;
-      return null;
-    }),
   ]);
 
   const discovered = new Map<string, ProviderAuth>();
@@ -29,16 +24,6 @@ export const discoverAllProviders = async (): Promise<Map<string, ProviderAuth>>
       token: claude.token,
       source: claude.source,
       tokenType: claude.token.startsWith('sk-ant-oat01-') ? 'oauth' : 'apikey',
-    });
-  } else if (legacyClaude) {
-    discovered.set('claude', {
-      provider: 'claude',
-      token: legacyClaude.token,
-      source: `oauth-discovery:${legacyClaude.source}`,
-      tokenType:
-        legacyClaude.source === 'env-api-key' || legacyClaude.source === 'openrouter'
-          ? 'apikey'
-          : 'oauth',
     });
   }
 

@@ -67,7 +67,6 @@ export const parseArgs = (argv: string[]): ParsedCommand => {
   const parsed = parseFlagsAndArgs(tail);
 
   if (
-    command === 'tab' ||
     command === 'config' ||
     command === 'provider' ||
     command === 'session' ||

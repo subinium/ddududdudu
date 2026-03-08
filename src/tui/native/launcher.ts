@@ -48,20 +48,12 @@ export const startNativeTui = async (options: NativeTuiLaunchOptions = {}): Prom
   }
 
   if (process.env.DDUDU_TUI === 'ink') {
-    const configModule = await import('../../core/config.js');
-    const config = await configModule.loadConfig();
-    const { startInkTui } = await import('../ink/entry.js');
-    await startInkTui(config);
-    return;
+    throw new Error('The legacy Ink TUI has been removed. Run ddudu without DDUDU_TUI=ink.');
   }
 
   const binaryPath = await resolveNativeBinary();
   if (!binaryPath) {
-    const configModule = await import('../../core/config.js');
-    const config = await configModule.loadConfig();
-    const { startInkTui } = await import('../ink/entry.js');
-    await startInkTui(config);
-    return;
+    throw new Error('ddudu native TUI binary not found. Rebuild the project with npm run build.');
   }
 
   const bridgeEntrypoint = resolveBridgeEntrypoint();
