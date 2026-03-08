@@ -306,6 +306,20 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
   throw new Error('Unknown session subcommand');
 };
 
+const handleJob = async (parsed: ParsedCommand): Promise<void> => {
+  if (parsed.subcommand !== 'run') {
+    throw new Error('Unknown job subcommand');
+  }
+
+  const [jobId] = parsed.args;
+  if (!jobId) {
+    throw new Error('job run requires ID');
+  }
+
+  const { runDetachedBackgroundJob } = await import('./core/background-worker.js');
+  await runDetachedBackgroundJob(jobId);
+};
+
 type AuthProviderName = 'claude' | 'codex' | 'gemini';
 
 const AUTH_PROVIDERS: AuthProviderName[] = ['claude', 'codex', 'gemini'];
@@ -468,6 +482,11 @@ const runCommand = async (parsed: ParsedCommand): Promise<void> => {
 
   if (parsed.command === 'auth') {
     await handleAuth(parsed);
+    return;
+  }
+
+  if (parsed.command === 'job') {
+    await handleJob(parsed);
     return;
   }
 

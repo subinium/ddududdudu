@@ -22,10 +22,10 @@
 - Mode-aware delegation across `JENNIE`, `LISA`, `ROSÉ`, and `JISOO`
 - Team orchestration with parallel, sequential, and delegated runs
 - Isolated delegated runs with git worktrees for CLI-backed agent sessions
-- Workflow state with todos, permission profiles, remote CLI session state, and automatic verification
+- Workflow state with todos, permission profiles, remote CLI session state, detached background jobs, and automatic verification
 - Sidebar agent activity rail for delegated runs, task tools, and team workers
-- Context compaction, handoff, briefing, and drift checking
-- Skills, hooks, MCP tools, git-aware retrieval, and layered memory
+- Context compaction, handoff, briefing, drift checking, and repair escalation
+- Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 
 ## Modes
 
@@ -53,7 +53,9 @@ Recommended setup: run this default four-mode lineup together and let ddudu rout
 | `glob`         | match paths by pattern                              |
 | `repo_map`     | render a compact repository tree                    |
 | `symbol_search` | find likely symbol definitions                     |
+| `definition_search` | resolve likely symbol definitions with LSP/heuristics |
 | `reference_search` | find likely cross-file references and usages       |
+| `reference_hotspots` | group likely implementation hotspots by file       |
 | `changed_files` | list git-changed files for active-context retrieval |
 | `codebase_search` | score files and lines against a natural-language query |
 | `web_fetch`    | fetch and summarize remote pages                    |
@@ -110,9 +112,10 @@ ddudu keeps one canonical local session and layers provider-specific CLI session
 - `session list`, `session last`, and `session resume <id>` reopen saved local sessions
 - CLI-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
+- background runs can continue as detached workers, keep inspectable job state, and can be retried, promoted, cancelled, or reopened later
 - `/plan` and `/todo` manage the shared execution plan
 - `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`
-- direct and delegated execution paths can auto-run review checks and verification summaries
+- direct and delegated execution paths can auto-run review checks, repair retries, and verification summaries
 - `/handoff`, `/fork`, `/briefing`, and `/drift` help carry long-running work forward without losing context
 
 ## CLI Commands
@@ -156,6 +159,8 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/config` | show runtime config summary |
 | `/help` | show available commands |
 | `/doctor` | show runtime health and context info |
+| `/queue` | inspect and manage queued prompts |
+| `/jobs` | inspect, retry, promote, cancel, or read detached background job results |
 | `/review` | run review checks against the current diff |
 | `/checkpoint` | create a git checkpoint commit |
 | `/undo` | revert the last ddudu checkpoint |

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { basename } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 
 import { DEFAULT_ANTHROPIC_BASE_URL } from '../../api/anthropic-base-url.js';
@@ -11,6 +12,7 @@ import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
 import { ChecksRunner } from '../../core/checks.js';
 import { loadConfig } from '../../core/config.js';
+import { BackgroundJobStore, resolveBackgroundJobDirectory, type BackgroundJobRecord } from '../../core/background-jobs.js';
 import { CompactionEngine, type CompactionMessage } from '../../core/compaction.js';
 import { DriftDetector } from '../../core/drift-detector.js';
 import { EpistemicStateManager } from '../../core/epistemic-state.js';
@@ -643,6 +645,7 @@ export class NativeBridgeController {
   private activeClient: ApiClient | null = null;
   private toolRegistry: ToolRegistry | null = null;
   private sessionManager: SessionManager | null = null;
+  private backgroundJobStore: BackgroundJobStore | null = null;
   private mcpManager: McpManager | null = null;
   private readonly loadedSkills = new Map<string, LoadedSkill>();
   private tokenCounter = new TokenCounter(BLACKPINK_MODES.jennie.model);
@@ -660,6 +663,7 @@ export class NativeBridgeController {
   private queuedPrompts: string[] = [];
   private pendingAskUser: AskUserResolver | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
+  private backgroundJobPollTimer: NodeJS.Timeout | null = null;
   private teamRunSince: number | null = null;
   private teamRunStrategy: 'parallel' | 'sequential' | 'delegate' | null = null;
   private teamRunTask: string | null = null;
@@ -668,6 +672,7 @@ export class NativeBridgeController {
   private readonly hookRegistry = new HookRegistry();
   private readonly lspManager = new LspManager(process.cwd());
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
+  private readonly backgroundJobStatusCache = new Map<string, BackgroundJobState['status']>();
   private readonly verificationRepairFingerprints = new Map<string, number>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
@@ -728,6 +733,9 @@ export class NativeBridgeController {
     }
 
     this.sessionManager = new SessionManager(this.config.session.directory);
+    this.backgroundJobStore = new BackgroundJobStore(
+      resolveBackgroundJobDirectory(this.config.session.directory),
+    );
     try {
       const resumed = await this.resumeRequestedSession();
       if (!resumed) {
@@ -750,6 +758,8 @@ export class NativeBridgeController {
     await this.refreshSystemPrompt();
     this.reconfigureClient();
     await this.restoreEpistemicState();
+    await this.pollBackgroundJobs();
+    this.startBackgroundJobPolling();
     this.state.ready = true;
     this.emitStateNow();
   }
@@ -767,9 +777,126 @@ export class NativeBridgeController {
         model: this.getCurrentModel(),
       });
     }
+    if (this.backgroundJobPollTimer) {
+      clearInterval(this.backgroundJobPollTimer);
+      this.backgroundJobPollTimer = null;
+    }
     this.mcpManager?.disconnectAll();
     void this.lspManager.shutdown();
     this.abortCurrentRequest();
+  }
+
+  private startBackgroundJobPolling(): void {
+    if (this.backgroundJobPollTimer) {
+      clearInterval(this.backgroundJobPollTimer);
+    }
+
+    this.backgroundJobPollTimer = setInterval(() => {
+      void this.pollBackgroundJobs();
+    }, 1500);
+  }
+
+  private mapStoredJobToState(job: BackgroundJobRecord): BackgroundJobState {
+    return {
+      id: job.id,
+      kind: job.kind,
+      label: job.label,
+      status: job.status === 'queued' ? 'running' : job.status,
+      detail: job.detail,
+      startedAt: job.startedAt ?? job.createdAt,
+      updatedAt: job.updatedAt,
+      prompt: job.prompt,
+      purpose: job.purpose,
+      preferredMode: job.preferredMode ?? null,
+      strategy: job.strategy,
+      reason: job.reason ?? null,
+      artifactId: job.artifact?.id ?? null,
+      artifactTitle: job.artifact?.title ?? null,
+      verificationSummary: job.result?.verification?.summary ?? null,
+      attempt: job.attempt ?? 0,
+      controller: null,
+    };
+  }
+
+  private syncDetachedAgentActivities(jobs: BackgroundJobRecord[]): void {
+    const detached = jobs.flatMap((job) =>
+      job.agentActivities.map((activity) => ({
+        id: activity.id,
+        label: activity.label,
+        mode: activity.mode,
+        purpose: activity.purpose,
+        status: activity.status,
+        detail: activity.detail,
+        workspacePath: activity.workspacePath,
+        updatedAt: activity.updatedAt,
+      })),
+    );
+
+    const live = this.agentActivities.filter((activity) => !activity.id.startsWith('job:'));
+    this.agentActivities = [...live, ...detached];
+    this.syncAgentActivities();
+  }
+
+  private async pollBackgroundJobs(): Promise<void> {
+    if (!this.backgroundJobStore || !this.state.sessionId) {
+      return;
+    }
+
+    try {
+      const jobs = await this.backgroundJobStore.listBySession(this.state.sessionId);
+      this.backgroundJobs = jobs.map((job) => this.mapStoredJobToState(job));
+      this.syncBackgroundJobs();
+      this.syncDetachedAgentActivities(jobs);
+      for (const job of jobs) {
+        const previous = this.backgroundJobStatusCache.get(job.id);
+        this.backgroundJobStatusCache.set(job.id, job.status === 'queued' ? 'running' : job.status);
+        if (!previous) {
+          continue;
+        }
+
+        if (previous === 'running' && (job.status === 'done' || job.status === 'error')) {
+          const jobRef = job.id.slice(0, 8);
+          this.appendSystemMessage(
+            `[background] ${job.label} ${job.status === 'done' ? 'finished' : 'failed'} · /jobs result ${jobRef}`,
+          );
+          if (job.status === 'done' && job.result?.verification) {
+            await this.maybeScheduleVerificationFollowup({
+              purpose: job.purpose ?? 'general',
+              userPrompt: job.prompt,
+              assistantOutput: job.result.text,
+              verification: job.result.verification,
+              allowRepair: job.reason !== 'verification auto-retry',
+            });
+          }
+        }
+      }
+      this.scheduleStatePush();
+    } catch (error: unknown) {
+      this.state.error = `[jobs] ${serializeError(error)}`;
+      this.scheduleStatePush();
+    }
+  }
+
+  private resolveCliEntrypoint(): string {
+    return fileURLToPath(new URL('../../index.js', import.meta.url));
+  }
+
+  private async spawnDetachedBackgroundJob(jobId: string): Promise<void> {
+    const child = spawn(
+      process.execPath,
+      [this.resolveCliEntrypoint(), 'job', 'run', jobId],
+      {
+        cwd: process.cwd(),
+        detached: true,
+        stdio: 'ignore',
+        env: {
+          ...process.env,
+          DDUDU_BACKGROUND_JOB: '1',
+        },
+      },
+    );
+
+    child.unref();
   }
 
   public appendSystemMessage(content: string): void {
@@ -1459,16 +1586,11 @@ export class NativeBridgeController {
     userMessage: NativeMessageState,
     decision: AutoRouteDecision,
   ): Promise<void> {
-    const assistantMessage: NativeMessageState = {
-      id: randomUUID(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      isStreaming: true,
-    };
     const backgroundJobId = randomUUID();
-    const routeActivityId = `bg:${backgroundJobId}:route`;
     const routeNotice = `${this.formatAutoRouteNotice(decision)} · background`;
+    const label = decision.preferredMode
+      ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
+      : `delegate ${decision.purpose ?? 'general'}`;
 
     this.state.messages.push({
       id: randomUUID(),
@@ -1476,263 +1598,66 @@ export class NativeBridgeController {
       content: routeNotice,
       timestamp: Date.now(),
     });
-    this.state.messages.push(assistantMessage);
-    this.updateBackgroundJob({
+    if (!this.backgroundJobStore) {
+      this.appendSystemMessage('[jobs] Background worker unavailable.');
+      return;
+    }
+
+    const contextSnapshot = await this.buildPromptContextSnapshot(
+      userMessage.content,
+      decision.purpose ?? 'general',
+    );
+    const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
+    const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
+      sessionId: this.state.sessionId,
       kind: 'delegate',
-      label: decision.preferredMode
-        ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-        : `delegate ${decision.purpose ?? 'general'}`,
-      status: 'running',
-      detail: previewText(userMessage.content, 72),
+      label,
+      cwd: process.cwd(),
       prompt: userMessage.content,
       purpose: decision.purpose ?? 'general',
       preferredMode: decision.preferredMode ?? null,
+      preferredModel: decision.preferredMode ? this.selectedModels[decision.preferredMode] : null,
       reason: decision.reason,
       attempt: decision.repairAttempt ?? 0,
-    });
-    this.updateAgentActivity({
-      id: routeActivityId,
-      label: 'route',
-      status: 'running',
-      mode: decision.preferredMode ?? null,
-      purpose: decision.purpose ?? 'general',
-      detail: `background · ${previewText(userMessage.content, 64)}`,
-    });
-
-    this.scheduleStatePush();
-
-    const controller = new AbortController();
-    this.updateBackgroundJob({
-      id: backgroundJobId,
-      kind: 'delegate',
-      label: decision.preferredMode
-        ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-        : `delegate ${decision.purpose ?? 'general'}`,
-      status: 'running',
-      detail: previewText(userMessage.content, 72),
-      prompt: userMessage.content,
-      purpose: decision.purpose ?? 'general',
-      preferredMode: decision.preferredMode ?? null,
-      reason: decision.reason,
-      attempt: decision.repairAttempt ?? 0,
-      controller,
-    });
-    void (async () => {
-      try {
-        const contextSnapshot = await this.buildPromptContextSnapshot(
-          userMessage.content,
-          decision.purpose ?? 'general',
-        );
-        await this.hookRegistry.emit('beforeSend', {
-          provider: this.getCurrentProvider(),
-          model: this.getCurrentModel(),
-          sessionId: this.state.sessionId,
-          remoteSessionId: null,
-          requestMode: 'full',
-          prompt: userMessage.content,
-        });
-
-        const runtime = this.createDelegationRuntime();
-        const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
-        const result = await runtime.run(
-          {
-            prompt: userMessage.content,
-            purpose: decision.purpose,
-            preferredMode: decision.preferredMode,
-            parentSessionId: this.state.sessionId,
-            maxTokens: this.config ? getMaxTokens(this.config) : undefined,
-            cwd: process.cwd(),
-            isolatedLabel: `background-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
-            verificationMode: this.verificationModeForPurpose(decision.purpose),
-            contextSnapshot,
-            artifacts,
-          },
-          {
-            signal: controller.signal,
-            onText: (delta) => {
-              if (!delta) {
-                return;
-              }
-
-              const current = this.state.messages.find((message) => message.id === assistantMessage.id)?.content ?? '';
-              this.updateMessage(assistantMessage.id, current + delta);
-              this.updateBackgroundJob({
-                id: backgroundJobId,
-                kind: 'delegate',
-                label: decision.preferredMode
-                  ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-                  : `delegate ${decision.purpose ?? 'general'}`,
-                status: 'running',
-                detail: previewText(delta, 72),
-              });
-              this.updateAgentActivity({
-                id: routeActivityId,
-                label: 'route',
-                status: 'running',
-                mode: decision.preferredMode ?? null,
-                purpose: decision.purpose ?? 'general',
-                detail: previewText(delta, 64),
-              });
-            },
-            onToolState: (states) => {
-              this.applyToolStates(assistantMessage.id, states);
-              const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
-              if (activeTool) {
-                const toolLabel = `${activeTool.name} ${activeTool.status}`;
-                this.updateBackgroundJob({
-                  id: backgroundJobId,
-                  kind: 'delegate',
-                  label: decision.preferredMode
-                    ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-                    : `delegate ${decision.purpose ?? 'general'}`,
-                  status: 'running',
-                  detail: toolLabel,
-                });
-                this.updateAgentActivity({
-                  id: routeActivityId,
-                  label: 'route',
-                  status: 'running',
-                  mode: decision.preferredMode ?? null,
-                  purpose: decision.purpose ?? 'general',
-                  detail: toolLabel,
-                });
-              }
-            },
-            onVerificationState: (state) => {
-              this.updateAgentActivity({
-                id: routeActivityId,
-                label: 'route',
-                status:
-                  state.status === 'running'
-                    ? 'verifying'
-                    : state.status === 'passed' || state.status === 'skipped'
-                      ? 'done'
-                      : 'error',
-                mode: decision.preferredMode ?? null,
-                purpose: decision.purpose ?? 'general',
-                detail: state.summary ?? null,
-              });
-            },
-          },
-        );
-
-        const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
-        this.finishMessage(assistantMessage.id, finalText);
-        const resultArtifact = this.rememberDelegationArtifact({
-          purpose: result.purpose,
-          mode: result.mode,
-          text: finalText,
-        });
-        let verificationArtifact: WorkflowArtifact | null = null;
-        if (result.verification?.status === 'failed') {
-          verificationArtifact = this.rememberVerificationArtifact(
-            result.verification,
-            result.mode,
-            `${BLACKPINK_MODES[result.mode].label} verification`,
-          );
-        }
-        this.updateBackgroundJob({
-          id: backgroundJobId,
-          kind: 'delegate',
-          label: `${BLACKPINK_MODES[result.mode].label} ${result.purpose ?? 'general'}`,
-          status: 'done',
-          detail: result.verification?.summary ?? previewText(finalText, 72),
-          prompt: userMessage.content,
-          purpose: result.purpose,
-          preferredMode: result.mode,
-          artifactId: verificationArtifact?.id ?? resultArtifact.id,
-          artifactTitle: verificationArtifact?.title ?? resultArtifact.title,
-          verificationSummary: result.verification?.summary ?? null,
-          controller: null,
-        });
-        this.updateAgentActivity({
-          id: routeActivityId,
-          label: BLACKPINK_MODES[result.mode].label,
-          status: 'done',
-          mode: result.mode,
-          purpose: result.purpose,
-          detail: result.verification?.summary ?? previewText(finalText, 64),
-          workspacePath: result.workspace?.path ?? null,
-        });
-
-        await this.hookRegistry.emit('afterResponse', {
-          provider: result.provider,
-          model: result.model,
-          sessionId: this.state.sessionId,
-          remoteSessionId: result.remoteSessionId ?? null,
-          requestMode: 'full',
-          inputTokens: result.usage.input,
-          outputTokens: result.usage.output,
-        });
-
-        if (this.sessionManager && this.state.sessionId) {
-          await this.sessionManager.append(this.state.sessionId, {
-            type: 'message',
-            timestamp: new Date().toISOString(),
-            data: {
-              user: userMessage.content,
-              assistant: finalText,
-              mode: result.mode,
-              provider: result.provider,
-              model: result.model,
-              requestMode: 'delegate_background',
-              purpose: result.purpose,
-              autoRoute: decision.reason,
-              remoteSessionId: result.remoteSessionId,
-              workspacePath: result.workspace?.path,
-              verification: result.verification
-                ? {
-                    status: result.verification.status,
-                    summary: result.verification.summary,
-                  }
-                : undefined,
-              inputTokens: result.usage.input,
-              outputTokens: result.usage.output,
-            },
-          });
-        }
-
-        await this.maybeScheduleVerificationFollowup({
-          purpose: result.purpose ?? 'general',
-          userPrompt: userMessage.content,
-          assistantOutput: finalText,
-          verification: result.verification,
-          allowRepair: decision.reason !== 'verification auto-retry',
-        });
-      } catch (error: unknown) {
-        const detail = controller.signal.aborted ? 'background job aborted' : serializeError(error);
-        this.updateBackgroundJob({
-          id: backgroundJobId,
-          kind: 'delegate',
-          label: decision.preferredMode
-            ? `${BLACKPINK_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-            : `delegate ${decision.purpose ?? 'general'}`,
-          status: 'error',
-          detail,
-          prompt: userMessage.content,
-          purpose: decision.purpose ?? 'general',
-          preferredMode: decision.preferredMode ?? null,
-          controller: null,
-        });
-        this.updateAgentActivity({
-          id: routeActivityId,
+      verificationMode: this.verificationModeForPurpose(decision.purpose),
+      contextSnapshot,
+      artifacts,
+      teamAgents: [],
+      teamSharedContext: null,
+      agentActivities: [
+        {
+          id: `job:${backgroundJobId}:route`,
           label: 'route',
-          status: 'error',
           mode: decision.preferredMode ?? null,
           purpose: decision.purpose ?? 'general',
-          detail,
-        });
-        await this.hookRegistry.emit('onError', {
-          provider: this.getCurrentProvider(),
-          model: this.getCurrentModel(),
-          sessionId: this.state.sessionId,
-          operation: 'delegate_background',
-          message: serializeError(error),
-        });
-        this.finishMessage(assistantMessage.id, controller.signal.aborted ? '[background request aborted]' : toErrorMessage(error));
-      }
-    })();
+          status: 'queued',
+          detail: `background · ${previewText(userMessage.content, 64)}`,
+          workspacePath: null,
+          updatedAt: Date.now(),
+        },
+      ],
+      result: null,
+      artifact: null,
+    });
+
+    this.backgroundJobs = [this.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
+    this.syncBackgroundJobs();
+    this.syncDetachedAgentActivities([record]);
+    this.scheduleStatePush();
+
+    try {
+      await this.spawnDetachedBackgroundJob(record.id);
+      await this.pollBackgroundJobs();
+    } catch (error: unknown) {
+      await this.backgroundJobStore.update(record.id, {
+        status: 'error',
+        detail: serializeError(error),
+        finishedAt: Date.now(),
+      });
+      await this.pollBackgroundJobs();
+      throw error;
+    }
   }
 
   private async executeDelegatedRoute(
@@ -3790,7 +3715,9 @@ export class NativeBridgeController {
   }
 
   private resetEphemeralAgentActivities(): void {
-    this.agentActivities = this.agentActivities.filter((activity) => activity.status === 'error');
+    this.agentActivities = this.agentActivities.filter(
+      (activity) => activity.status === 'error' || activity.id.startsWith('job:'),
+    );
     this.syncAgentActivities();
   }
 
@@ -4089,6 +4016,36 @@ export class NativeBridgeController {
     ].join('\n');
   }
 
+  private buildVerificationEscalationTask(input: {
+    purpose: DelegationPurpose | 'general';
+    userPrompt: string;
+    assistantOutput: string;
+    verification: VerificationSummary;
+  }): string {
+    return [
+      `Escalate this failing ${input.purpose} request as a coordinated team repair.`,
+      '',
+      'Original request:',
+      input.userPrompt,
+      '',
+      'Current failing output summary:',
+      previewText(input.assistantOutput, 700),
+      '',
+      'Verification summary:',
+      input.verification.summary,
+      '',
+      'Verification report:',
+      input.verification.report,
+      '',
+      'Expected team behavior:',
+      '- planner/reviewer isolates the root cause',
+      '- executor proposes the smallest safe patch',
+      '- reviewer verifies the patch and remaining risks',
+      '',
+      'Return one merged repair briefing and final verification status.',
+    ].join('\n');
+  }
+
   private preferredRetryModeForPurpose(
     purpose: DelegationPurpose | 'general',
   ): NamedMode {
@@ -4152,6 +4109,28 @@ export class NativeBridgeController {
           preferredMode: this.preferredRetryModeForPurpose(input.purpose),
           reason: 'verification auto-retry',
           repairAttempt: repairAttempts + 1,
+        },
+      );
+      return;
+    }
+
+    const canEscalateToTeam =
+      input.purpose !== 'review' &&
+      input.purpose !== 'oracle' &&
+      this.canStartBackgroundJob() &&
+      repairAttempts >= 1;
+
+    if (canEscalateToTeam) {
+      await this.startBackgroundTeamRun(
+        'delegate',
+        this.buildVerificationEscalationTask({
+          purpose: input.purpose,
+          userPrompt: input.userPrompt,
+          assistantOutput: input.assistantOutput,
+          verification,
+        }),
+        {
+          routeNote: 'Verification escalation · team delegate',
         },
       );
       return;
@@ -4437,6 +4416,18 @@ export class NativeBridgeController {
     return `Job ${job.id} has no stored result yet.`;
   }
 
+  private async getStoredBackgroundJob(jobId: string): Promise<BackgroundJobRecord | null> {
+    if (!this.backgroundJobStore) {
+      return null;
+    }
+
+    try {
+      return await this.backgroundJobStore.load(jobId);
+    } catch {
+      return null;
+    }
+  }
+
   private resolveBackgroundJob(reference: string): BackgroundJobState {
     const visibleJobs = this.backgroundJobs
       .slice()
@@ -4480,22 +4471,21 @@ export class NativeBridgeController {
         return 'Usage: /jobs cancel <index-or-id>';
       }
       const job = this.resolveBackgroundJob(ref);
-      if (job.status !== 'running' || !job.controller) {
+      const stored = await this.getStoredBackgroundJob(job.id);
+      if (job.status !== 'running' || !stored?.pid) {
         return `Job ${ref} is not cancellable.`;
       }
-      job.controller.abort();
-      this.updateBackgroundJob({
-        id: job.id,
-        kind: job.kind,
-        label: job.label,
-        status: 'error',
-        detail: 'cancelled by user',
-        prompt: job.prompt,
-        purpose: job.purpose,
-        preferredMode: job.preferredMode,
-        strategy: job.strategy,
-        controller: null,
-      });
+      try {
+        process.kill(stored.pid, 'SIGTERM');
+      } catch {
+        await this.backgroundJobStore?.update(job.id, {
+          status: 'error',
+          detail: 'cancelled by user',
+          finishedAt: Date.now(),
+          pid: null,
+        });
+      }
+      await this.pollBackgroundJobs();
       return `Cancelled job ${ref}.`;
     }
 
@@ -4540,7 +4530,32 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs inspect <index-or-id>';
       }
-      return this.formatJobInspect(this.resolveBackgroundJob(ref));
+      const job = this.resolveBackgroundJob(ref);
+      const stored = await this.getStoredBackgroundJob(job.id);
+      if (stored) {
+        return [
+          `Job ${stored.id}`,
+          `label: ${stored.label}`,
+          `kind: ${stored.kind}`,
+          `status: ${stored.status}`,
+          stored.purpose ? `purpose: ${stored.purpose}` : null,
+          stored.preferredMode ? `mode: ${BLACKPINK_MODES[stored.preferredMode].label}` : null,
+          stored.strategy ? `strategy: ${stored.strategy}` : null,
+          stored.reason ? `reason: ${stored.reason}` : null,
+          stored.attempt > 0 ? `attempt: ${stored.attempt}` : null,
+          `created: ${new Date(stored.createdAt).toISOString()}`,
+          stored.startedAt ? `started: ${new Date(stored.startedAt).toISOString()}` : null,
+          stored.finishedAt ? `finished: ${new Date(stored.finishedAt).toISOString()}` : null,
+          `updated: ${new Date(stored.updatedAt).toISOString()}`,
+          stored.detail ? `detail: ${stored.detail}` : null,
+          stored.result?.verification?.summary ? `verification: ${stored.result.verification.summary}` : null,
+          stored.artifact ? `artifact: ${stored.artifact.title}` : null,
+          stored.prompt ? `prompt: ${stored.prompt}` : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join('\n');
+      }
+      return this.formatJobInspect(job);
     }
 
     if (command === 'result') {
@@ -4548,7 +4563,24 @@ export class NativeBridgeController {
       if (!ref) {
         return 'Usage: /jobs result <index-or-id>';
       }
-      return this.formatJobResult(this.resolveBackgroundJob(ref));
+      const job = this.resolveBackgroundJob(ref);
+      const stored = await this.getStoredBackgroundJob(job.id);
+      if (stored?.result?.text) {
+        return stored.result.text;
+      }
+      if (stored?.artifact) {
+        return [
+          stored.artifact.title,
+          `source: ${stored.artifact.source}`,
+          stored.artifact.mode ? `mode: ${BLACKPINK_MODES[stored.artifact.mode].label}` : null,
+          `created: ${stored.artifact.createdAt}`,
+          '',
+          stored.artifact.summary,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join('\n');
+      }
+      return this.formatJobResult(job);
     }
 
     if (command === 'promote') {
@@ -4563,18 +4595,22 @@ export class NativeBridgeController {
 
       if (job.status === 'running' && job.controller) {
         job.controller.abort();
-        this.updateBackgroundJob({
-          id: job.id,
-          kind: job.kind,
-          label: job.label,
-          status: 'error',
-          detail: 'promoted to foreground',
-          prompt: job.prompt,
-          purpose: job.purpose,
-          preferredMode: job.preferredMode,
-          strategy: job.strategy,
-          controller: null,
-        });
+      } else {
+        const stored = await this.getStoredBackgroundJob(job.id);
+        if (stored?.pid) {
+          try {
+            process.kill(stored.pid, 'SIGTERM');
+          } catch {
+            // Process may already be gone; promote anyway.
+          }
+          await this.backgroundJobStore?.update(job.id, {
+            status: 'error',
+            detail: 'promoted to foreground',
+            finishedAt: Date.now(),
+            pid: null,
+          });
+          await this.pollBackgroundJobs();
+        }
       }
 
       if (this.state.loading && this.abortController) {
@@ -4977,21 +5013,12 @@ export class NativeBridgeController {
       return;
     }
 
-    const runId = randomUUID();
-    const backgroundJobId = randomUUID();
-    const backgroundNotes: string[] = [];
-    for (const agent of teamAgents) {
-      this.updateAgentActivity({
-        id: `team:${runId}:queued:${agent.id}`,
-        label: agent.name,
-        status: 'queued',
-        mode: agent.mode,
-        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
-        detail: `background ${strategy} · ${agent.role}`,
-      });
+    if (!this.backgroundJobStore) {
+      this.appendSystemMessage('[jobs] Background worker unavailable.');
+      return;
     }
 
-    const assistantMessageId = randomUUID();
+    const backgroundJobId = randomUUID();
     const notice = options.routeNote
       ? `${options.routeNote} · ${previewText(task, 96)}`
       : `Team run background · ${strategy} · ${previewText(task, 96)}`;
@@ -5001,119 +5028,57 @@ export class NativeBridgeController {
       content: notice,
       timestamp: Date.now(),
     });
-    this.state.messages.push({
-      id: assistantMessageId,
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      isStreaming: true,
-    });
-    this.updateBackgroundJob({
+    const contextSnapshot = await this.buildPromptContextSnapshot(task, 'planning');
+    const artifacts = this.getArtifactsForPurpose('planning', 4);
+    const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
+      sessionId: this.state.sessionId,
       kind: 'team',
       label: `team ${strategy}`,
-      status: 'running',
-      detail: previewText(task, 72),
+      cwd: process.cwd(),
       prompt: task,
+      purpose: 'general',
+      preferredMode: null,
+      preferredModel: null,
       strategy,
       reason: options.routeNote ?? `team ${strategy}`,
+      attempt: 0,
+      verificationMode: 'checks',
+      contextSnapshot,
+      artifacts,
+      teamAgents,
+      teamSharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
+      agentActivities: teamAgents.map((agent) => ({
+        id: `job:${backgroundJobId}:${agent.id}:queued`,
+        label: agent.name,
+        mode: agent.mode ?? null,
+        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
+        status: 'queued',
+        detail: `background ${strategy} · ${agent.role}`,
+        workspacePath: null,
+        updatedAt: Date.now(),
+      })),
+      result: null,
+      artifact: null,
     });
+
+    this.backgroundJobs = [this.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
+    this.syncBackgroundJobs();
+    this.syncDetachedAgentActivities([record]);
     this.scheduleStatePush();
 
-    const controller = new AbortController();
-    this.updateBackgroundJob({
-      id: backgroundJobId,
-      kind: 'team',
-      label: `team ${strategy}`,
-      status: 'running',
-      detail: previewText(task, 72),
-      prompt: task,
-      strategy,
-      reason: options.routeNote ?? `team ${strategy}`,
-      controller,
-    });
-    void (async () => {
-      try {
-        const orchestrator = new TeamOrchestrator({
-          name: 'ddudu-native-team-bg',
-          agents: teamAgents,
-          strategy,
-          maxRounds: 2,
-          sharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
-          runAgent: async (agent, input, round) =>
-            this.executeTeamAgent(agent, input, round, controller.signal, runId, backgroundNotes),
-          onMessage: (message) => {
-            this.updateMessage(assistantMessageId, this.formatTeamProgress(message));
-            this.updateBackgroundJob({
-              id: backgroundJobId,
-              kind: 'team',
-              label: `team ${strategy}`,
-              status: 'running',
-              detail: `${message.type} · ${message.from} → ${message.to}`,
-            });
-          },
-        });
-
-        const result = await orchestrator.run(task, controller.signal);
-        const formatted = this.formatTeamResult(
-          strategy,
-          task,
-          teamAgents,
-          result.messages,
-          result.output,
-          result.success,
-          result.rounds,
-          backgroundNotes,
-        );
-        this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
-        this.finishMessage(assistantMessageId, formatted);
-        const artifact = this.rememberTeamArtifact(strategy, task, result.output);
-        this.updateBackgroundJob({
-          id: backgroundJobId,
-          kind: 'team',
-          label: `team ${strategy}`,
-          status: 'done',
-          detail: this.teamLastSummary,
-          prompt: task,
-          strategy,
-          artifactId: artifact.id,
-          artifactTitle: artifact.title,
-          controller: null,
-        });
-
-        if (this.sessionManager && this.state.sessionId) {
-          await this.sessionManager.append(this.state.sessionId, {
-            type: 'message',
-            timestamp: new Date().toISOString(),
-            data: {
-              user: task,
-              assistant: formatted,
-              mode: this.currentMode,
-              requestMode: 'team_background',
-              teamStrategy: strategy,
-              teamAgents: teamAgents.map((agent) => ({
-                id: agent.id,
-                mode: agent.mode,
-                model: agent.model,
-              })),
-            },
-          });
-        }
-      } catch (error: unknown) {
-        const detail = controller.signal.aborted ? 'background team aborted' : serializeError(error);
-        this.updateBackgroundJob({
-          id: backgroundJobId,
-          kind: 'team',
-          label: `team ${strategy}`,
-          status: 'error',
-          detail,
-          prompt: task,
-          strategy,
-          controller: null,
-        });
-        this.finishMessage(assistantMessageId, controller.signal.aborted ? '[background team aborted]' : `Team run failed: ${serializeError(error)}`);
-      }
-    })();
+    try {
+      await this.spawnDetachedBackgroundJob(record.id);
+      await this.pollBackgroundJobs();
+    } catch (error: unknown) {
+      await this.backgroundJobStore.update(record.id, {
+        status: 'error',
+        detail: serializeError(error),
+        finishedAt: Date.now(),
+      });
+      await this.pollBackgroundJobs();
+      throw error;
+    }
   }
 
   private buildTeamAgents(): TeamAgentRole[] {

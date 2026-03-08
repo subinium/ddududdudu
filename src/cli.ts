@@ -66,7 +66,14 @@ export const parseArgs = (argv: string[]): ParsedCommand => {
   const tail = tokens.slice(1);
   const parsed = parseFlagsAndArgs(tail);
 
-  if (command === 'tab' || command === 'config' || command === 'provider' || command === 'session' || command === 'auth') {
+  if (
+    command === 'tab' ||
+    command === 'config' ||
+    command === 'provider' ||
+    command === 'session' ||
+    command === 'auth' ||
+    command === 'job'
+  ) {
     const [subcommand, ...restArgs] = parsed.args;
     return {
       command,
