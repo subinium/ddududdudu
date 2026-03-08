@@ -1,6 +1,6 @@
 import type { DelegationRuntime } from '../core/delegation.js';
 import type { NamedMode } from '../core/types.js';
-import type { PermissionProfile, PlanItem, PlanItemStatus } from '../core/workflow-state.js';
+import type { PermissionProfile, PlanItem, PlanItemStatus, WorkflowArtifact } from '../core/workflow-state.js';
 
 export interface ToolParameter {
   type: 'string' | 'number' | 'boolean' | 'array' | 'object';
@@ -31,6 +31,7 @@ export interface ToolContext {
     workspacePath?: string;
   }) => void;
   contextSnapshot?: (prompt: string, purpose?: string) => Promise<string>;
+  artifacts?: (purpose?: string, limit?: number) => WorkflowArtifact[];
   askUser?: (question: string, options?: string[]) => Promise<string>;
   authToken?: string;
   authBaseUrl?: string;

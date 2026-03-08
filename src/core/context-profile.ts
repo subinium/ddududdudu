@@ -2,7 +2,7 @@ export interface ContextProfileInput {
   provider: string;
   model: string;
   providerWindowTokens: number;
-  bridgeBacked: boolean;
+  cliBacked: boolean;
   triggerRatio: number;
 }
 
@@ -23,25 +23,25 @@ export const deriveContextProfile = (input: ContextProfileInput): ContextProfile
   let providerWindowTokens = Math.max(input.providerWindowTokens, 32_000);
 
   if (
-    input.bridgeBacked &&
+    input.cliBacked &&
     input.provider === 'anthropic' &&
     input.model.startsWith('claude-sonnet-4')
   ) {
     providerWindowTokens = Math.min(providerWindowTokens, 200_000);
   }
 
-  let canonicalWorkingSetTokens = input.bridgeBacked
+  let canonicalWorkingSetTokens = input.cliBacked
     ? Math.min(Math.floor(providerWindowTokens * 0.35), 180_000)
     : Math.min(Math.floor(providerWindowTokens * 0.6), 260_000);
 
   if (input.provider === 'openai' && input.model.startsWith('gpt-5.4')) {
-    canonicalWorkingSetTokens = input.bridgeBacked
+    canonicalWorkingSetTokens = input.cliBacked
       ? Math.min(canonicalWorkingSetTokens, 180_000)
       : Math.min(Math.floor(providerWindowTokens * 0.5), 260_000);
   }
 
   if (input.provider === 'anthropic' && input.model.startsWith('claude-sonnet-4')) {
-    canonicalWorkingSetTokens = input.bridgeBacked
+    canonicalWorkingSetTokens = input.cliBacked
       ? Math.min(canonicalWorkingSetTokens, 220_000)
       : Math.min(Math.floor(providerWindowTokens * 0.55), 320_000);
   }
@@ -52,10 +52,10 @@ export const deriveContextProfile = (input: ContextProfileInput): ContextProfile
     providerWindowTokens,
     canonicalWorkingSetTokens,
     autoCompactAtTokens: Math.floor(canonicalWorkingSetTokens * triggerRatio),
-    hydrateInlineMessages: input.bridgeBacked ? 3 : 5,
-    maxToolCallsPerMessage: input.bridgeBacked ? 2 : 4,
-    toolResultChars: input.bridgeBacked ? 220 : 360,
-    assistantChars: input.bridgeBacked ? 3_600 : 6_000,
+    hydrateInlineMessages: input.cliBacked ? 3 : 5,
+    maxToolCallsPerMessage: input.cliBacked ? 2 : 4,
+    toolResultChars: input.cliBacked ? 220 : 360,
+    assistantChars: input.cliBacked ? 3_600 : 6_000,
     userChars: 2_400,
     systemChars: 1_200,
   };

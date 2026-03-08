@@ -6,6 +6,7 @@ import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { VerificationRunner } from './verifier.js';
 import type { IsolatedWorkspace } from './worktree-manager.js';
 import { WorktreeManager } from './worktree-manager.js';
+import type { WorkflowArtifact } from './workflow-state.js';
 
 export interface DelegationCredentials {
   token: string;
@@ -35,6 +36,7 @@ export interface DelegationRequest {
   verificationMode?: VerificationMode;
   forceIsolation?: boolean;
   contextSnapshot?: string;
+  artifacts?: WorkflowArtifact[];
 }
 
 export interface DelegationHandlers {
@@ -204,6 +206,43 @@ const buildSessionEntry = (
   };
 };
 
+const previewArtifactText = (value: string, maxLength: number = 320): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
+const buildDelegationPrompt = (
+  request: DelegationRequest,
+  purpose: DelegationPurpose,
+): string => {
+  const sections: string[] = [`Task purpose: ${purpose}`];
+
+  if (request.artifacts && request.artifacts.length > 0) {
+    sections.push(
+      '<handoff_artifacts>',
+      ...request.artifacts.map((artifact) => {
+        const attrs = [
+          `kind="${artifact.kind}"`,
+          `title="${artifact.title.replace(/"/g, '\'')}"`,
+          `source="${artifact.source}"`,
+          artifact.mode ? `mode="${artifact.mode}"` : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(' ');
+        return `<artifact ${attrs}>\n${previewArtifactText(artifact.summary)}\n</artifact>`;
+      }),
+      '</handoff_artifacts>',
+    );
+  }
+
+  sections.push('<task>', request.prompt.trim(), '</task>');
+  return sections.join('\n\n');
+};
+
 export class DelegationRuntime {
   private readonly config: DelegationRuntimeConfig;
   private readonly providers: Map<string, DelegationCredentials>;
@@ -274,7 +313,7 @@ export class DelegationRuntime {
     }
 
     try {
-      const messages: ApiMessage[] = [{ role: 'user', content: request.prompt }];
+      const messages: ApiMessage[] = [{ role: 'user', content: buildDelegationPrompt(request, purpose) }];
       const combinedSystemPrompt = [request.systemPrompt ?? profile.systemPrompt, request.contextSnapshot]
         .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
@@ -396,12 +435,12 @@ export class DelegationRuntime {
       return null;
     }
 
-    const bridgeBacked =
+    const cliBacked =
       (options.provider === 'anthropic' && options.auth.tokenType === 'oauth') ||
       (options.provider === 'openai' && options.auth.tokenType === 'bearer');
     const shouldIsolate =
       options.forceIsolation ||
-      bridgeBacked ||
+      cliBacked ||
       options.purpose === 'execution' ||
       options.purpose === 'design' ||
       options.purpose === 'review';

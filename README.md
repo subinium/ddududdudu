@@ -21,8 +21,8 @@
 - Canonical local sessions with `resume`, `hydrate`, and saved session reopening
 - Mode-aware delegation across `JENNIE`, `LISA`, `ROSÉ`, and `JISOO`
 - Team orchestration with parallel, sequential, and delegated runs
-- Isolated delegated runs with git worktrees for bridge-backed agent sessions
-- Workflow state with todos, permission profiles, remote bridge state, and automatic verification
+- Isolated delegated runs with git worktrees for CLI-backed agent sessions
+- Workflow state with todos, permission profiles, remote CLI session state, and automatic verification
 - Sidebar agent activity rail for delegated runs, task tools, and team workers
 - Context compaction, handoff, briefing, and drift checking
 - Skills, hooks, MCP tools, git-aware retrieval, and layered memory
@@ -103,10 +103,10 @@ ddudu auth
 
 ## Workflow
 
-ddudu keeps one canonical local session and layers provider-specific bridge sessions on top of it.
+ddudu keeps one canonical local session and layers provider-specific CLI sessions on top of it.
 
 - `session list`, `session last`, and `session resume <id>` reopen saved local sessions
-- bridge-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
+- CLI-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - `/plan` and `/todo` manage the shared execution plan
 - `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`

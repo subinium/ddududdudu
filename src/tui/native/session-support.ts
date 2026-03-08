@@ -1,9 +1,9 @@
 import type { ApiMessage } from '../../api/anthropic-client.js';
 import type { NativeMessageState, NativeRequestEstimateState } from './protocol.js';
 
-export type BridgeRequestMode = 'full' | 'resume' | 'hydrate';
+export type CliBackedRequestMode = 'full' | 'resume' | 'hydrate';
 
-export interface BridgeSessionState {
+export interface CliBackedSessionState {
   provider: string;
   sessionId: string;
   syncedMessageCount: number;
@@ -108,7 +108,7 @@ export const createRequestEstimate = (input: {
   history: number;
   tools: number;
   prompt: number;
-  mode: BridgeRequestMode;
+  mode: CliBackedRequestMode;
   note?: string;
 }): NativeRequestEstimateState => {
   return {

@@ -119,6 +119,7 @@ export const oracleTool: Tool = {
         const contextSnapshot = ctx.contextSnapshot
           ? await ctx.contextSnapshot(question, 'oracle')
           : undefined;
+        const artifacts = ctx.artifacts?.('oracle', 4);
         const result = await ctx.delegation.run(
           {
             prompt: question,
@@ -130,6 +131,7 @@ export const oracleTool: Tool = {
             isolatedLabel: `oracle-${preferredMode ?? 'auto'}`,
             verificationMode: 'none',
             contextSnapshot,
+            artifacts,
           },
           {
             onText: (text: string) => {

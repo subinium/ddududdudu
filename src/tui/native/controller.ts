@@ -49,8 +49,8 @@ import { SLASH_COMMANDS } from '../ink/types.js';
 import {
   buildCompactionMessages,
   type CompactionBuildOptions,
-  type BridgeRequestMode,
-  type BridgeSessionState,
+  type CliBackedRequestMode,
+  type CliBackedSessionState,
   countApiMessageTokens,
   createRequestEstimate,
 } from './session-support.js';
@@ -73,7 +73,7 @@ interface ProviderCredentials {
 
 interface RequestPlan {
   apiMessages: ApiMessage[];
-  mode: BridgeRequestMode;
+  mode: CliBackedRequestMode;
   note: string | null;
   remoteSessionId: string | null;
 }
@@ -654,7 +654,7 @@ export class NativeBridgeController {
   private teamLastSummary: string | null = null;
   private readonly compactionEngine = new CompactionEngine();
   private readonly hookRegistry = new HookRegistry();
-  private readonly remoteSessions = new Map<string, BridgeSessionState>();
+  private readonly remoteSessions = new Map<string, CliBackedSessionState>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
 
@@ -981,7 +981,7 @@ export class NativeBridgeController {
       this.finishMessage(this.activeAssistantMessageId, '[request aborted]');
     }
 
-    if (this.activeOperation === 'request' && this.isBridgeBackedProvider()) {
+    if (this.activeOperation === 'request' && this.isCliBackedProvider()) {
       this.invalidateRemoteSession(this.getCurrentProvider());
     }
 
@@ -1186,7 +1186,7 @@ export class NativeBridgeController {
       }
 
       if (!controller.signal.aborted) {
-        if (this.isBridgeBackedProvider() && activeRemoteSessionId) {
+        if (this.isCliBackedProvider() && activeRemoteSessionId) {
           this.rememberRemoteSession({
             provider: this.getCurrentProvider(),
             sessionId: activeRemoteSessionId,
@@ -1222,16 +1222,24 @@ export class NativeBridgeController {
           });
         }
 
+        const directPurpose = this.inferPromptPurpose(trimmedContent);
+        this.rememberSessionArtifact(directPurpose, fullText);
         this.state.loadingLabel = 'verifier';
         this.scheduleStatePush();
         const verification = await this.runAutoVerification(process.cwd(), 'full');
         if (verification.status !== 'skipped') {
           this.appendSystemMessage(`[verify] ${verification.summary}`);
         }
+        await this.maybeScheduleVerificationFollowup({
+          purpose: directPurpose,
+          userPrompt: trimmedContent,
+          assistantOutput: fullText,
+          verification,
+        });
       }
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
-        if (this.isBridgeBackedProvider()) {
+        if (this.isCliBackedProvider()) {
           this.invalidateRemoteSession(this.getCurrentProvider());
         }
         await this.hookRegistry.emit('onError', {
@@ -1501,6 +1509,7 @@ export class NativeBridgeController {
         });
 
         const runtime = this.createDelegationRuntime();
+        const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
         const result = await runtime.run(
           {
             prompt: userMessage.content,
@@ -1512,6 +1521,7 @@ export class NativeBridgeController {
             isolatedLabel: `background-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
             verificationMode: this.verificationModeForPurpose(decision.purpose),
             contextSnapshot,
+            artifacts,
           },
           {
             signal: controller.signal,
@@ -1589,6 +1599,13 @@ export class NativeBridgeController {
           mode: result.mode,
           text: finalText,
         });
+        if (result.verification?.status === 'failed') {
+          this.rememberVerificationArtifact(
+            result.verification,
+            result.mode,
+            `${BLACKPINK_MODES[result.mode].label} verification`,
+          );
+        }
         this.updateBackgroundJob({
           id: backgroundJobId,
           kind: 'delegate',
@@ -1736,6 +1753,7 @@ export class NativeBridgeController {
       });
 
       const runtime = this.createDelegationRuntime();
+      const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
       const result = await runtime.run(
         {
           prompt: userMessage.content,
@@ -1747,6 +1765,7 @@ export class NativeBridgeController {
           isolatedLabel: `route-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
           verificationMode: this.verificationModeForPurpose(decision.purpose),
           contextSnapshot,
+          artifacts,
         },
         {
           signal: controller.signal,
@@ -1862,6 +1881,12 @@ export class NativeBridgeController {
           },
         });
       }
+      await this.maybeScheduleVerificationFollowup({
+        purpose: result.purpose ?? 'general',
+        userPrompt: userMessage.content,
+        assistantOutput: finalText,
+        verification: result.verification,
+      });
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
         this.updateAgentActivity({
@@ -2196,6 +2221,12 @@ export class NativeBridgeController {
         },
         contextSnapshot: async (prompt: string, purpose?: string): Promise<string> => {
           return this.buildPromptContextSnapshot(prompt, purpose as DelegationPurpose | 'general' | undefined);
+        },
+        artifacts: (purpose?: string, limit?: number): WorkflowArtifact[] => {
+          return this.getArtifactsForPurpose(
+            (purpose as DelegationPurpose | 'general' | undefined) ?? 'general',
+            limit ?? 4,
+          );
         },
       };
 
@@ -2795,8 +2826,8 @@ export class NativeBridgeController {
       toApiMessages(this.getCanonicalConversationMessages()),
       (text) => this.tokenCounter.countTokens(text),
     );
-    const includeTools = !this.isBridgeBackedProvider(provider);
-    const includeSystem = provider === 'anthropic' || !this.isBridgeBackedProvider(provider);
+    const includeTools = !this.isCliBackedProvider(provider);
+    const includeSystem = provider === 'anthropic' || !this.isCliBackedProvider(provider);
     const tools =
       includeTools && this.toolRegistry
         ? this.tokenCounter.countTokens(JSON.stringify(formatToolsForApi(this.toolRegistry)))
@@ -2825,7 +2856,7 @@ export class NativeBridgeController {
       provider,
       model,
       providerWindowTokens: this.tokenCounter.getContextLimitFor(model),
-      bridgeBacked: this.isBridgeBackedProvider(provider),
+      cliBacked: this.isCliBackedProvider(provider),
       triggerRatio,
     });
   }
@@ -2873,11 +2904,11 @@ export class NativeBridgeController {
 
   private estimateRequestForPlan(plan: RequestPlan): NativeRequestEstimateState {
     const provider = this.getCurrentProvider();
-    const includeTools = !this.isBridgeBackedProvider(provider);
+    const includeTools = !this.isCliBackedProvider(provider);
     const includeSystem =
       plan.mode === 'full' ||
       provider === 'anthropic' ||
-      !this.isBridgeBackedProvider(provider);
+      !this.isCliBackedProvider(provider);
 
     const totalMessages = countApiMessageTokens(plan.apiMessages, (text) =>
       this.tokenCounter.countTokens(text),
@@ -3692,6 +3723,21 @@ export class NativeBridgeController {
     });
   }
 
+  private rememberSessionArtifact(
+    purpose: DelegationPurpose | 'general',
+    text: string,
+  ): void {
+    const kind = this.artifactKindForPurpose(purpose === 'general' ? undefined : purpose);
+    const title = `${BLACKPINK_MODES[this.currentMode].label} ${kind}`;
+    this.rememberArtifact({
+      kind,
+      title,
+      summary: text,
+      source: 'session',
+      mode: this.currentMode,
+    });
+  }
+
   private rememberTeamArtifact(
     strategy: 'parallel' | 'sequential' | 'delegate',
     task: string,
@@ -3704,6 +3750,156 @@ export class NativeBridgeController {
       source: 'team',
       mode: this.currentMode,
     });
+  }
+
+  private artifactScoreForPurpose(
+    artifact: WorkflowArtifact,
+    purpose: DelegationPurpose | 'general',
+  ): number {
+    let score = 1;
+
+    if (purpose === 'general') {
+      if (artifact.kind === 'briefing') {
+        score += 6;
+      }
+    } else {
+      const preferredKinds: Record<DelegationPurpose, WorkflowArtifactKind[]> = {
+        general: ['briefing', 'answer'],
+        execution: ['patch', 'plan', 'review', 'briefing'],
+        planning: ['plan', 'briefing', 'review', 'research'],
+        research: ['research', 'briefing', 'plan', 'review'],
+        review: ['review', 'patch', 'plan', 'briefing'],
+        design: ['design', 'plan', 'briefing', 'review'],
+        oracle: ['review', 'research', 'briefing', 'plan'],
+      };
+      const index = preferredKinds[purpose].indexOf(artifact.kind);
+      if (index >= 0) {
+        score += 10 - index * 2;
+      }
+    }
+
+    if (artifact.source === 'team') {
+      score += 2;
+    }
+    if (artifact.mode === this.currentMode) {
+      score += 1;
+    }
+
+    const agePenalty = this.artifacts.findIndex((item) => item.id === artifact.id);
+    if (agePenalty >= 0) {
+      score += Math.max(0, 6 - agePenalty);
+    }
+
+    return score;
+  }
+
+  private getArtifactsForPurpose(
+    purpose: DelegationPurpose | 'general' = 'general',
+    limit: number = 4,
+  ): WorkflowArtifact[] {
+    return this.artifacts
+      .slice()
+      .sort((a, b) => {
+        return this.artifactScoreForPurpose(b, purpose) - this.artifactScoreForPurpose(a, purpose)
+          || b.createdAt.localeCompare(a.createdAt);
+      })
+      .slice(0, limit)
+      .map((artifact) => ({ ...artifact }));
+  }
+
+  private rememberVerificationArtifact(
+    verification: VerificationSummary,
+    mode: NamedMode,
+    title: string,
+  ): void {
+    this.rememberArtifact({
+      kind: 'review',
+      title,
+      summary: `${verification.summary}\n${previewText(verification.report, 260)}`,
+      source: 'session',
+      mode,
+    });
+  }
+
+  private async ensureVerificationTodo(verification: VerificationSummary): Promise<void> {
+    const step = `Resolve verification failures: ${previewText(verification.summary, 120)}`;
+    if (this.todos.some((item) => item.step === step)) {
+      return;
+    }
+
+    await this.addPlanItem(step, 'pending', 'review');
+  }
+
+  private buildVerificationFollowupPrompt(input: {
+    purpose: DelegationPurpose | 'general';
+    userPrompt: string;
+    assistantOutput: string;
+    verification: VerificationSummary;
+  }): string {
+    return [
+      `A ${input.purpose} run produced verification failures.`,
+      '',
+      'Original request:',
+      input.userPrompt,
+      '',
+      'Current output summary:',
+      previewText(input.assistantOutput, 700),
+      '',
+      'Verification summary:',
+      input.verification.summary,
+      '',
+      'Verification report:',
+      input.verification.report,
+      '',
+      'Return a concise reviewer handoff with:',
+      '1. likely root cause',
+      '2. files or symbols to revisit',
+      '3. the smallest safe next patch',
+    ].join('\n');
+  }
+
+  private async maybeScheduleVerificationFollowup(input: {
+    purpose: DelegationPurpose | 'general';
+    userPrompt: string;
+    assistantOutput: string;
+    verification?: VerificationSummary;
+  }): Promise<void> {
+    const verification = input.verification;
+    if (!verification || verification.status !== 'failed') {
+      return;
+    }
+
+    this.rememberVerificationArtifact(
+      verification,
+      this.currentMode,
+      `${BLACKPINK_MODES[this.currentMode].label} verification`,
+    );
+    await this.ensureVerificationTodo(verification);
+
+    if (input.purpose === 'review' || input.purpose === 'oracle' || !this.canStartBackgroundJob()) {
+      return;
+    }
+
+    const reviewMode = this.getTeamEligibleModes().includes('rosé') ? 'rosé' : 'jennie';
+    await this.startBackgroundDelegatedRoute(
+      {
+        id: randomUUID(),
+        role: 'user',
+        content: this.buildVerificationFollowupPrompt({
+          purpose: input.purpose,
+          userPrompt: input.userPrompt,
+          assistantOutput: input.assistantOutput,
+          verification,
+        }),
+        timestamp: Date.now(),
+      },
+      {
+        kind: 'delegate',
+        purpose: 'review',
+        preferredMode: reviewMode,
+        reason: 'verification follow-up',
+      },
+    );
   }
 
   private async runAutoVerification(
@@ -4628,6 +4824,7 @@ export class NativeBridgeController {
     });
     try {
       const contextSnapshot = await this.buildPromptContextSnapshot(input, purpose);
+      const artifacts = this.getArtifactsForPurpose(purpose, 4);
       const result = await runtime.run(
         {
           prompt: [
@@ -4645,6 +4842,7 @@ export class NativeBridgeController {
           isolatedLabel: `team-${agent.id}-r${round}`,
           verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
           contextSnapshot,
+          artifacts,
         },
         {
           signal,
@@ -4842,7 +5040,7 @@ export class NativeBridgeController {
     }
   }
 
-  private isBridgeBackedProvider(provider: string = this.getCurrentProvider()): boolean {
+  private isCliBackedProvider(provider: string = this.getCurrentProvider()): boolean {
     const auth = this.availableProviders.get(provider);
     if (provider === 'anthropic') {
       return auth?.tokenType === 'oauth';
@@ -4877,7 +5075,7 @@ export class NativeBridgeController {
     this.state.teamRunSince = this.teamRunSince;
   }
 
-  private rememberRemoteSession(session: BridgeSessionState): void {
+  private rememberRemoteSession(session: CliBackedSessionState): void {
     this.remoteSessions.set(session.provider, session);
     this.updateRemoteSessionState();
     void this.persistWorkflowState('remote_session_update');
@@ -4898,7 +5096,7 @@ export class NativeBridgeController {
     const bridgeSession = !forceFresh ? this.remoteSessions.get(provider) : undefined;
     const canonicalMessages = this.getCanonicalConversationMessages();
 
-    if (this.isBridgeBackedProvider(provider) && bridgeSession) {
+    if (this.isCliBackedProvider(provider) && bridgeSession) {
       const missingMessages = canonicalMessages.slice(bridgeSession.syncedMessageCount);
       if (missingMessages.length === 0) {
         return {
@@ -4932,7 +5130,7 @@ export class NativeBridgeController {
 
   private async buildHydrationPrompt(
     missingMessages: NativeMessageState[],
-    remoteSession: BridgeSessionState,
+    remoteSession: CliBackedSessionState,
     nextPrompt: string,
   ): Promise<string> {
     const profile = this.getContextProfile(remoteSession.provider, remoteSession.lastModel);

@@ -91,6 +91,7 @@ export const taskTool: Tool = {
         const contextSnapshot = ctx.contextSnapshot
           ? await ctx.contextSnapshot(args.prompt, purpose)
           : undefined;
+        const artifacts = ctx.artifacts?.(purpose ?? 'general', 4);
         const result = await ctx.delegation.run(
           {
             prompt: args.prompt,
@@ -102,6 +103,7 @@ export const taskTool: Tool = {
             cwd: ctx.cwd,
             isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
             contextSnapshot,
+            artifacts,
           },
           {
             onText: (text: string) => {
