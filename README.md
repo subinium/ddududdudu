@@ -15,6 +15,16 @@
 
 ---
 
+## Current Capabilities
+
+- Native Rust TUI with a TypeScript harness engine
+- Canonical local sessions with `resume`, `hydrate`, and saved session reopening
+- Mode-aware delegation across `JENNIE`, `LISA`, `ROSÉ`, and `JISOO`
+- Team orchestration with parallel, sequential, and delegated runs
+- Workflow state with todos, permission profiles, and session-scoped remote bridge state
+- Context compaction, handoff, briefing, and drift checking
+- Skills, hooks, MCP tools, and persistent project/global memory
+
 ## Modes
 
 | Mode     | Provider       | Model               | Role                                      |
@@ -37,11 +47,15 @@
 | `bash`         | run shell commands                                  |
 | `grep`         | search file contents                                |
 | `glob`         | match paths by pattern                              |
+| `repo_map`     | render a compact repository tree                    |
+| `symbol_search`| find likely symbol definitions                      |
+| `codebase_search` | score files and lines against a natural-language query |
 | `web_fetch`    | fetch and summarize remote pages                    |
 | `task`         | delegate work to a sub-agent                        |
 | `oracle`       | ask a stronger secondary model for a focused answer |
 | `ask_question` | pause and request user input inside a run           |
 | `memory`       | read or write persistent memory                     |
+| `update_plan`  | manage the shared execution plan / todo list        |
 
 ## Quick Start
 
@@ -83,6 +97,16 @@ Check what ddudu sees:
 ddudu auth
 ```
 
+## Workflow
+
+ddudu keeps one canonical local session and layers provider-specific bridge sessions on top of it.
+
+- `session list`, `session last`, and `session resume <id>` reopen saved local sessions
+- bridge-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
+- `/plan` and `/todo` manage the shared execution plan
+- `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`
+- `/handoff`, `/fork`, `/briefing`, and `/drift` help carry long-running work forward without losing context
+
 ## CLI Commands
 
 ```bash
@@ -110,25 +134,34 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 
 ## Slash Commands
 
-Current native TUI commands:
-
-- `/clear`
-- `/compact`
-- `/mode`
-- `/model`
-- `/memory`
-- `/session`
-- `/config`
-- `/help`
-- `/doctor`
-- `/review`
-- `/fire`
-- `/init`
-- `/skill`
-- `/hook`
-- `/mcp`
-- `/team`
-- `/quit`
+| Command | Purpose |
+| ------- | ------- |
+| `/clear` | clear the current transcript |
+| `/compact` | compact canonical context |
+| `/mode` | switch active mode |
+| `/model` | switch the current mode's model |
+| `/plan` | show the shared execution plan |
+| `/todo` | add, update, or clear plan items |
+| `/permissions` | change the active permission profile |
+| `/memory` | inspect persistent memory |
+| `/session` | inspect local and remote session state |
+| `/config` | show runtime config summary |
+| `/help` | show available commands |
+| `/doctor` | show runtime health and context info |
+| `/review` | run review checks against the current diff |
+| `/checkpoint` | create a git checkpoint commit |
+| `/undo` | revert the last ddudu checkpoint |
+| `/handoff` | compact context into a new handoff session |
+| `/fork` | fork the current session |
+| `/briefing` | generate and save a session briefing |
+| `/drift` | compare current repo state with the latest briefing |
+| `/fire` | fast toggle permissionless mode |
+| `/init` | initialize `.ddudu/` files |
+| `/skill` | inspect or load skills |
+| `/hook` | inspect loaded hooks |
+| `/mcp` | inspect MCP server/tool state |
+| `/team` | run multi-agent orchestration |
+| `/quit` | exit ddudu |
 
 ## Project Layout
 
@@ -140,8 +173,11 @@ Typical setup:
 .ddudu/
 ├── config.yaml
 ├── DDUDU.md
+├── memory.md
+├── hooks/
 ├── rules/
 ├── prompts/
+├── skills/
 └── sessions/
 ```
 
