@@ -3,14 +3,29 @@ import { dirname } from 'node:path';
 
 import { getDduduPaths } from './dirs.js';
 
-export type MemoryScope = 'global' | 'project';
+export type MemoryScope =
+  | 'global'
+  | 'project'
+  | 'working'
+  | 'episodic'
+  | 'semantic'
+  | 'procedural';
 
-const MEMORY_FILE_NAME = 'memory.md';
+const PROJECT_MEMORY_FILES: Record<Exclude<MemoryScope, 'global'>, string> = {
+  project: 'memory.md',
+  working: 'memory/working.md',
+  episodic: 'memory/episodic.md',
+  semantic: 'memory/semantic.md',
+  procedural: 'memory/procedural.md',
+};
 
 const getMemoryPath = (cwd: string, scope: MemoryScope): string => {
   const paths = getDduduPaths(cwd);
-  const baseDir = scope === 'global' ? paths.globalDir : paths.projectDir;
-  return `${baseDir}/${MEMORY_FILE_NAME}`;
+  if (scope === 'global') {
+    return `${paths.globalDir}/memory.md`;
+  }
+
+  return `${paths.projectDir}/${PROJECT_MEMORY_FILES[scope]}`;
 };
 
 const readMemoryFile = async (filePath: string): Promise<string> => {
@@ -35,15 +50,28 @@ const ensureMemoryDir = async (filePath: string): Promise<void> => {
 };
 
 export const loadMemory = async (cwd: string): Promise<string> => {
-  const globalPath = getMemoryPath(cwd, 'global');
-  const projectPath = getMemoryPath(cwd, 'project');
+  const scopes: MemoryScope[] = [
+    'global',
+    'project',
+    'working',
+    'episodic',
+    'semantic',
+    'procedural',
+  ];
 
-  const [globalMemory, projectMemory] = await Promise.all([
-    readMemoryFile(globalPath),
-    readMemoryFile(projectPath),
-  ]);
+  const contents = await Promise.all(
+    scopes.map(async (scope) => ({
+      scope,
+      content: await readMemoryFile(getMemoryPath(cwd, scope)),
+    })),
+  );
 
-  return `## Global Memory\n${globalMemory}\n\n## Project Memory\n${projectMemory}`;
+  return contents
+    .map(({ scope, content }) => {
+      const title = scope.charAt(0).toUpperCase() + scope.slice(1);
+      return `## ${title} Memory\n${content}`;
+    })
+    .join('\n\n');
 };
 
 export const saveMemory = async (

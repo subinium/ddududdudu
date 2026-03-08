@@ -98,6 +98,9 @@ export const oracleTool: Tool = {
           preferredMode,
           preferredModel,
           parentSessionId: ctx.sessionId,
+          cwd: ctx.cwd,
+          isolatedLabel: `oracle-${preferredMode ?? 'auto'}`,
+          verificationMode: 'none',
         },
         {
           onText: (text: string) => {

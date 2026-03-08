@@ -14,7 +14,14 @@ const isMemoryAction = (value: unknown): value is MemoryAction => {
 };
 
 const isMemoryScope = (value: unknown): value is MemoryScope => {
-  return value === 'global' || value === 'project';
+  return (
+    value === 'global' ||
+    value === 'project' ||
+    value === 'working' ||
+    value === 'episodic' ||
+    value === 'semantic' ||
+    value === 'procedural'
+  );
 };
 
 const parseScope = (value: unknown): MemoryScope | null => {
@@ -30,27 +37,14 @@ const parseScope = (value: unknown): MemoryScope | null => {
 };
 
 const getScopedMemory = (combinedMemory: string, scope: MemoryScope): string => {
-  const globalHeader = '## Global Memory\n';
-  const projectHeader = '\n\n## Project Memory\n';
-  const projectIndex = combinedMemory.indexOf(projectHeader);
-
-  if (scope === 'global') {
-    if (!combinedMemory.startsWith(globalHeader)) {
-      return combinedMemory;
-    }
-
-    if (projectIndex === -1) {
-      return combinedMemory.slice(globalHeader.length);
-    }
-
-    return combinedMemory.slice(globalHeader.length, projectIndex);
-  }
-
-  if (projectIndex === -1) {
+  const title = `${scope.charAt(0).toUpperCase() + scope.slice(1)} Memory`;
+  const sections = combinedMemory.split(/\n(?=## )/u);
+  const match = sections.find((section) => section.startsWith(`## ${title}\n`));
+  if (!match) {
     return '';
   }
 
-  return combinedMemory.slice(projectIndex + projectHeader.length);
+  return match.replace(`## ${title}\n`, '');
 };
 
 export const memoryTool: Tool = {
@@ -70,8 +64,8 @@ export const memoryTool: Tool = {
       },
       scope: {
         type: 'string',
-        description: 'Memory scope to target (global or project).',
-        enum: ['global', 'project'],
+        description: 'Memory scope to target (global, project, working, episodic, semantic, or procedural).',
+        enum: ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'],
       },
     },
   },
@@ -86,7 +80,7 @@ export const memoryTool: Tool = {
     const scope = parseScope(args.scope);
     if (!scope) {
       return {
-        output: 'Invalid argument: scope must be global or project',
+        output: 'Invalid argument: scope must be global, project, working, episodic, semantic, or procedural',
         isError: true,
       };
     }

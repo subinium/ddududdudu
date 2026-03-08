@@ -36,6 +36,7 @@ export interface StreamOptions {
   baseUrl?: string;
   tools?: import('./anthropic-client.js').ApiToolDefinition[];
   remoteSessionId?: string;
+  cwd?: string;
 }
 
 export interface ApiClient {
@@ -149,6 +150,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
             if (tokenType === 'oauth') {
               const client = new ClaudeCliClient({
                 model: streamOptions.model,
+                cwd: streamOptions.cwd,
               });
 
               await client.stream(
@@ -203,6 +205,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
             if (tokenType === 'bearer') {
               const client = new CodexClient({
                 model: streamOptions.model,
+                cwd: streamOptions.cwd,
               });
 
               await client.stream(

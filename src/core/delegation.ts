@@ -2,6 +2,10 @@ import type { ApiMessage, ToolStateUpdate } from '../api/anthropic-client.js';
 import { createClient } from '../api/client-factory.js';
 import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
+import type { VerificationMode, VerificationSummary } from './verifier.js';
+import { VerificationRunner } from './verifier.js';
+import type { IsolatedWorkspace } from './worktree-manager.js';
+import { WorktreeManager } from './worktree-manager.js';
 
 export interface DelegationCredentials {
   token: string;
@@ -26,6 +30,10 @@ export interface DelegationRequest {
   systemPrompt?: string;
   maxTokens?: number;
   parentSessionId?: string | null;
+  cwd?: string;
+  isolatedLabel?: string;
+  verificationMode?: VerificationMode;
+  forceIsolation?: boolean;
 }
 
 export interface DelegationHandlers {
@@ -42,6 +50,9 @@ export interface DelegationResult {
   purpose: DelegationPurpose;
   localSessionId?: string;
   remoteSessionId?: string;
+  cwd: string;
+  workspace?: IsolatedWorkspace | null;
+  verification?: VerificationSummary;
   usage: {
     input: number;
     output: number;
@@ -64,6 +75,7 @@ interface DelegationRuntimeConfig {
   availableProviders: Map<string, DelegationCredentials>;
   sessionManager?: SessionManager | null;
   resolveModel?: (mode: NamedMode) => string;
+  worktreeManager?: WorktreeManager | null;
 }
 
 const MODE_PROFILES: Record<NamedMode, DelegationModeProfile> = {
@@ -174,6 +186,16 @@ const buildSessionEntry = (
       model: result.model,
       purpose: result.purpose,
       remoteSessionId: result.remoteSessionId,
+      cwd: result.cwd,
+      workspacePath: result.workspace?.path,
+      workspaceKind: result.workspace?.kind,
+      verification: result.verification
+        ? {
+            status: result.verification.status,
+            summary: result.verification.summary,
+            cwd: result.verification.cwd,
+          }
+        : undefined,
       durationMs: result.durationMs,
       usage: result.usage,
     },
@@ -212,12 +234,25 @@ export class DelegationRuntime {
     }
 
     const model = request.preferredModel ?? this.config.resolveModel?.(mode) ?? profile.defaultModel;
+    const baseCwd = request.cwd ?? this.config.cwd;
+    const workspace = await this.maybeCreateWorkspace({
+      auth,
+      provider,
+      purpose,
+      baseCwd,
+      label:
+        request.isolatedLabel ??
+        [mode, purpose, request.parentSessionId?.slice(0, 8)].filter(Boolean).join('-'),
+      forceIsolation: request.forceIsolation ?? false,
+    });
+    const effectiveCwd = workspace?.path ?? baseCwd;
     const client = createClient(provider, auth.token, auth.tokenType);
     const start = Date.now();
     let text = '';
     let usage = { input: 0, output: 0 } as DelegationResult['usage'];
     let remoteSessionId: string | undefined;
     let localSessionId: string | undefined;
+    let verification: VerificationSummary | undefined;
 
     if (this.config.sessionManager) {
       const session = await this.config.sessionManager.create({
@@ -225,7 +260,13 @@ export class DelegationRuntime {
         provider,
         model,
         title: `${mode}:${purpose}`,
-        metadata: { delegated: true, mode, purpose },
+        metadata: {
+          delegated: true,
+          mode,
+          purpose,
+          workspacePath: workspace?.path,
+          workspaceKind: workspace?.kind,
+        },
       });
       localSessionId = session.id;
     }
@@ -237,6 +278,7 @@ export class DelegationRuntime {
         model,
         maxTokens: request.maxTokens ?? 8192,
         signal: handlers.signal,
+        cwd: effectiveCwd,
       })) {
         if (event.type === 'text') {
           const delta = event.text ?? '';
@@ -266,6 +308,11 @@ export class DelegationRuntime {
         }
       }
 
+      const verificationMode = this.resolveVerificationMode(purpose, request.verificationMode);
+      if (verificationMode !== 'none') {
+        verification = await new VerificationRunner(effectiveCwd).run(verificationMode);
+      }
+
       const result: DelegationResult = {
         text: text.trim(),
         mode,
@@ -274,6 +321,9 @@ export class DelegationRuntime {
         purpose,
         localSessionId,
         remoteSessionId,
+        cwd: effectiveCwd,
+        workspace,
+        verification,
         usage,
         durationMs: Date.now() - start,
       };
@@ -321,5 +371,56 @@ export class DelegationRuntime {
     }
 
     throw new Error('No delegated modes available.');
+  }
+
+  private async maybeCreateWorkspace(options: {
+    auth: DelegationCredentials;
+    provider: string;
+    purpose: DelegationPurpose;
+    baseCwd: string;
+    label: string;
+    forceIsolation: boolean;
+  }): Promise<IsolatedWorkspace | null> {
+    const manager = this.config.worktreeManager;
+    if (!manager) {
+      return null;
+    }
+
+    const bridgeBacked =
+      (options.provider === 'anthropic' && options.auth.tokenType === 'oauth') ||
+      (options.provider === 'openai' && options.auth.tokenType === 'bearer');
+    const shouldIsolate =
+      options.forceIsolation ||
+      bridgeBacked ||
+      options.purpose === 'execution' ||
+      options.purpose === 'design' ||
+      options.purpose === 'review';
+
+    if (!shouldIsolate) {
+      return null;
+    }
+
+    try {
+      return await manager.create(options.label, {
+        baseCwd: options.baseCwd,
+      });
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveVerificationMode(
+    purpose: DelegationPurpose,
+    requested: VerificationMode | undefined,
+  ): VerificationMode {
+    if (requested) {
+      return requested;
+    }
+
+    if (purpose === 'execution' || purpose === 'design' || purpose === 'review') {
+      return 'checks';
+    }
+
+    return 'none';
   }
 }

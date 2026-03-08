@@ -21,9 +21,10 @@
 - Canonical local sessions with `resume`, `hydrate`, and saved session reopening
 - Mode-aware delegation across `JENNIE`, `LISA`, `ROSÉ`, and `JISOO`
 - Team orchestration with parallel, sequential, and delegated runs
-- Workflow state with todos, permission profiles, and session-scoped remote bridge state
+- Isolated delegated runs with git worktrees for bridge-backed agent sessions
+- Workflow state with todos, permission profiles, remote bridge state, and automatic verification
 - Context compaction, handoff, briefing, and drift checking
-- Skills, hooks, MCP tools, and persistent project/global memory
+- Skills, hooks, MCP tools, git-aware retrieval, and layered memory
 
 ## Modes
 
@@ -48,7 +49,9 @@
 | `grep`         | search file contents                                |
 | `glob`         | match paths by pattern                              |
 | `repo_map`     | render a compact repository tree                    |
-| `symbol_search`| find likely symbol definitions                      |
+| `symbol_search` | find likely symbol definitions                     |
+| `reference_search` | find likely cross-file references and usages       |
+| `changed_files` | list git-changed files for active-context retrieval |
 | `codebase_search` | score files and lines against a natural-language query |
 | `web_fetch`    | fetch and summarize remote pages                    |
 | `task`         | delegate work to a sub-agent                        |
@@ -103,8 +106,10 @@ ddudu keeps one canonical local session and layers provider-specific bridge sess
 
 - `session list`, `session last`, and `session resume <id>` reopen saved local sessions
 - bridge-backed providers keep remote session IDs so the harness can `resume` or `hydrate` when context advances
+- delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - `/plan` and `/todo` manage the shared execution plan
 - `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`
+- direct and delegated execution paths can auto-run review checks and verification summaries
 - `/handoff`, `/fork`, `/briefing`, and `/drift` help carry long-running work forward without losing context
 
 ## CLI Commands
@@ -125,7 +130,7 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | Key             | Action                                     |
 | --------------- | ------------------------------------------ |
 | `Shift+Tab`     | cycle mode                                 |
-| `Ctrl+J`        | newline in composer                        |
+| `Shift+Enter` / `Ctrl+J` | newline in composer               |
 | `Enter`         | submit                                     |
 | `Esc`           | interrupt running request / clear composer |
 | `Up` / `Down`   | scroll transcript when composer is empty   |
@@ -174,6 +179,11 @@ Typical setup:
 ├── config.yaml
 ├── DDUDU.md
 ├── memory.md
+├── memory/
+│   ├── working.md
+│   ├── episodic.md
+│   ├── semantic.md
+│   └── procedural.md
 ├── hooks/
 ├── rules/
 ├── prompts/

@@ -1,6 +1,12 @@
 import { askQuestionTool } from './ask-question-tool.js';
 import { bashTool } from './bash-tool.js';
-import { codebaseSearchTool, repoMapTool, symbolSearchTool } from './context-tools.js';
+import {
+  changedFilesTool,
+  codebaseSearchTool,
+  referenceSearchTool,
+  repoMapTool,
+  symbolSearchTool,
+} from './context-tools.js';
 import { editFileTool, listDirTool, readFileTool, writeFileTool } from './file-tools.js';
 import type { Tool, ToolDefinition, ToolParameter } from './index.js';
 import { memoryTool } from './memory-tool.js';
@@ -91,6 +97,8 @@ const BUILTIN_TOOLS: Tool[] = [
   globTool,
   repoMapTool,
   symbolSearchTool,
+  referenceSearchTool,
+  changedFilesTool,
   codebaseSearchTool,
   webFetchTool,
   taskTool,

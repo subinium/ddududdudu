@@ -117,6 +117,22 @@ struct NativePlanItemState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct NativeWorkspaceState {
+    label: String,
+    path: String,
+    kind: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+struct NativeVerificationState {
+    status: String,
+    summary: Option<String>,
+    cwd: Option<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct NativeRequestEstimateState {
     system: u64,
     history: u64,
@@ -159,6 +175,8 @@ struct NativeTuiState {
     remote_session_id: Option<String>,
     remote_session_count: u64,
     todos: Vec<NativePlanItemState>,
+    workspace: Option<NativeWorkspaceState>,
+    verification: Option<NativeVerificationState>,
     error: Option<String>,
 }
 
@@ -392,6 +410,8 @@ impl App {
                 remote_session_id: None,
                 remote_session_count: 0,
                 todos: Vec::new(),
+                workspace: None,
+                verification: None,
                 error: None,
             },
             composer: ComposerState::default(),
@@ -686,6 +706,68 @@ impl App {
             FG,
             ACCENT_DIM,
         );
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(sidebar_header("Workspace"));
+        if let Some(workspace) = &self.state.workspace {
+            push_sidebar_rail_item(
+                &mut lines,
+                "▣",
+                ACCENT,
+                preview_line(&workspace.label, 28),
+                Some(preview_line(&workspace.path, 30)),
+                FG,
+                ACCENT_DIM,
+            );
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                workspace.kind.clone(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
+        } else {
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "root workspace".to_string(),
+                Some(preview_line(&self.state.cwd, 30)),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        if let Some(verification) = &self.state.verification {
+            let color = match verification.status.as_str() {
+                "passed" => SUCCESS,
+                "failed" => ERROR,
+                "running" => ACCENT,
+                _ => ACCENT_DIM,
+            };
+            push_sidebar_rail_item(
+                &mut lines,
+                if verification.status == "running" {
+                    SPINNER_FRAMES[self.spinner_index]
+                } else if verification.status == "passed" {
+                    "✓"
+                } else if verification.status == "failed" {
+                    "!"
+                } else {
+                    "·"
+                },
+                color,
+                format!("verify {}", verification.status),
+                verification
+                    .summary
+                    .as_ref()
+                    .map(|summary| preview_line(summary, 30))
+                    .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 30))),
+                FG,
+                ACCENT_DIM,
+            );
+        }
         lines.push(Line::from(Span::raw("")));
 
         lines.push(sidebar_header("Plan"));

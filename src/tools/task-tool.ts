@@ -72,6 +72,8 @@ export const taskTool: Tool = {
           preferredModel: model,
           systemPrompt,
           parentSessionId: ctx.sessionId,
+          cwd: ctx.cwd,
+          isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
         },
         {
           onText: (text: string) => {
@@ -81,8 +83,13 @@ export const taskTool: Tool = {
         },
       );
 
+      const verificationNote =
+        result.verification && result.verification.status !== 'skipped'
+          ? `\n\n## Verification\n${result.verification.summary}`
+          : '';
+
       return {
-        output: result.text,
+        output: `${result.text}${verificationNote}`.trim(),
         metadata: {
           mode: result.mode,
           provider: result.provider,
@@ -90,6 +97,9 @@ export const taskTool: Tool = {
           purpose: result.purpose,
           localSessionId: result.localSessionId,
           remoteSessionId: result.remoteSessionId,
+          cwd: result.cwd,
+          workspacePath: result.workspace?.path,
+          verification: result.verification,
           usage: result.usage,
           durationMs: result.durationMs,
         },

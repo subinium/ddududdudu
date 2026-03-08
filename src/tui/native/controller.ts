@@ -27,6 +27,8 @@ import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import type { DduduConfig, LoadedSession, NamedMode, SessionEntry } from '../../core/types.js';
+import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
+import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
 import type {
   PermissionProfile,
   PlanItem,
@@ -55,6 +57,8 @@ import type {
   NativeRequestEstimateState,
   NativeToolCallState,
   NativeTuiState,
+  NativeVerificationState,
+  NativeWorkspaceState,
 } from './protocol.js';
 
 interface ProviderCredentials {
@@ -313,6 +317,14 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
       const query = previewText(readString(input.query), 48);
       return query ? `symbol ${query}` : 'symbol search';
     }
+    case 'reference_search': {
+      const query = previewText(readString(input.query), 48);
+      return query ? `refs ${query}` : 'reference search';
+    }
+    case 'changed_files': {
+      const path = readString(input.path);
+      return path ? `changes ${path}` : 'changed files';
+    }
     case 'codebase_search': {
       const query = previewText(readString(input.query), 48);
       return query ? `search ${query}` : 'codebase search';
@@ -552,6 +564,8 @@ export class NativeBridgeController {
     remoteSessionId: null,
     remoteSessionCount: 0,
     todos: [],
+    workspace: null,
+    verification: null,
     error: null,
   };
 
@@ -587,6 +601,8 @@ export class NativeBridgeController {
   private readonly compactionEngine = new CompactionEngine();
   private readonly hookRegistry = new HookRegistry();
   private readonly remoteSessions = new Map<string, BridgeSessionState>();
+  private readonly worktreeManager = new WorktreeManager(process.cwd());
+  private readonly teamRunIsolatedNotes: string[] = [];
 
   public constructor(emit: EmitFn) {
     this.emit = emit;
@@ -1026,6 +1042,7 @@ export class NativeBridgeController {
               signal: controller.signal,
               maxTokens,
               remoteSessionId: currentPlan.remoteSessionId ?? undefined,
+              cwd: process.cwd(),
             });
 
             const outcome = await this.consumeStream(stream, {
@@ -1127,6 +1144,13 @@ export class NativeBridgeController {
               outputTokens: requestOutputTokens,
             },
           });
+        }
+
+        this.state.loadingLabel = 'verifier';
+        this.scheduleStatePush();
+        const verification = await this.runAutoVerification(process.cwd(), 'full');
+        if (verification.status !== 'skipped') {
+          this.appendSystemMessage(`[verify] ${verification.summary}`);
         }
       }
     } catch (error: unknown) {
@@ -1340,6 +1364,9 @@ export class NativeBridgeController {
           preferredMode: decision.preferredMode,
           parentSessionId: this.state.sessionId,
           maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+          cwd: process.cwd(),
+          isolatedLabel: `route-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
+          verificationMode: this.verificationModeForPurpose(decision.purpose),
         },
         {
           signal: controller.signal,
@@ -1359,6 +1386,17 @@ export class NativeBridgeController {
 
       const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
       this.finishMessage(assistantMessage.id, finalText);
+      this.setWorkspaceState(result.workspace ?? null);
+      if (result.verification) {
+        this.setVerificationState({
+          status: result.verification.status,
+          summary: result.verification.summary,
+          cwd: result.verification.cwd,
+        });
+        if (result.verification.status !== 'skipped') {
+          this.appendSystemMessage(`[verify] ${result.verification.summary}`);
+        }
+      }
 
       await this.hookRegistry.emit('afterResponse', {
         provider: result.provider,
@@ -1384,6 +1422,13 @@ export class NativeBridgeController {
             purpose: result.purpose,
             autoRoute: decision.reason,
             remoteSessionId: result.remoteSessionId,
+            workspacePath: result.workspace?.path,
+            verification: result.verification
+              ? {
+                  status: result.verification.status,
+                  summary: result.verification.summary,
+                }
+              : undefined,
             inputTokens: result.usage.input,
             outputTokens: result.usage.output,
           },
@@ -1542,7 +1587,20 @@ export class NativeBridgeController {
   }
 
   private classifyToolRisk(name: string, input: Record<string, unknown>): 'read' | 'write' | 'dangerous' {
-    if (name === 'read_file' || name === 'list_dir' || name === 'grep' || name === 'glob' || name === 'web_fetch' || name === 'repo_map' || name === 'symbol_search' || name === 'codebase_search' || name === 'ask_question' || name === 'oracle') {
+    if (
+      name === 'read_file' ||
+      name === 'list_dir' ||
+      name === 'grep' ||
+      name === 'glob' ||
+      name === 'web_fetch' ||
+      name === 'repo_map' ||
+      name === 'symbol_search' ||
+      name === 'reference_search' ||
+      name === 'changed_files' ||
+      name === 'codebase_search' ||
+      name === 'ask_question' ||
+      name === 'oracle'
+    ) {
       return 'read';
     }
 
@@ -1701,6 +1759,34 @@ export class NativeBridgeController {
           sessionId: this.state.sessionId,
         });
         const result = await tool.execute(block.input, toolContext);
+        if (result.metadata && typeof result.metadata === 'object') {
+          const metadata = result.metadata as Record<string, unknown>;
+          if (typeof metadata.workspacePath === 'string' && metadata.workspacePath.trim()) {
+            this.state.workspace = {
+              label: block.name,
+              path: metadata.workspacePath,
+              kind: typeof metadata.workspaceKind === 'string' ? metadata.workspaceKind : 'git-worktree',
+            };
+          }
+          const verification = metadata.verification;
+          if (typeof verification === 'object' && verification !== null) {
+            const record = verification as Record<string, unknown>;
+            const status = record.status;
+            const summary = record.summary;
+            const cwd = record.cwd;
+            if (
+              (status === 'running' || status === 'passed' || status === 'failed' || status === 'skipped') &&
+              (summary === null || typeof summary === 'string') &&
+              (cwd === null || typeof cwd === 'string')
+            ) {
+              this.state.verification = {
+                status,
+                summary,
+                cwd,
+              };
+            }
+          }
+        }
         this.setToolStatus(
           context.assistantMessageId,
           block.id,
@@ -2266,6 +2352,7 @@ export class NativeBridgeController {
       cwd: process.cwd(),
       availableProviders: this.availableProviders,
       sessionManager: this.sessionManager,
+      worktreeManager: this.worktreeManager,
       resolveModel: (mode: NamedMode): string => {
         return this.selectedModels[mode] ?? BLACKPINK_MODES[mode].model;
       },
@@ -2476,6 +2563,56 @@ export class NativeBridgeController {
     } catch (error: unknown) {
       return `Review failed: ${serializeError(error)}`;
     }
+  }
+
+  private setWorkspaceState(workspace: IsolatedWorkspace | null): void {
+    this.state.workspace = workspace
+      ? {
+          label: workspace.label,
+          path: workspace.path,
+          kind: workspace.kind,
+        }
+      : null;
+    this.scheduleStatePush();
+  }
+
+  private setVerificationState(state: NativeVerificationState | null): void {
+    this.state.verification = state;
+    this.scheduleStatePush();
+  }
+
+  private async runAutoVerification(
+    cwd: string,
+    mode: Exclude<VerificationMode, 'none'> = 'full',
+  ): Promise<VerificationSummary> {
+    this.setVerificationState({
+      status: 'running',
+      summary: mode === 'full' ? 'running review + scripts' : 'running review checks',
+      cwd,
+    });
+
+    const summary = await new VerificationRunner(cwd).run(mode);
+    this.setVerificationState({
+      status: summary.status,
+      summary: summary.summary,
+      cwd: summary.cwd,
+    });
+
+    return summary;
+  }
+
+  private verificationModeForPurpose(
+    purpose: DelegationPurpose | undefined,
+  ): VerificationMode {
+    if (purpose === 'execution' || purpose === 'design') {
+      return 'full';
+    }
+
+    if (purpose === 'review') {
+      return 'checks';
+    }
+
+    return 'none';
   }
 
   private async runPermissionsCommand(args: string[]): Promise<string> {
@@ -2809,6 +2946,7 @@ export class NativeBridgeController {
     this.teamRunSince = Date.now();
     this.teamRunStrategy = strategy;
     this.teamRunTask = task;
+    this.teamRunIsolatedNotes.length = 0;
     this.scheduleStatePush();
 
     const controller = new AbortController();
@@ -2849,6 +2987,7 @@ export class NativeBridgeController {
               mode: agent.mode,
               model: agent.model,
             })),
+            isolatedRuns: [...this.teamRunIsolatedNotes],
           },
         });
       }
@@ -2968,9 +3107,32 @@ export class NativeBridgeController {
         systemPrompt: agent.systemPrompt,
         maxTokens: this.config ? getMaxTokens(this.config) : undefined,
         parentSessionId: this.state.sessionId,
+        cwd: process.cwd(),
+        isolatedLabel: `team-${agent.id}-r${round}`,
+        verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
       },
       { signal },
     );
+
+    this.setWorkspaceState(result.workspace ?? null);
+    if (result.verification) {
+      this.setVerificationState({
+        status: result.verification.status,
+        summary: result.verification.summary,
+        cwd: result.verification.cwd,
+      });
+    }
+    if (result.workspace || result.verification) {
+      this.teamRunIsolatedNotes.push(
+        [
+          `- ${agent.name}`,
+          result.workspace ? `workspace ${result.workspace.path}` : null,
+          result.verification ? `verify ${result.verification.summary}` : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(' · '),
+      );
+    }
 
     return result.text.trim() || `[${agent.name}] no output`;
   }
@@ -3014,6 +3176,9 @@ export class NativeBridgeController {
       '',
       '## Recent Coordination',
       ...(recentMessages.length > 0 ? recentMessages : ['- No coordination messages recorded.']),
+      ...(this.teamRunIsolatedNotes.length > 0
+        ? ['', '## Isolated Runs', ...this.teamRunIsolatedNotes]
+        : []),
     ].join('\n');
   }
 
