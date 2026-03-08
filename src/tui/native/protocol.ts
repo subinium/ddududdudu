@@ -53,6 +53,17 @@ export interface NativePlanItemState extends Omit<PlanItem, 'status'> {
   status: PlanItemStatus;
 }
 
+export interface NativeAgentActivityState {
+  id: string;
+  label: string;
+  mode: NamedMode | null;
+  purpose: string | null;
+  status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
+  detail: string | null;
+  workspacePath: string | null;
+  updatedAt: number;
+}
+
 export interface NativeWorkspaceState {
   label: string;
   path: string;
@@ -104,6 +115,7 @@ export interface NativeTuiState {
   remoteSessionId: string | null;
   remoteSessionCount: number;
   todos: NativePlanItemState[];
+  agentActivities: NativeAgentActivityState[];
   workspace: NativeWorkspaceState | null;
   verification: NativeVerificationState | null;
   error: string | null;

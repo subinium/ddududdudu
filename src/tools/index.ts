@@ -21,6 +21,15 @@ export interface ToolContext {
   cwd: string;
   abortSignal?: AbortSignal;
   onProgress?: (text: string) => void;
+  onAgentActivity?: (activity: {
+    id: string;
+    label: string;
+    status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
+    mode?: NamedMode;
+    purpose?: string;
+    detail?: string;
+    workspacePath?: string;
+  }) => void;
   askUser?: (question: string, options?: string[]) => Promise<string>;
   authToken?: string;
   authBaseUrl?: string;

@@ -117,6 +117,19 @@ struct NativePlanItemState {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
+struct NativeAgentActivityState {
+    id: String,
+    label: String,
+    mode: Option<String>,
+    purpose: Option<String>,
+    status: String,
+    detail: Option<String>,
+    workspace_path: Option<String>,
+    updated_at: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
 struct NativeWorkspaceState {
     label: String,
     path: String,
@@ -175,6 +188,7 @@ struct NativeTuiState {
     remote_session_id: Option<String>,
     remote_session_count: u64,
     todos: Vec<NativePlanItemState>,
+    agent_activities: Vec<NativeAgentActivityState>,
     workspace: Option<NativeWorkspaceState>,
     verification: Option<NativeVerificationState>,
     error: Option<String>,
@@ -410,6 +424,7 @@ impl App {
                 remote_session_id: None,
                 remote_session_count: 0,
                 todos: Vec::new(),
+                agent_activities: Vec::new(),
                 workspace: None,
                 verification: None,
                 error: None,
@@ -798,6 +813,50 @@ impl App {
                     marker,
                     color,
                     preview_line(&item.step, 28),
+                    detail,
+                    FG,
+                    ACCENT_DIM,
+                );
+            }
+        }
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(sidebar_header("Agents"));
+        if self.state.agent_activities.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                "·",
+                ACCENT_DIM,
+                "no active agents".to_string(),
+                None,
+                FG,
+                ACCENT_DIM,
+            );
+        } else {
+            for item in self.state.agent_activities.iter().take(6) {
+                let (marker, color) = match item.status.as_str() {
+                    "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
+                    "verifying" => ("◌", ACCENT),
+                    "done" => ("✓", SUCCESS),
+                    "error" => ("!", ERROR),
+                    _ => ("·", ACCENT_DIM),
+                };
+                let title = match (&item.mode, &item.purpose) {
+                    (Some(mode), Some(purpose)) => format!("{} · {}", title_case_label(mode), purpose),
+                    (Some(mode), None) => title_case_label(mode),
+                    (None, Some(purpose)) => format!("{} · {}", item.label, purpose),
+                    (None, None) => item.label.clone(),
+                };
+                let detail = item
+                    .detail
+                    .as_ref()
+                    .map(|detail| preview_line(detail, 26))
+                    .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 26)));
+                push_sidebar_rail_item(
+                    &mut lines,
+                    marker,
+                    color,
+                    preview_line(&title, 28),
                     detail,
                     FG,
                     ACCENT_DIM,

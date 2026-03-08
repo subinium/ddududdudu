@@ -39,6 +39,7 @@ export interface DelegationRequest {
 export interface DelegationHandlers {
   onText?: (text: string) => void;
   onToolState?: (states: ToolStateUpdate[]) => void;
+  onVerificationState?: (state: { status: 'running' | 'passed' | 'failed' | 'skipped'; summary?: string }) => void;
   signal?: AbortSignal;
 }
 
@@ -310,7 +311,12 @@ export class DelegationRuntime {
 
       const verificationMode = this.resolveVerificationMode(purpose, request.verificationMode);
       if (verificationMode !== 'none') {
+        handlers.onVerificationState?.({ status: 'running', summary: `verification ${verificationMode}` });
         verification = await new VerificationRunner(effectiveCwd).run(verificationMode);
+        handlers.onVerificationState?.({
+          status: verification.status,
+          summary: verification.summary,
+        });
       }
 
       const result: DelegationResult = {

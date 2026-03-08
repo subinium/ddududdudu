@@ -23,6 +23,7 @@
 - Team orchestration with parallel, sequential, and delegated runs
 - Isolated delegated runs with git worktrees for bridge-backed agent sessions
 - Workflow state with todos, permission profiles, remote bridge state, and automatic verification
+- Sidebar agent activity rail for delegated runs, task tools, and team workers
 - Context compaction, handoff, briefing, and drift checking
 - Skills, hooks, MCP tools, git-aware retrieval, and layered memory
 

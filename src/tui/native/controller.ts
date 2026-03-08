@@ -82,6 +82,17 @@ interface AutoRouteDecision {
   strategy?: 'parallel' | 'sequential' | 'delegate';
 }
 
+interface AgentActivityState {
+  id: string;
+  label: string;
+  mode: NamedMode | null;
+  purpose: string | null;
+  status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
+  detail: string | null;
+  workspacePath: string | null;
+  updatedAt: number;
+}
+
 type EmitFn = (event: NativeBridgeEvent) => void;
 type AskUserResolver = {
   resolve: (answer: string) => void;
@@ -564,6 +575,7 @@ export class NativeBridgeController {
     remoteSessionId: null,
     remoteSessionCount: 0,
     todos: [],
+    agentActivities: [],
     workspace: null,
     verification: null,
     error: null,
@@ -587,6 +599,7 @@ export class NativeBridgeController {
   private permissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private lastSafePermissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private todos: PlanItem[] = [];
+  private agentActivities: AgentActivityState[] = [];
   private readonly epistemicState = new EpistemicStateManager();
   private abortController: AbortController | null = null;
   private activeOperation: 'request' | 'team' | null = null;
@@ -936,6 +949,7 @@ export class NativeBridgeController {
     if (!trimmedContent) {
       return;
     }
+    this.resetEphemeralAgentActivities();
 
     if (this.state.loading && this.abortController) {
       this.queuedPrompts.push(trimmedContent);
@@ -1320,6 +1334,7 @@ export class NativeBridgeController {
     userMessage: NativeMessageState,
     decision: AutoRouteDecision,
   ): Promise<void> {
+    this.resetEphemeralAgentActivities();
     const assistantMessage: NativeMessageState = {
       id: randomUUID(),
       role: 'assistant',
@@ -1345,6 +1360,15 @@ export class NativeBridgeController {
     const controller = new AbortController();
     this.abortController = controller;
     this.activeOperation = 'request';
+    const routeActivityId = randomUUID();
+    this.updateAgentActivity({
+      id: routeActivityId,
+      label: 'route',
+      status: 'running',
+      mode: decision.preferredMode ?? null,
+      purpose: decision.purpose ?? 'general',
+      detail: previewText(userMessage.content, 72),
+    });
 
     try {
       await this.hookRegistry.emit('beforeSend', {
@@ -1377,9 +1401,43 @@ export class NativeBridgeController {
 
             const current = this.state.messages.find((message) => message.id === assistantMessage.id)?.content ?? '';
             this.updateMessage(assistantMessage.id, current + delta);
+            this.updateAgentActivity({
+              id: routeActivityId,
+              label: 'route',
+              status: 'running',
+              mode: decision.preferredMode ?? null,
+              purpose: decision.purpose ?? 'general',
+              detail: previewText(delta, 64),
+            });
           },
           onToolState: (states) => {
             this.applyToolStates(assistantMessage.id, states);
+            const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
+            if (activeTool) {
+              this.updateAgentActivity({
+                id: routeActivityId,
+                label: 'route',
+                status: 'running',
+                mode: decision.preferredMode ?? null,
+                purpose: decision.purpose ?? 'general',
+                detail: `${activeTool.name} ${activeTool.status}`,
+              });
+            }
+          },
+          onVerificationState: (state) => {
+            this.updateAgentActivity({
+              id: routeActivityId,
+              label: 'route',
+              status:
+                state.status === 'running'
+                  ? 'verifying'
+                  : state.status === 'passed' || state.status === 'skipped'
+                    ? 'done'
+                    : 'error',
+              mode: decision.preferredMode ?? null,
+              purpose: decision.purpose ?? 'general',
+              detail: state.summary ?? null,
+            });
           },
         },
       );
@@ -1397,6 +1455,15 @@ export class NativeBridgeController {
           this.appendSystemMessage(`[verify] ${result.verification.summary}`);
         }
       }
+      this.updateAgentActivity({
+        id: routeActivityId,
+        label: BLACKPINK_MODES[result.mode].label,
+        status: 'done',
+        mode: result.mode,
+        purpose: result.purpose,
+        detail: result.verification?.summary ?? previewText(finalText, 64),
+        workspacePath: result.workspace?.path ?? null,
+      });
 
       await this.hookRegistry.emit('afterResponse', {
         provider: result.provider,
@@ -1436,6 +1503,14 @@ export class NativeBridgeController {
       }
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
+        this.updateAgentActivity({
+          id: routeActivityId,
+          label: 'route',
+          status: 'error',
+          mode: decision.preferredMode ?? null,
+          purpose: decision.purpose ?? 'general',
+          detail: serializeError(error),
+        });
         await this.hookRegistry.emit('onError', {
           provider: this.getCurrentProvider(),
           model: this.getCurrentModel(),
@@ -1445,6 +1520,14 @@ export class NativeBridgeController {
         });
         this.finishMessage(assistantMessage.id, toErrorMessage(error));
       } else {
+        this.updateAgentActivity({
+          id: routeActivityId,
+          label: 'route',
+          status: 'error',
+          mode: decision.preferredMode ?? null,
+          purpose: decision.purpose ?? 'general',
+          detail: 'request aborted',
+        });
         this.finishMessage(assistantMessage.id, '[request aborted]');
       }
     } finally {
@@ -1736,6 +1819,17 @@ export class NativeBridgeController {
             'running',
             summarizeToolResult(progress),
           );
+        },
+        onAgentActivity: (activity): void => {
+          this.updateAgentActivity({
+            id: activity.id,
+            label: activity.label,
+            status: activity.status,
+            mode: activity.mode ?? null,
+            purpose: activity.purpose ?? null,
+            detail: activity.detail ?? null,
+            workspacePath: activity.workspacePath ?? null,
+          });
         },
       };
 
@@ -2174,6 +2268,8 @@ export class NativeBridgeController {
     this.currentMode = inferredMode;
     this.state.mode = inferredMode;
     this.remoteSessions.clear();
+    this.agentActivities = [];
+    this.syncAgentActivities();
 
     if (restoredSnapshot) {
       this.selectedModels = { ...restoredSnapshot.selectedModels };
@@ -2581,6 +2677,69 @@ export class NativeBridgeController {
     this.scheduleStatePush();
   }
 
+  private syncAgentActivities(): void {
+    this.state.agentActivities = this.agentActivities
+      .slice()
+      .sort((a, b) => {
+        const priority = (activity: AgentActivityState): number => {
+          if (activity.status === 'running' || activity.status === 'verifying') {
+            return 0;
+          }
+          if (activity.status === 'queued') {
+            return 1;
+          }
+          if (activity.status === 'error') {
+            return 2;
+          }
+          return 3;
+        };
+
+        return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
+      })
+      .slice(0, 8)
+      .map((activity) => ({ ...activity }));
+  }
+
+  private updateAgentActivity(update: {
+    id: string;
+    label: string;
+    status: AgentActivityState['status'];
+    mode?: NamedMode | null;
+    purpose?: string | null;
+    detail?: string | null;
+    workspacePath?: string | null;
+  }): void {
+    const existing = this.agentActivities.find((activity) => activity.id === update.id);
+    if (existing) {
+      existing.label = update.label;
+      existing.status = update.status;
+      existing.mode = update.mode ?? existing.mode;
+      existing.purpose = update.purpose ?? existing.purpose;
+      existing.detail = update.detail ?? existing.detail;
+      existing.workspacePath = update.workspacePath ?? existing.workspacePath;
+      existing.updatedAt = Date.now();
+    } else {
+      this.agentActivities.push({
+        id: update.id,
+        label: update.label,
+        status: update.status,
+        mode: update.mode ?? null,
+        purpose: update.purpose ?? null,
+        detail: update.detail ?? null,
+        workspacePath: update.workspacePath ?? null,
+        updatedAt: Date.now(),
+      });
+    }
+
+    this.syncAgentActivities();
+    this.scheduleStatePush();
+  }
+
+  private resetEphemeralAgentActivities(): void {
+    this.agentActivities = this.agentActivities.filter((activity) => activity.status === 'error');
+    this.syncAgentActivities();
+  }
+
   private async runAutoVerification(
     cwd: string,
     mode: Exclude<VerificationMode, 'none'> = 'full',
@@ -2914,6 +3073,7 @@ export class NativeBridgeController {
     if (this.state.loading || this.abortController) {
       return 'Team run unavailable while another request is active.';
     }
+    this.resetEphemeralAgentActivities();
 
     const teamAgents = this.buildTeamAgents();
     if (teamAgents.length < 2) {
@@ -3092,49 +3252,121 @@ export class NativeBridgeController {
     signal: AbortSignal,
   ): Promise<string> {
     const runtime = this.createDelegationRuntime();
+    const activityId = `team:${round}:${agent.id}`;
     const purpose: DelegationPurpose =
       agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
-    const result = await runtime.run(
-      {
-        prompt: [
-          `Round ${round}`,
-          `Team task context for ${agent.name}:`,
-          input,
-        ].join('\n\n'),
-        purpose,
-        preferredMode: agent.mode,
-        preferredModel: agent.model,
-        systemPrompt: agent.systemPrompt,
-        maxTokens: this.config ? getMaxTokens(this.config) : undefined,
-        parentSessionId: this.state.sessionId,
-        cwd: process.cwd(),
-        isolatedLabel: `team-${agent.id}-r${round}`,
-        verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
-      },
-      { signal },
-    );
-
-    this.setWorkspaceState(result.workspace ?? null);
-    if (result.verification) {
-      this.setVerificationState({
-        status: result.verification.status,
-        summary: result.verification.summary,
-        cwd: result.verification.cwd,
-      });
-    }
-    if (result.workspace || result.verification) {
-      this.teamRunIsolatedNotes.push(
-        [
-          `- ${agent.name}`,
-          result.workspace ? `workspace ${result.workspace.path}` : null,
-          result.verification ? `verify ${result.verification.summary}` : null,
-        ]
-          .filter((part): part is string => Boolean(part))
-          .join(' · '),
+    this.updateAgentActivity({
+      id: activityId,
+      label: agent.name,
+      status: 'running',
+      mode: agent.mode,
+      purpose,
+      detail: `round ${round} · ${agent.role}`,
+    });
+    try {
+      const result = await runtime.run(
+        {
+          prompt: [
+            `Round ${round}`,
+            `Team task context for ${agent.name}:`,
+            input,
+          ].join('\n\n'),
+          purpose,
+          preferredMode: agent.mode,
+          preferredModel: agent.model,
+          systemPrompt: agent.systemPrompt,
+          maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+          parentSessionId: this.state.sessionId,
+          cwd: process.cwd(),
+          isolatedLabel: `team-${agent.id}-r${round}`,
+          verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
+        },
+        {
+          signal,
+          onText: (delta) => {
+            if (delta.trim()) {
+              this.updateAgentActivity({
+                id: activityId,
+                label: agent.name,
+                status: 'running',
+                mode: agent.mode,
+                purpose,
+                detail: previewText(delta, 64),
+              });
+            }
+          },
+          onToolState: (states) => {
+            const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
+            if (activeTool) {
+              this.updateAgentActivity({
+                id: activityId,
+                label: agent.name,
+                status: 'running',
+                mode: agent.mode,
+                purpose,
+                detail: `${activeTool.name} ${activeTool.status}`,
+              });
+            }
+          },
+          onVerificationState: (state) => {
+            this.updateAgentActivity({
+              id: activityId,
+              label: agent.name,
+              status:
+                state.status === 'running'
+                  ? 'verifying'
+                  : state.status === 'passed' || state.status === 'skipped'
+                    ? 'done'
+                    : 'error',
+              mode: agent.mode,
+              purpose,
+              detail: state.summary ?? null,
+            });
+          },
+        },
       );
-    }
 
-    return result.text.trim() || `[${agent.name}] no output`;
+      this.setWorkspaceState(result.workspace ?? null);
+      if (result.verification) {
+        this.setVerificationState({
+          status: result.verification.status,
+          summary: result.verification.summary,
+          cwd: result.verification.cwd,
+        });
+      }
+      if (result.workspace || result.verification) {
+        this.teamRunIsolatedNotes.push(
+          [
+            `- ${agent.name}`,
+            result.workspace ? `workspace ${result.workspace.path}` : null,
+            result.verification ? `verify ${result.verification.summary}` : null,
+          ]
+            .filter((part): part is string => Boolean(part))
+            .join(' · '),
+        );
+      }
+      this.updateAgentActivity({
+        id: activityId,
+        label: agent.name,
+        status: 'done',
+        mode: agent.mode,
+        purpose,
+        detail: result.verification?.summary ?? previewText(result.text, 64),
+        workspacePath: result.workspace?.path ?? null,
+      });
+
+      return result.text.trim() || `[${agent.name}] no output`;
+    } catch (error: unknown) {
+      this.updateAgentActivity({
+        id: activityId,
+        label: agent.name,
+        status: 'error',
+        mode: agent.mode,
+        purpose,
+        detail: serializeError(error),
+      });
+      throw error;
+    }
   }
 
   private formatTeamProgress(message: TeamMessage): string {

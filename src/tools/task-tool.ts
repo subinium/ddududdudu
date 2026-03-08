@@ -22,6 +22,19 @@ const resolveBaseUrl = (): string => {
   return DEFAULT_ANTHROPIC_BASE_URL;
 };
 
+const preview = (value: string, maxLength: number = 80): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
 export const taskTool: Tool = {
   definition: {
     name: 'task',
@@ -64,46 +77,106 @@ export const taskTool: Tool = {
         : undefined;
 
     if (ctx.delegation) {
-      const result = await ctx.delegation.run(
-        {
-          prompt: args.prompt,
-          purpose,
-          preferredMode: mode,
-          preferredModel: model,
-          systemPrompt,
-          parentSessionId: ctx.sessionId,
-          cwd: ctx.cwd,
-          isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
-        },
-        {
-          onText: (text: string) => {
-            ctx.onProgress?.(text);
+      const activityId = randomUUID();
+      ctx.onAgentActivity?.({
+        id: activityId,
+        label: 'task',
+        status: 'running',
+        mode,
+        purpose,
+        detail: preview(args.prompt),
+      });
+
+      try {
+        const result = await ctx.delegation.run(
+          {
+            prompt: args.prompt,
+            purpose,
+            preferredMode: mode,
+            preferredModel: model,
+            systemPrompt,
+            parentSessionId: ctx.sessionId,
+            cwd: ctx.cwd,
+            isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
           },
-          signal: ctx.abortSignal,
-        },
-      );
+          {
+            onText: (text: string) => {
+              ctx.onProgress?.(text);
+              if (text.trim()) {
+                ctx.onAgentActivity?.({
+                  id: activityId,
+                  label: 'task',
+                  status: 'running',
+                  mode,
+                  purpose,
+                  detail: preview(text, 64),
+                });
+              }
+            },
+            onVerificationState: (state) => {
+              ctx.onAgentActivity?.({
+                id: activityId,
+                label: 'task',
+                status:
+                  state.status === 'running'
+                    ? 'verifying'
+                    : state.status === 'passed' || state.status === 'skipped'
+                      ? 'done'
+                      : 'error',
+                mode,
+                purpose,
+                detail: state.summary,
+              });
+          },
+            signal: ctx.abortSignal,
+          },
+        );
 
-      const verificationNote =
-        result.verification && result.verification.status !== 'skipped'
-          ? `\n\n## Verification\n${result.verification.summary}`
-          : '';
-
-      return {
-        output: `${result.text}${verificationNote}`.trim(),
-        metadata: {
+        ctx.onAgentActivity?.({
+          id: activityId,
+          label: 'task',
+          status: 'done',
           mode: result.mode,
-          provider: result.provider,
-          model: result.model,
           purpose: result.purpose,
-          localSessionId: result.localSessionId,
-          remoteSessionId: result.remoteSessionId,
-          cwd: result.cwd,
+          detail:
+            result.verification?.summary ??
+            result.workspace?.path ??
+            preview(result.text, 64),
           workspacePath: result.workspace?.path,
-          verification: result.verification,
-          usage: result.usage,
-          durationMs: result.durationMs,
-        },
-      };
+        });
+
+        const verificationNote =
+          result.verification && result.verification.status !== 'skipped'
+            ? `\n\n## Verification\n${result.verification.summary}`
+            : '';
+
+        return {
+          output: `${result.text}${verificationNote}`.trim(),
+          metadata: {
+            mode: result.mode,
+            provider: result.provider,
+            model: result.model,
+            purpose: result.purpose,
+            localSessionId: result.localSessionId,
+            remoteSessionId: result.remoteSessionId,
+            cwd: result.cwd,
+            workspacePath: result.workspace?.path,
+            verification: result.verification,
+            usage: result.usage,
+            durationMs: result.durationMs,
+          },
+        };
+      } catch (error: unknown) {
+        ctx.onAgentActivity?.({
+          id: activityId,
+          label: 'task',
+          status: 'error',
+          mode,
+          purpose,
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     }
 
     const token = ctx.authToken || resolveToken();

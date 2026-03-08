@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
@@ -39,6 +40,19 @@ const buildFileContext = async (cwd: string, files: string[]): Promise<string> =
   }
 
   return chunks.join('\n\n');
+};
+
+const preview = (value: string, maxLength: number = 80): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
 export const oracleTool: Tool = {
@@ -91,38 +105,80 @@ export const oracleTool: Tool = {
       typeof args.model === 'string' && args.model.trim().length > 0 ? args.model : undefined;
 
     if (ctx.delegation) {
-      const result = await ctx.delegation.run(
-        {
-          prompt: question,
-          purpose: 'oracle',
-          preferredMode,
-          preferredModel,
-          parentSessionId: ctx.sessionId,
-          cwd: ctx.cwd,
-          isolatedLabel: `oracle-${preferredMode ?? 'auto'}`,
-          verificationMode: 'none',
-        },
-        {
-          onText: (text: string) => {
-            ctx.onProgress?.(text);
-          },
-          signal: ctx.abortSignal,
-        },
-      );
+      const activityId = randomUUID();
+      ctx.onAgentActivity?.({
+        id: activityId,
+        label: 'oracle',
+        status: 'running',
+        mode: preferredMode,
+        purpose: 'oracle',
+        detail: preview(args.question),
+      });
 
-      return {
-        output: result.text,
-        metadata: {
+      try {
+        const result = await ctx.delegation.run(
+          {
+            prompt: question,
+            purpose: 'oracle',
+            preferredMode,
+            preferredModel,
+            parentSessionId: ctx.sessionId,
+            cwd: ctx.cwd,
+            isolatedLabel: `oracle-${preferredMode ?? 'auto'}`,
+            verificationMode: 'none',
+          },
+          {
+            onText: (text: string) => {
+              ctx.onProgress?.(text);
+              if (text.trim()) {
+                ctx.onAgentActivity?.({
+                  id: activityId,
+                  label: 'oracle',
+                  status: 'running',
+                  mode: preferredMode,
+                  purpose: 'oracle',
+                  detail: preview(text, 64),
+                });
+              }
+            },
+            signal: ctx.abortSignal,
+          },
+        );
+
+        ctx.onAgentActivity?.({
+          id: activityId,
+          label: 'oracle',
+          status: 'done',
           mode: result.mode,
-          provider: result.provider,
-          model: result.model,
-          files,
-          usage: result.usage,
-          localSessionId: result.localSessionId,
-          remoteSessionId: result.remoteSessionId,
-          durationMs: result.durationMs,
-        },
-      };
+          purpose: result.purpose,
+          detail: preview(result.text, 64),
+          workspacePath: result.workspace?.path,
+        });
+
+        return {
+          output: result.text,
+          metadata: {
+            mode: result.mode,
+            provider: result.provider,
+            model: result.model,
+            files,
+            usage: result.usage,
+            localSessionId: result.localSessionId,
+            remoteSessionId: result.remoteSessionId,
+            durationMs: result.durationMs,
+          },
+        };
+      } catch (error: unknown) {
+        ctx.onAgentActivity?.({
+          id: activityId,
+          label: 'oracle',
+          status: 'error',
+          mode: preferredMode,
+          purpose: 'oracle',
+          detail: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     }
 
     const client = new AnthropicClient({
