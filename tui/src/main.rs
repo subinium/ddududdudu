@@ -5,8 +5,10 @@ use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
+use crossterm::execute;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -949,52 +951,6 @@ impl App {
         lines.push(Line::from(Span::raw("")));
 
         lines.push(sidebar_header("Background"));
-        if self.state.loading {
-            let elapsed = format_elapsed(self.state.loading_since);
-            push_sidebar_rail_item(
-                &mut lines,
-                SPINNER_FRAMES[self.spinner_index],
-                ACCENT,
-                format!("request {elapsed}"),
-                Some(if self.state.loading_label.is_empty() {
-                    "running".to_string()
-                } else {
-                    self.state.loading_label.clone()
-                }),
-                FG,
-                ACCENT_DIM,
-            );
-            if let Some(estimate) = &self.state.request_estimate {
-                push_sidebar_rail_item(
-                    &mut lines,
-                    "⋯",
-                    ACCENT_DIM,
-                    format!("next {} ~{}", estimate.mode, format_count(estimate.total)),
-                    estimate.note.as_ref().map(|note| preview_line(note, 32)),
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "Esc to interrupt".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        } else {
-            push_sidebar_rail_item(
-                &mut lines,
-                "·",
-                ACCENT_DIM,
-                "idle".to_string(),
-                Some("no running request".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-        }
         for job in self.state.background_jobs.iter().take(4) {
             let (marker, color) = match job.status.as_str() {
                 "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
@@ -1016,13 +972,36 @@ impl App {
                 ACCENT_DIM,
             );
         }
-        for prompt in self.state.queued_prompts.iter().take(3) {
+        for (index, prompt) in self.state.queued_prompts.iter().take(6).enumerate() {
             push_sidebar_rail_item(
                 &mut lines,
                 "•",
                 ACCENT_DIM,
-                preview_line(prompt, 26),
+                format!("{}. {}", index + 1, preview_line(prompt, 22)),
                 Some("queued".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
+        }
+        if self.state.background_jobs.is_empty() && self.state.queued_prompts.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                if self.state.loading { "·" } else { "·" },
+                ACCENT_DIM,
+                if self.state.loading {
+                    "foreground active".to_string()
+                } else {
+                    "idle".to_string()
+                },
+                Some(if self.state.loading {
+                    if self.state.loading_label.is_empty() {
+                        "request running".to_string()
+                    } else {
+                        preview_line(&self.state.loading_label, 28)
+                    }
+                } else {
+                    "no background work".to_string()
+                }),
                 FG,
                 ACCENT_DIM,
             );
@@ -1176,13 +1155,29 @@ impl App {
         let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
         let queue_visible = !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none();
-        let footer_rows = if queue_visible { 2 } else { 1 };
+        let footer_rows = 1usize;
+        let min_editor_rows = if inner.height > 3 { 2usize } else { 1usize };
+        let max_queue_rows = if queue_visible {
+            self.state
+                .queued_prompts
+                .len()
+                .min((inner.height as usize).saturating_sub(footer_rows + min_editor_rows))
+        } else {
+            0usize
+        };
+        let queue_preview_rows = if queue_visible && self.state.queued_prompts.len() > max_queue_rows && max_queue_rows > 0 {
+            max_queue_rows.saturating_sub(1)
+        } else {
+            max_queue_rows
+        };
         let metrics = wrap_editor_text(
             &self.composer.text,
             self.composer.cursor,
             content_width.max(1),
         );
-        let max_visible = inner.height.saturating_sub(footer_rows) as usize;
+        let max_visible = inner
+            .height
+            .saturating_sub((footer_rows + max_queue_rows) as u16) as usize;
         let start = metrics
             .lines
             .len()
@@ -1197,33 +1192,34 @@ impl App {
             .collect::<Vec<_>>();
 
         let mut lines = Vec::new();
-        if queue_visible {
-            let next_prompt = self
+        if queue_visible && max_queue_rows > 0 {
+            for (index, prompt) in self
                 .state
                 .queued_prompts
-                .first()
-                .map(|prompt| preview_line(prompt, content_width.saturating_sub(16)))
-                .unwrap_or_default();
-            let remaining = self.state.queued_prompts.len().saturating_sub(1);
-            let mut queue_spans = vec![
-                Span::styled("queue ", Style::default().fg(ACCENT_DIM)),
-                Span::styled(
-                    format_count(self.state.queued_prompts.len() as u64),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-            ];
-            if !next_prompt.is_empty() {
-                queue_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-                queue_spans.push(Span::styled(next_prompt, Style::default().fg(FG)));
+                .iter()
+                .take(queue_preview_rows)
+                .enumerate()
+            {
+                let marker = format!("{:>2}. ", index + 1);
+                let marker_width = marker.width();
+                lines.push(Line::from(vec![
+                    Span::styled(marker, Style::default().fg(ACCENT_DIM)),
+                    Span::styled(
+                        preview_line(prompt, content_width.saturating_sub(marker_width)),
+                        Style::default().fg(FG),
+                    ),
+                ]));
             }
+            let remaining = self.state.queued_prompts.len().saturating_sub(queue_preview_rows);
             if remaining > 0 {
-                queue_spans.push(Span::styled("  ", Style::default().fg(ACCENT_DIM)));
-                queue_spans.push(Span::styled(
-                    format!("+{}", format_count(remaining as u64)),
-                    Style::default().fg(ACCENT_DIM),
-                ));
+                lines.push(Line::from(vec![
+                    Span::styled("… ", Style::default().fg(ACCENT_DIM)),
+                    Span::styled(
+                        format!("+{} more queued", format_count(remaining as u64)),
+                        Style::default().fg(ACCENT_DIM),
+                    ),
+                ]));
             }
-            lines.push(Line::from(queue_spans));
         }
 
         if visible_lines.is_empty() {
@@ -1267,7 +1263,7 @@ impl App {
 
         let cursor_x = inner.x + prompt_prefix.width() as u16 + metrics.cursor_col as u16;
         let cursor_y = inner.y
-            + if queue_visible { 1 } else { 0 }
+            + max_queue_rows as u16
             + (metrics.cursor_row.saturating_sub(start) as u16);
         (
             cursor_x.min(inner.right().saturating_sub(1)),
@@ -2684,6 +2680,10 @@ fn main() -> Result<()> {
     let bridge = BridgeClient::spawn(&node_path, &bridge_path)?;
 
     let mut terminal = ratatui::init();
+    let _ = execute!(
+        terminal.backend_mut(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     terminal.clear()?;
 
     let outcome = {
@@ -2694,6 +2694,7 @@ fn main() -> Result<()> {
         })
     };
 
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
     ratatui::restore();
     outcome
 }

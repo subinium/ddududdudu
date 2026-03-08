@@ -4324,7 +4324,7 @@ export class NativeBridgeController {
         return {
           apiMessages: [{ role: 'user', content: userMessage.content }],
           mode: 'resume',
-          note: `bridge resume · ${provider} session ${bridgeSession.sessionId.slice(0, 8)}`,
+          note: null,
           remoteSessionId: bridgeSession.sessionId,
         };
       }
@@ -4337,7 +4337,7 @@ export class NativeBridgeController {
       return {
         apiMessages: [{ role: 'user', content: hydrationPrompt }],
         mode: 'hydrate',
-        note: `bridge hydrate · ${missingMessages.length} canonical messages since last ${provider} turn`,
+        note: null,
         remoteSessionId: bridgeSession.sessionId,
       };
     }
@@ -4345,9 +4345,7 @@ export class NativeBridgeController {
     return {
       apiMessages: toApiMessages([...this.state.messages, userMessage]),
       mode: 'full',
-      note: this.isBridgeBackedProvider(provider)
-        ? 'fresh bridge session · provider CLI adds its own hidden scaffold'
-        : null,
+      note: null,
       remoteSessionId: null,
     };
   }
