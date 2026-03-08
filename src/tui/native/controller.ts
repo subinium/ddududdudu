@@ -31,6 +31,7 @@ import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
+import { getDduduPaths } from '../../core/dirs.js';
 import type { DduduConfig, LoadedSession, NamedMode, SessionEntry } from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
 import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
@@ -112,6 +113,7 @@ interface BackgroundJobState {
   detail: string | null;
   startedAt: number;
   updatedAt: number;
+  finishedAt?: number | null;
   prompt?: string;
   purpose?: DelegationPurpose | 'general';
   preferredMode?: NamedMode | null;
@@ -121,6 +123,9 @@ interface BackgroundJobState {
   artifactTitle?: string | null;
   verificationSummary?: string | null;
   attempt?: number;
+  hasResult?: boolean;
+  resultPreview?: string | null;
+  workspacePath?: string | null;
   controller?: AbortController | null;
 }
 
@@ -805,6 +810,7 @@ export class NativeBridgeController {
       detail: job.detail,
       startedAt: job.startedAt ?? job.createdAt,
       updatedAt: job.updatedAt,
+      finishedAt: job.finishedAt ?? null,
       prompt: job.prompt,
       purpose: job.purpose,
       preferredMode: job.preferredMode ?? null,
@@ -814,6 +820,9 @@ export class NativeBridgeController {
       artifactTitle: job.artifact?.title ?? null,
       verificationSummary: job.result?.verification?.summary ?? null,
       attempt: job.attempt ?? 0,
+      hasResult: Boolean(job.result?.text || job.artifact),
+      resultPreview: job.result?.text ? previewText(job.result.text, 160) : job.artifact?.summary ?? null,
+      workspacePath: job.result?.workspacePath ?? null,
       controller: null,
     };
   }
@@ -859,6 +868,18 @@ export class NativeBridgeController {
           this.appendSystemMessage(
             `[background] ${job.label} ${job.status === 'done' ? 'finished' : 'failed'} · /jobs result ${jobRef}`,
           );
+          if (job.status === 'done' && job.result?.verification?.status === 'passed') {
+            const mode = job.result.mode === 'jennie' || job.result.mode === 'lisa' || job.result.mode === 'rosé' || job.result.mode === 'jisoo'
+              ? job.result.mode
+              : (job.preferredMode ?? this.currentMode);
+            await this.finalizeVerificationRecovery({
+              reason: job.reason,
+              purpose: job.purpose ?? 'general',
+              output: job.result.text,
+              mode,
+              verification: job.result.verification,
+            });
+          }
           if (job.status === 'done' && job.result?.verification) {
             await this.maybeScheduleVerificationFollowup({
               purpose: job.purpose ?? 'general',
@@ -969,7 +990,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs result|inspect|retry|promote|cancel)',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
         );
         return;
       case '/plan':
@@ -1378,6 +1399,13 @@ export class NativeBridgeController {
         if (verification.status !== 'skipped') {
           this.appendSystemMessage(`[verify] ${verification.summary}`);
         }
+        await this.finalizeVerificationRecovery({
+          reason: null,
+          purpose: directPurpose,
+          output: fullText,
+          mode,
+          verification,
+        });
         await this.maybeScheduleVerificationFollowup({
           purpose: directPurpose,
           userPrompt: trimmedContent,
@@ -1797,6 +1825,13 @@ export class NativeBridgeController {
           this.appendSystemMessage(`[verify] ${result.verification.summary}`);
         }
       }
+      await this.finalizeVerificationRecovery({
+        reason: decision.reason,
+        purpose: result.purpose ?? 'general',
+        output: finalText,
+        mode: result.mode,
+        verification: result.verification,
+      });
       this.updateAgentActivity({
         id: routeActivityId,
         label: BLACKPINK_MODES[result.mode].label,
@@ -3287,12 +3322,32 @@ export class NativeBridgeController {
     }
 
     const symbolHints = this.extractPromptSymbolHints(prompt, 3);
+    const importanceTool = this.toolRegistry?.get('file_importance');
     const codebaseTool = this.toolRegistry?.get('codebase_search');
     const definitionTool = this.toolRegistry?.get('definition_search') ?? this.toolRegistry?.get('symbol_search');
     const hotspotTool = this.toolRegistry?.get('reference_hotspots') ?? this.toolRegistry?.get('reference_search');
 
     const pendingSearches: Array<Promise<void>> = [];
-    if (codebaseTool) {
+    if (importanceTool) {
+      pendingSearches.push((async () => {
+        try {
+          const result = await importanceTool.execute(
+            {
+              query: prompt,
+              purpose: effectivePurpose,
+              max_results: Math.max(limit, 8),
+            },
+            { cwd: process.cwd(), lsp: this.lspManager },
+          );
+          this.addRankedOutputScores(scores, result.output, 3);
+          for (const filePath of this.extractRankedFilesFromSearch(result.output, limit + 3)) {
+            this.addFileScore(scores, filePath, 14);
+          }
+        } catch {
+          // Fall back to other signals.
+        }
+      })());
+    } else if (codebaseTool) {
       pendingSearches.push((async () => {
         try {
           const query = effectivePurpose && effectivePurpose !== 'general'
@@ -3658,9 +3713,14 @@ export class NativeBridgeController {
         detail: job.detail,
         startedAt: job.startedAt,
         updatedAt: job.updatedAt,
+        finishedAt: job.finishedAt ?? null,
         purpose: job.purpose ?? null,
         preferredMode: job.preferredMode ?? null,
         strategy: job.strategy ?? null,
+        attempt: job.attempt ?? null,
+        hasResult: job.hasResult ?? false,
+        resultPreview: job.resultPreview ?? null,
+        workspacePath: job.workspacePath ?? null,
         promptPreview: job.prompt ? previewText(job.prompt, 96) : null,
       }));
   }
@@ -3745,6 +3805,7 @@ export class NativeBridgeController {
       existing.label = update.label;
       existing.status = update.status;
       existing.detail = update.detail ?? existing.detail;
+      existing.finishedAt = update.status === 'running' ? null : Date.now();
       existing.prompt = update.prompt ?? existing.prompt;
       existing.purpose = update.purpose ?? existing.purpose;
       existing.preferredMode = update.preferredMode ?? existing.preferredMode;
@@ -3754,6 +3815,7 @@ export class NativeBridgeController {
       existing.artifactTitle = update.artifactTitle ?? existing.artifactTitle;
       existing.verificationSummary = update.verificationSummary ?? existing.verificationSummary;
       existing.attempt = update.attempt ?? existing.attempt;
+      existing.hasResult = update.status === 'done' ? true : existing.hasResult;
       existing.controller = update.controller ?? existing.controller;
       existing.updatedAt = Date.now();
     } else {
@@ -3766,6 +3828,7 @@ export class NativeBridgeController {
         detail: update.detail ?? null,
         startedAt: update.startedAt ?? now,
         updatedAt: now,
+        finishedAt: update.status === 'running' ? null : now,
         prompt: update.prompt,
         purpose: update.purpose,
         preferredMode: update.preferredMode ?? null,
@@ -3775,6 +3838,9 @@ export class NativeBridgeController {
         artifactTitle: update.artifactTitle ?? null,
         verificationSummary: update.verificationSummary ?? null,
         attempt: update.attempt ?? 0,
+        hasResult: update.status === 'done',
+        resultPreview: null,
+        workspacePath: null,
         controller: update.controller ?? null,
       });
     }
@@ -3955,6 +4021,74 @@ export class NativeBridgeController {
     }
 
     await this.addPlanItem(step, 'pending', 'review');
+  }
+
+  private async completeVerificationTodos(): Promise<void> {
+    let changed = false;
+    for (const item of this.todos) {
+      if (item.status === 'completed') {
+        continue;
+      }
+      if (!item.step.startsWith('Resolve verification failures:')) {
+        continue;
+      }
+      item.status = 'completed';
+      item.owner = 'verified';
+      item.updatedAt = new Date().toISOString();
+      changed = true;
+    }
+
+    if (!changed) {
+      return;
+    }
+
+    this.state.todos = this.todos.map((item) => ({ ...item }));
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+    void this.persistWorkflowState('verification_todo_resolve');
+  }
+
+  private rememberRepairArtifact(input: {
+    purpose: DelegationPurpose | 'general';
+    mode: NamedMode;
+    output: string;
+    verification: VerificationSummary;
+  }): WorkflowArtifact {
+    return this.rememberArtifact({
+      kind: 'patch',
+      title: `${BLACKPINK_MODES[input.mode].label} repair patch`,
+      summary: [
+        `purpose: ${input.purpose}`,
+        `verification: ${input.verification.summary}`,
+        '',
+        previewText(input.output, 420),
+      ].join('\n'),
+      source: 'delegate',
+      mode: input.mode,
+    });
+  }
+
+  private async finalizeVerificationRecovery(input: {
+    reason?: string | null;
+    purpose: DelegationPurpose | 'general';
+    output: string;
+    mode: NamedMode;
+    verification?: VerificationSummary | null;
+  }): Promise<void> {
+    const verification = input.verification;
+    if (!verification || verification.status !== 'passed') {
+      return;
+    }
+
+    await this.completeVerificationTodos();
+    if (input.reason === 'verification auto-retry' || input.reason?.startsWith('Verification escalation') === true) {
+      this.rememberRepairArtifact({
+        purpose: input.purpose,
+        mode: input.mode,
+        output: input.output,
+        verification,
+      });
+    }
   }
 
   private buildVerificationFollowupPrompt(input: {
@@ -4356,11 +4490,19 @@ export class NativeBridgeController {
       return 'Jobs: none';
     }
 
+    const running = this.state.backgroundJobs.filter((job) => job.status === 'running').length;
+    const done = this.state.backgroundJobs.filter((job) => job.status === 'done').length;
+    const error = this.state.backgroundJobs.filter((job) => job.status === 'error').length;
+
     return [
       'Jobs',
+      `summary: ${running} running · ${done} done · ${error} error`,
       ...this.state.backgroundJobs.map((job, index) => {
-        const detail = job.detail ? ` · ${job.detail}` : '';
-        return `${index + 1}. ${job.label} [${job.status}]${detail}`;
+        const detail = job.status === 'done'
+          ? job.resultPreview ?? job.workspacePath ?? job.detail ?? null
+          : job.detail ?? job.resultPreview ?? job.workspacePath ?? null;
+        const suffix = detail ? ` · ${previewText(detail, 96)}` : '';
+        return `${index + 1}. ${job.label} [${job.status}]${suffix}`;
       }),
     ].join('\n');
   }
@@ -4379,7 +4521,10 @@ export class NativeBridgeController {
       job.attempt && job.attempt > 0 ? `attempt: ${job.attempt}` : null,
       `started: ${new Date(job.startedAt).toISOString()}`,
       `updated: ${new Date(job.updatedAt).toISOString()}`,
+      job.finishedAt ? `finished: ${new Date(job.finishedAt).toISOString()}` : null,
       job.detail ? `detail: ${job.detail}` : null,
+      job.resultPreview ? `result: ${job.resultPreview}` : null,
+      job.workspacePath ? `workspace: ${job.workspacePath}` : null,
       job.verificationSummary ? `verification: ${job.verificationSummary}` : null,
       artifact ? `artifact: ${artifact.title}` : job.artifactTitle ? `artifact: ${job.artifactTitle}` : null,
       job.prompt ? `prompt: ${job.prompt}` : null,
@@ -4414,6 +4559,43 @@ export class NativeBridgeController {
     }
 
     return `Job ${job.id} has no stored result yet.`;
+  }
+
+  private formatJobLogs(job: BackgroundJobRecord): string {
+    const activities = job.agentActivities
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .map((activity) => {
+        const scope = [
+          activity.mode ? BLACKPINK_MODES[activity.mode].label : activity.label,
+          activity.purpose,
+          activity.status,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(' · ');
+        const detail = activity.detail ? ` · ${previewText(activity.detail, 180)}` : '';
+        const workspace = activity.workspacePath ? ` · ${previewText(activity.workspacePath, 100)}` : '';
+        return `- ${scope}${detail}${workspace}`;
+      });
+
+    return [
+      `Job ${job.id}`,
+      `label: ${job.label}`,
+      `status: ${job.status}`,
+      job.startedAt ? `started: ${new Date(job.startedAt).toISOString()}` : null,
+      job.finishedAt ? `finished: ${new Date(job.finishedAt).toISOString()}` : null,
+      job.attempt > 0 ? `attempt: ${job.attempt}` : null,
+      job.detail ? `detail: ${job.detail}` : null,
+      job.result?.workspacePath ? `workspace: ${job.result.workspacePath}` : null,
+      '',
+      'Agent activity:',
+      ...(activities.length > 0 ? activities : ['- no recorded agent activity']),
+      '',
+      'Result preview:',
+      job.result?.text ? previewText(job.result.text, 500) : job.artifact?.summary ?? 'no stored result',
+    ]
+      .filter((part): part is string => Boolean(part))
+      .join('\n');
   }
 
   private async getStoredBackgroundJob(jobId: string): Promise<BackgroundJobRecord | null> {
@@ -4548,6 +4730,8 @@ export class NativeBridgeController {
           stored.finishedAt ? `finished: ${new Date(stored.finishedAt).toISOString()}` : null,
           `updated: ${new Date(stored.updatedAt).toISOString()}`,
           stored.detail ? `detail: ${stored.detail}` : null,
+          stored.result?.workspacePath ? `workspace: ${stored.result.workspacePath}` : null,
+          stored.result?.text ? `result: ${previewText(stored.result.text, 220)}` : null,
           stored.result?.verification?.summary ? `verification: ${stored.result.verification.summary}` : null,
           stored.artifact ? `artifact: ${stored.artifact.title}` : null,
           stored.prompt ? `prompt: ${stored.prompt}` : null,
@@ -4556,6 +4740,19 @@ export class NativeBridgeController {
           .join('\n');
       }
       return this.formatJobInspect(job);
+    }
+
+    if (command === 'logs') {
+      const ref = rest[0]?.trim();
+      if (!ref) {
+        return 'Usage: /jobs logs <index-or-id>';
+      }
+      const job = this.resolveBackgroundJob(ref);
+      const stored = await this.getStoredBackgroundJob(job.id);
+      if (!stored) {
+        return `Job ${ref} has no stored logs.`;
+      }
+      return this.formatJobLogs(stored);
     }
 
     if (command === 'result') {
@@ -4627,7 +4824,7 @@ export class NativeBridgeController {
       return `Promoted job ${ref} to foreground.`;
     }
 
-    return 'Usage: /jobs [cancel|retry|inspect|result|promote] ...';
+    return 'Usage: /jobs [cancel|retry|inspect|logs|result|promote] ...';
   }
 
   private async runCheckpointCommand(message: string): Promise<string> {
@@ -4790,8 +4987,14 @@ export class NativeBridgeController {
 
   private formatMcpSummary(): string {
     const entries = Object.entries(this.config?.mcp.servers ?? {});
+    const paths = getDduduPaths(process.cwd());
     if (entries.length === 0) {
-      return 'No MCP servers configured.';
+      return [
+        'No MCP servers configured.',
+        `project config: ${paths.projectConfig}`,
+        `global config: ${paths.globalConfig}`,
+        'Add servers under mcp.servers in ddudu config, not .claude/, unless you explicitly want Claude Code config.',
+      ].join('\n');
     }
 
     const connected = new Set(this.mcpManager?.getConnectedServers() ?? []);
@@ -4801,6 +5004,8 @@ export class NativeBridgeController {
 
     return [
       'MCP servers',
+      `project config: ${paths.projectConfig}`,
+      `global config: ${paths.globalConfig}`,
       `connected: ${connected.size}/${entries.length}`,
       `tools: ${toolCount}`,
       ...entries.map(([name, config]) => {

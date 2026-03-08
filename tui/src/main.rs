@@ -168,9 +168,14 @@ struct NativeBackgroundJobState {
     detail: Option<String>,
     started_at: u64,
     updated_at: u64,
+    finished_at: Option<u64>,
     purpose: Option<String>,
     preferred_mode: Option<String>,
     strategy: Option<String>,
+    attempt: Option<u64>,
+    has_result: Option<bool>,
+    result_preview: Option<String>,
+    workspace_path: Option<String>,
     prompt_preview: Option<String>,
 }
 
@@ -1004,6 +1009,44 @@ impl App {
         lines.push(Line::from(Span::raw("")));
 
         lines.push(sidebar_header("Background"));
+        let running_jobs = self
+            .state
+            .background_jobs
+            .iter()
+            .filter(|job| job.status == "running")
+            .count();
+        let done_jobs = self
+            .state
+            .background_jobs
+            .iter()
+            .filter(|job| job.status == "done")
+            .count();
+        let error_jobs = self
+            .state
+            .background_jobs
+            .iter()
+            .filter(|job| job.status == "error")
+            .count();
+        if !self.state.background_jobs.is_empty() || !self.state.queued_prompts.is_empty() {
+            push_sidebar_rail_item(
+                &mut lines,
+                if running_jobs > 0 {
+                    SPINNER_FRAMES[self.spinner_index]
+                } else {
+                    "·"
+                },
+                if running_jobs > 0 { ACCENT } else { ACCENT_DIM },
+                format!(
+                    "{} running · {} done · {} error",
+                    format_count(running_jobs as u64),
+                    format_count(done_jobs as u64),
+                    format_count(error_jobs as u64)
+                ),
+                Some(format!("{} queued", format_count(self.state.queued_prompts.len() as u64))),
+                FG,
+                ACCENT_DIM,
+            );
+        }
         for job in self.state.background_jobs.iter().take(4) {
             let (marker, color) = match job.status.as_str() {
                 "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
@@ -1012,27 +1055,45 @@ impl App {
                 _ => ("·", ACCENT_DIM),
             };
             let elapsed = format_elapsed(Some(job.started_at));
+            let attempt = job
+                .attempt
+                .filter(|attempt| *attempt > 0)
+                .map(|attempt| format!(" · retry {}", format_count(attempt)));
             push_sidebar_rail_item(
                 &mut lines,
                 marker,
                 color,
-                format!("{} {elapsed}", preview_line(&job.label, 18)),
-                job.detail
-                    .as_ref()
-                    .map(|detail| preview_line(detail, 28))
-                    .or_else(|| {
-                        let note = [
-                            job.purpose.as_ref().map(|value| value.as_str()),
-                            job.strategy.as_ref().map(|value| value.as_str()),
-                            job.preferred_mode.as_ref().map(|value| value.as_str()),
-                            job.prompt_preview.as_ref().map(|value| value.as_str()),
-                        ]
-                        .into_iter()
-                        .flatten()
-                        .next();
-                        note.map(|value| preview_line(value, 28))
-                    })
-                    .or_else(|| Some(job.kind.clone())),
+                format!(
+                    "{}{} {elapsed}",
+                    preview_line(&job.label, 18),
+                    attempt.as_deref().unwrap_or("")
+                ),
+                match job.status.as_str() {
+                    "done" => job
+                        .result_preview
+                        .as_ref()
+                        .map(|detail| preview_line(detail, 28))
+                        .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28)))
+                        .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28))),
+                    _ => job
+                        .detail
+                        .as_ref()
+                        .map(|detail| preview_line(detail, 28))
+                        .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28)))
+                        .or_else(|| {
+                            let note = [
+                                job.purpose.as_ref().map(|value| value.as_str()),
+                                job.strategy.as_ref().map(|value| value.as_str()),
+                                job.preferred_mode.as_ref().map(|value| value.as_str()),
+                                job.prompt_preview.as_ref().map(|value| value.as_str()),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            .next();
+                            note.map(|value| preview_line(value, 28))
+                        })
+                        .or_else(|| Some(job.kind.clone())),
+                },
                 FG,
                 ACCENT_DIM,
             );

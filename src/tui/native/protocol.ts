@@ -93,9 +93,14 @@ export interface NativeBackgroundJobState {
   detail: string | null;
   startedAt: number;
   updatedAt: number;
+  finishedAt?: number | null;
   purpose?: string | null;
   preferredMode?: NamedMode | null;
   strategy?: 'parallel' | 'sequential' | 'delegate' | null;
+  attempt?: number | null;
+  hasResult?: boolean;
+  resultPreview?: string | null;
+  workspacePath?: string | null;
   promptPreview?: string | null;
 }
 

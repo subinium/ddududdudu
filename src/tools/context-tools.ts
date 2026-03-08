@@ -616,6 +616,56 @@ const renderGroupedMatches = (
     .join('\n\n');
 };
 
+const applyRankedOutputScores = (
+  scores: Map<string, { score: number; reasons: Set<string>; lines: string[] }>,
+  output: string,
+  weightMultiplier: number,
+  reason: string,
+): void => {
+  for (const rawLine of output.split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('# ')) {
+      continue;
+    }
+    const match = /^#\s+(.+?)\s+\(score\s+(\d+)/u.exec(line);
+    if (!match) {
+      continue;
+    }
+    const filePath = match[1]?.trim();
+    const score = Number.parseInt(match[2] ?? '0', 10);
+    if (!filePath || !Number.isFinite(score)) {
+      continue;
+    }
+    const existing = scores.get(filePath) ?? { score: 0, reasons: new Set<string>(), lines: [] };
+    existing.score += Math.max(1, Math.min(score, 40)) * weightMultiplier;
+    existing.reasons.add(reason);
+    scores.set(filePath, existing);
+  }
+};
+
+const fileImportancePurposeBoost = (purpose: string | undefined, relPath: string): number => {
+  const normalizedPurpose = purpose?.trim().toLowerCase();
+  const lowerPath = relPath.toLowerCase();
+  if (!normalizedPurpose) {
+    return 0;
+  }
+
+  if (normalizedPurpose === 'execution') {
+    return lowerPath.includes('test') ? 2 : 4;
+  }
+  if (normalizedPurpose === 'review') {
+    return lowerPath.includes('test') || lowerPath.includes('spec') ? 5 : 3;
+  }
+  if (normalizedPurpose === 'design') {
+    return lowerPath.includes('ui') || lowerPath.includes('component') || lowerPath.includes('theme') ? 5 : 2;
+  }
+  if (normalizedPurpose === 'planning' || normalizedPurpose === 'research') {
+    return lowerPath.endsWith('.md') || lowerPath.includes('docs/') ? 4 : 1;
+  }
+
+  return 0;
+};
+
 export const repoMapTool: Tool = {
   definition: {
     name: 'repo_map',
@@ -1129,6 +1179,152 @@ export const codebaseSearchTool: Tool = {
           root: rootPath,
           tokens,
           count: top.length,
+          changedFiles: Array.from(changedFiles.values()),
+        },
+      };
+    } catch (error: unknown) {
+      return {
+        output: error instanceof Error ? error.message : String(error),
+        isError: true,
+      };
+    }
+  },
+};
+
+export const fileImportanceTool: Tool = {
+  definition: {
+    name: 'file_importance',
+    description: 'Rank the files most likely to matter for the current request using changed-file, path, line-match, and LSP signals.',
+    parameters: {
+      query: { type: 'string', description: 'Natural-language request or keyword set.', required: true },
+      path: { type: 'string', description: 'Base path for ranking.' },
+      purpose: { type: 'string', description: 'Optional request purpose such as execution, review, planning, design, or research.' },
+      max_results: { type: 'number', description: 'Maximum files to return.' },
+    },
+  },
+  async execute(args, ctx) {
+    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
+      return { output: 'Missing required argument: query', isError: true };
+    }
+
+    const rootPath =
+      typeof args.path === 'string' && args.path.trim().length > 0
+        ? resolve(ctx.cwd, args.path)
+        : ctx.cwd;
+    const purpose = typeof args.purpose === 'string' && args.purpose.trim().length > 0 ? args.purpose.trim() : undefined;
+    const maxResults =
+      typeof args.max_results === 'number' && Number.isFinite(args.max_results)
+        ? Math.max(1, Math.floor(args.max_results))
+        : 8;
+    const tokens = tokenizeQuery(args.query);
+
+    if (tokens.length === 0) {
+      return { output: 'Query did not contain enough searchable tokens.', isError: true };
+    }
+
+    try {
+      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+      const changedFiles = new Set(await getChangedFiles(rootPath));
+      const scores = new Map<string, { score: number; reasons: Set<string>; lines: string[] }>();
+      const addSignal = (filePath: string, score: number, reason: string, line?: string): void => {
+        if (score <= 0) {
+          return;
+        }
+        const existing = scores.get(filePath) ?? { score: 0, reasons: new Set<string>(), lines: [] };
+        existing.score += score;
+        existing.reasons.add(reason);
+        if (line && existing.lines.length < 3) {
+          existing.lines.push(line);
+        }
+        scores.set(filePath, existing);
+      };
+
+      const significantTokens = tokens.filter((token) => token.length >= 3).slice(0, 4);
+      for (const filePath of files) {
+        const relPath = normalizePath(relative(rootPath, filePath));
+        const lowerPath = relPath.toLowerCase();
+        const pathTokens = tokens.filter((token) => lowerPath.includes(token));
+        let score = changedFileBoost(tokens, relPath, changedFiles);
+        score += fileImportancePurposeBoost(purpose, relPath);
+        if (pathTokens.length > 0) {
+          score += pathTokens.length * 4;
+        }
+        if (changedFiles.has(relPath)) {
+          addSignal(relPath, score, 'changed');
+        } else if (score > 0) {
+          addSignal(relPath, score, pathTokens.length > 0 ? `path:${pathTokens[0]}` : 'path');
+        }
+
+        const text = await readTextFile(filePath);
+        if (!text) {
+          continue;
+        }
+        const lines = text.split('\n');
+        for (let index = 0; index < lines.length; index += 1) {
+          const rawLine = lines[index] ?? '';
+          const lowerLine = rawLine.toLowerCase();
+          let lineScore = 0;
+          let matchedToken: string | null = null;
+          for (const token of significantTokens) {
+            if (lowerLine.includes(token)) {
+              lineScore += 2;
+              matchedToken ??= token;
+            }
+          }
+          if (lineScore <= 0) {
+            continue;
+          }
+          addSignal(relPath, lineScore, matchedToken ? `line:${matchedToken}` : 'line', `${relPath}:${index + 1}: ${rawLine.trim()}`);
+        }
+      }
+
+      const lspTokens = significantTokens.filter((token) => !CHANGE_PATTERNS.includes(token)).slice(0, 3);
+      for (const token of lspTokens) {
+        const definitionResult = await tryLspDefinitionSearch(token, rootPath, Math.max(maxResults, 6), ctx);
+        if (definitionResult) {
+          applyRankedOutputScores(scores, definitionResult.output, 3, `definition:${token}`);
+        }
+        const referenceMatches = await tryLspReferenceSearch(token, rootPath, Math.max(maxResults, 6), ctx);
+        if (referenceMatches && referenceMatches.length > 0) {
+          for (const match of referenceMatches) {
+            addSignal(match.path, match.score * 2, `references:${token}`, match.line);
+          }
+        }
+      }
+
+      const ranked = Array.from(scores.entries())
+        .sort((a, b) => b[1].score - a[1].score || a[0].localeCompare(b[0]))
+        .slice(0, maxResults);
+
+      if (ranked.length === 0) {
+        return {
+          output: '',
+          metadata: {
+            root: rootPath,
+            count: 0,
+            purpose,
+            tokens,
+          },
+        };
+      }
+
+      return {
+        output: ranked
+          .map(([path, entry]) => {
+            const reasons = Array.from(entry.reasons).slice(0, 3).join(', ');
+            const reasonLine = reasons ? `signals: ${reasons}` : null;
+            return [
+              `# ${path} (score ${entry.score})`,
+              ...(reasonLine ? [reasonLine] : []),
+              ...entry.lines.slice(0, 2),
+            ].join('\n');
+          })
+          .join('\n\n'),
+        metadata: {
+          root: rootPath,
+          count: ranked.length,
+          purpose,
+          tokens,
           changedFiles: Array.from(changedFiles.values()),
         },
       };

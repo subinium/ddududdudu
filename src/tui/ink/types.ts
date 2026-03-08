@@ -116,7 +116,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/context', description: 'Show active prompt context snapshot', value: '/context' },
   { label: '/review', description: 'Run code review checks', value: '/review' },
   { label: '/queue', description: 'Inspect or reorder queued prompts', value: '/queue' },
-  { label: '/jobs', description: 'Manage background delegated jobs', value: '/jobs' },
+  { label: '/jobs', description: 'Inspect logs, results, and retries for detached jobs', value: '/jobs' },
   { label: '/artifacts', description: 'Show recent typed artifacts', value: '/artifacts' },
   { label: '/checkpoint', description: 'Create a git checkpoint', value: '/checkpoint' },
   { label: '/undo', description: 'Undo the last ddudu checkpoint', value: '/undo' },

@@ -39,6 +39,13 @@ Toggle fast with /fire, or set explicitly with /permissions.
 - Skills and hooks loaded on demand
 - MCP (Model Context Protocol) server support
 
+## Path Conventions
+- ddudu project configuration lives under \`.ddudu/\` in the current repository
+- ddudu global configuration lives under \`~/.ddudu/\`
+- If the user asks to add MCP servers for ddudu, update \`.ddudu/config.yaml\` (project) or \`~/.ddudu/config.yaml\` (global)
+- Do NOT default to \`.claude/\` for ddudu configuration
+- Only touch \`.claude/\`, \`CLAUDE.md\`, or Claude Code-specific paths when the user explicitly asks for Claude Code compatibility
+
 ## Delegation
 You have the \`task\` tool to delegate work to another ddudu mode with isolated context and, when possible, an isolated git worktree.
 Use \`purpose\` when you want automatic routing:
