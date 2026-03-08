@@ -25,7 +25,7 @@ const printUsage = (): void => {
     `  ${P}ddudu doctor${X}                ${D}Check environment${X}`,
     `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
     `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
-    `  ${P}ddudu session${X} list|resume    ${D}Session management${X}`,
+    `  ${P}ddudu session${X} list|resume|last ${D}Session management${X}`,
     '',
     `${PL}Shortcuts (TUI)${X}`,
     `  Shift+Tab  cycle mode   Esc  interrupt`,
@@ -260,30 +260,32 @@ const resolveSessionDir = async (): Promise<string> => {
 };
 
 const handleSession = async (parsed: ParsedCommand): Promise<void> => {
-  const { access, readdir } = await import('node:fs/promises');
-  const { constants } = await import('node:fs');
+  const { SessionManager } = await import('./core/session.js');
   const sessionDir = await resolveSessionDir();
-
-  try {
-    await access(sessionDir, constants.R_OK);
-  } catch {
-    process.stdout.write('No sessions directory found\n');
-    return;
-  }
-
-  const entries = await readdir(sessionDir, { withFileTypes: true });
-  const sessionIds = entries
-    .filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl'))
-    .map((entry) => entry.name.slice(0, -'.jsonl'.length));
+  const manager = new SessionManager(sessionDir);
+  const sessions = await manager.list();
+  const sessionIds = sessions.map((session) => session.id);
 
   if (parsed.subcommand === 'list') {
-    if (sessionIds.length === 0) {
+    if (sessions.length === 0) {
       process.stdout.write('No sessions\n');
       return;
     }
-    for (const id of sessionIds) {
-      process.stdout.write(`${id}\n`);
+    for (const session of sessions) {
+      process.stdout.write(`${session.id}\n`);
     }
+    return;
+  }
+
+  if (parsed.subcommand === 'last') {
+    const latest = sessions[0];
+    if (!latest) {
+      process.stdout.write('No sessions\n');
+      return;
+    }
+
+    const { startNativeTui } = await import('./tui/native/launcher.js');
+    await startNativeTui({ resumeSessionId: latest.id });
     return;
   }
 

@@ -60,6 +60,7 @@ export interface NativeRequestEstimateState {
 
 export interface NativeTuiState {
   ready: boolean;
+  version: string;
   cwd: string;
   mode: NamedMode;
   modes: NativeModeState[];

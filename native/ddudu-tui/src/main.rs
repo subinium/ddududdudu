@@ -122,6 +122,7 @@ struct NativeRequestEstimateState {
 #[serde(rename_all = "camelCase")]
 struct NativeTuiState {
     ready: bool,
+    version: String,
     cwd: String,
     mode: String,
     modes: Vec<NativeModeState>,
@@ -352,6 +353,7 @@ impl App {
             bridge,
             state: NativeTuiState {
                 ready: false,
+                version: String::new(),
                 cwd: String::new(),
                 mode: "jennie".into(),
                 modes: Vec::new(),
@@ -615,6 +617,15 @@ impl App {
         lines.push(sidebar_header("Context"));
         push_sidebar_rail_item(
             &mut lines,
+            "·",
+            ACCENT_DIM,
+            format!("ddudu v{}", self.state.version),
+            None,
+            FG,
+            ACCENT_DIM,
+        );
+        push_sidebar_rail_item(
+            &mut lines,
             "◉",
             ACCENT,
             format!("{:>5.1}% footprint", self.state.context_percent * 100.0),
@@ -657,7 +668,7 @@ impl App {
                 ACCENT_DIM
             },
             if self.state.playing_with_fire {
-                "fire on".to_string()
+                "fire on (permissionless)".to_string()
             } else {
                 "fire off".to_string()
             },

@@ -92,6 +92,7 @@ ddudu init            # initialize .ddudu/ in current project
 ddudu doctor          # basic environment check
 ddudu config show     # print merged config
 ddudu session list    # list saved sessions
+ddudu session last    # reopen the most recent saved local session
 ddudu session resume <id>  # reopen a saved local session in the native TUI
 ```
 
@@ -153,5 +154,5 @@ MIT
 ---
 
 <p align="center">
-  Inspired by <a href="https://github.com/minpeter">minpeter</a>
+  Inspired by <a href="https://github.com/minpeter">minpeter</a> 🍀
 </p>

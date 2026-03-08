@@ -61,6 +61,14 @@ interface RequestPlan {
   remoteSessionId: string | null;
 }
 
+interface AutoRouteDecision {
+  kind: 'direct' | 'delegate' | 'team';
+  reason: string;
+  purpose?: DelegationPurpose;
+  preferredMode?: NamedMode;
+  strategy?: 'parallel' | 'sequential' | 'delegate';
+}
+
 type EmitFn = (event: NativeBridgeEvent) => void;
 type AskUserResolver = {
   resolve: (answer: string) => void;
@@ -455,6 +463,7 @@ export class NativeBridgeController {
   private config: DduduConfig | null = null;
   private readonly state: NativeTuiState = {
     ready: false,
+    version: PROMPT_VERSION,
     cwd: process.cwd(),
     mode: 'jennie',
     modes: [],
@@ -814,6 +823,10 @@ export class NativeBridgeController {
     this.tokenCounter.setModel(model);
     await this.maybeAutoCompact(trimmedContent);
 
+    if (await this.maybeHandleJennieAutoRoute(trimmedContent)) {
+      return;
+    }
+
     const userMessage: NativeMessageState = {
       id: randomUUID(),
       role: 'user',
@@ -1046,6 +1059,247 @@ export class NativeBridgeController {
       if (nextPrompt) {
         await this.submit(nextPrompt);
       }
+    }
+  }
+
+  private classifyJennieAutoRoute(prompt: string): AutoRouteDecision {
+    const normalized = normalizeSingleLine(prompt);
+    const lower = normalized.toLowerCase();
+    const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
+
+    const hasDesign = /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b/u.test(lower);
+    const hasPlanning = /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b/u.test(lower);
+    const hasResearch = /\b(research|investigate|look into|survey|compare options|explore)\b/u.test(lower);
+    const hasReview = /\b(review|audit|verify|validation|regression|risk|critic|critique)\b/u.test(lower);
+    const hasExecution = /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b/u.test(lower);
+    const explicitTeam = /\b(team|multi[- ]agent|orchestrate|delegate|parallel|sequential|split (this|it) up|break (this|it) down)\b/u.test(lower);
+    const multiStep =
+      /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(lower) ||
+      /\b(end-to-end|from scratch|full flow|across the repo|whole project|entire codebase)\b/u.test(lower) ||
+      normalized.split(/\n+/u).length > 1;
+    const purposeCount = [hasDesign, hasPlanning, hasResearch, hasReview, hasExecution].filter(Boolean).length;
+
+    if (wordCount <= 6 && purposeCount === 0) {
+      return { kind: 'direct', reason: 'short direct prompt' };
+    }
+
+    if (explicitTeam || (purposeCount >= 2 && multiStep)) {
+      return {
+        kind: 'team',
+        strategy: explicitTeam ? 'delegate' : 'parallel',
+        reason: explicitTeam ? 'explicit orchestration request' : 'multi-domain request',
+      };
+    }
+
+    if (hasDesign) {
+      return {
+        kind: 'delegate',
+        purpose: 'design',
+        preferredMode: 'jisoo',
+        reason: 'design or UX request',
+      };
+    }
+
+    if (hasResearch) {
+      return {
+        kind: 'delegate',
+        purpose: 'research',
+        preferredMode: 'rosé',
+        reason: 'research request',
+      };
+    }
+
+    if (hasPlanning) {
+      return {
+        kind: 'delegate',
+        purpose: 'planning',
+        preferredMode: 'rosé',
+        reason: 'planning or architecture request',
+      };
+    }
+
+    if (hasReview) {
+      return {
+        kind: 'delegate',
+        purpose: 'review',
+        preferredMode: 'rosé',
+        reason: 'review or validation request',
+      };
+    }
+
+    if (hasExecution) {
+      return {
+        kind: 'delegate',
+        purpose: 'execution',
+        preferredMode: 'lisa',
+        reason: 'implementation request',
+      };
+    }
+
+    return { kind: 'direct', reason: 'no strong orchestration signal' };
+  }
+
+  private formatAutoRouteNotice(decision: AutoRouteDecision): string {
+    if (decision.kind === 'team') {
+      return `Auto route · team ${decision.strategy ?? 'parallel'} · ${decision.reason}`;
+    }
+
+    const modeLabel = decision.preferredMode
+      ? BLACKPINK_MODES[decision.preferredMode].label
+      : 'Auto';
+    const purpose = decision.purpose ?? 'general';
+    return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
+  }
+
+  private async maybeHandleJennieAutoRoute(trimmedContent: string): Promise<boolean> {
+    if (this.currentMode !== 'jennie') {
+      return false;
+    }
+
+    const decision = this.classifyJennieAutoRoute(trimmedContent);
+    if (decision.kind === 'direct') {
+      return false;
+    }
+
+    const userMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'user',
+      content: trimmedContent,
+      timestamp: Date.now(),
+    };
+
+    this.state.messages.push(userMessage);
+
+    if (decision.kind === 'team') {
+      await this.executeTeamRun(decision.strategy ?? 'parallel', trimmedContent, {
+        routeNote: this.formatAutoRouteNotice(decision),
+      });
+      return true;
+    }
+
+    await this.executeDelegatedRoute(userMessage, decision);
+    return true;
+  }
+
+  private async executeDelegatedRoute(
+    userMessage: NativeMessageState,
+    decision: AutoRouteDecision,
+  ): Promise<void> {
+    const assistantMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+    const routeNotice = this.formatAutoRouteNotice(decision);
+    this.state.messages.push({
+      id: randomUUID(),
+      role: 'system',
+      content: routeNotice,
+      timestamp: Date.now(),
+    });
+    this.state.messages.push(assistantMessage);
+    this.state.loading = true;
+    this.state.loadingLabel = `route · ${decision.purpose ?? 'general'}`;
+    this.state.loadingSince = Date.now();
+    this.state.requestEstimate = null;
+    this.activeAssistantMessageId = assistantMessage.id;
+    this.scheduleStatePush();
+
+    const controller = new AbortController();
+    this.abortController = controller;
+    this.activeOperation = 'request';
+
+    try {
+      await this.hookRegistry.emit('beforeSend', {
+        provider: this.getCurrentProvider(),
+        model: this.getCurrentModel(),
+        sessionId: this.state.sessionId,
+        remoteSessionId: null,
+        requestMode: 'full',
+        prompt: userMessage.content,
+      });
+
+      const runtime = this.createDelegationRuntime();
+      const result = await runtime.run(
+        {
+          prompt: userMessage.content,
+          purpose: decision.purpose,
+          preferredMode: decision.preferredMode,
+          parentSessionId: this.state.sessionId,
+          maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+        },
+        {
+          signal: controller.signal,
+          onText: (delta) => {
+            if (!delta) {
+              return;
+            }
+
+            const current = this.state.messages.find((message) => message.id === assistantMessage.id)?.content ?? '';
+            this.updateMessage(assistantMessage.id, current + delta);
+          },
+          onToolState: (states) => {
+            this.applyToolStates(assistantMessage.id, states);
+          },
+        },
+      );
+
+      const finalText = result.text.trim() || `[${BLACKPINK_MODES[result.mode].label}] no output`;
+      this.finishMessage(assistantMessage.id, finalText);
+
+      await this.hookRegistry.emit('afterResponse', {
+        provider: result.provider,
+        model: result.model,
+        sessionId: this.state.sessionId,
+        remoteSessionId: result.remoteSessionId ?? null,
+        requestMode: 'full',
+        inputTokens: result.usage.input,
+        outputTokens: result.usage.output,
+      });
+
+      if (this.sessionManager && this.state.sessionId) {
+        await this.sessionManager.append(this.state.sessionId, {
+          type: 'message',
+          timestamp: new Date().toISOString(),
+          data: {
+            user: userMessage.content,
+            assistant: finalText,
+            mode: result.mode,
+            provider: result.provider,
+            model: result.model,
+            requestMode: 'delegate',
+            purpose: result.purpose,
+            autoRoute: decision.reason,
+            remoteSessionId: result.remoteSessionId,
+            inputTokens: result.usage.input,
+            outputTokens: result.usage.output,
+          },
+        });
+      }
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) {
+        await this.hookRegistry.emit('onError', {
+          provider: this.getCurrentProvider(),
+          model: this.getCurrentModel(),
+          sessionId: this.state.sessionId,
+          operation: 'delegate',
+          message: serializeError(error),
+        });
+        this.finishMessage(assistantMessage.id, toErrorMessage(error));
+      } else {
+        this.finishMessage(assistantMessage.id, '[request aborted]');
+      }
+    } finally {
+      this.state.loading = false;
+      this.state.loadingLabel = '';
+      this.state.loadingSince = null;
+      this.state.requestEstimate = null;
+      this.abortController = null;
+      this.activeAssistantMessageId = null;
+      this.activeOperation = null;
+      this.scheduleStatePush();
     }
   }
 
@@ -1867,16 +2121,31 @@ export class NativeBridgeController {
       return 'Usage: /team run [parallel|sequential|delegate] <task>';
     }
 
+    return this.executeTeamRun(strategy, task);
+  }
+
+  private async executeTeamRun(
+    strategy: 'parallel' | 'sequential' | 'delegate',
+    task: string,
+    options: { routeNote?: string } = {},
+  ): Promise<string> {
+    if (this.state.loading || this.abortController) {
+      return 'Team run unavailable while another request is active.';
+    }
+
     const teamAgents = this.buildTeamAgents();
     if (teamAgents.length < 2) {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
 
     const assistantMessageId = randomUUID();
+    const notice = options.routeNote
+      ? `${options.routeNote} · ${previewText(task, 96)}`
+      : `Team run started · ${strategy} · ${previewText(task, 96)}`;
     this.state.messages.push({
       id: randomUUID(),
       role: 'system',
-      content: `Team run started · ${strategy} · ${previewText(task, 96)}`,
+      content: notice,
       timestamp: Date.now(),
     });
     this.state.messages.push({
@@ -1920,6 +2189,24 @@ export class NativeBridgeController {
       const formatted = this.formatTeamResult(strategy, task, teamAgents, result.messages, result.output, result.success, result.rounds);
       this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
       this.finishMessage(assistantMessageId, formatted);
+      if (this.sessionManager && this.state.sessionId) {
+        await this.sessionManager.append(this.state.sessionId, {
+          type: 'message',
+          timestamp: new Date().toISOString(),
+          data: {
+            user: task,
+            assistant: formatted,
+            mode: this.currentMode,
+            requestMode: 'team',
+            teamStrategy: strategy,
+            teamAgents: teamAgents.map((agent) => ({
+              id: agent.id,
+              mode: agent.mode,
+              model: agent.model,
+            })),
+          },
+        });
+      }
       return `Team run finished · ${this.teamLastSummary}`;
     } catch (error: unknown) {
       if (controller.signal.aborted) {
@@ -2349,6 +2636,8 @@ export class NativeBridgeController {
   }
 
   private emitStateNow(): void {
+    this.syncUsageState();
+
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
