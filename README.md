@@ -23,7 +23,7 @@
 - Team orchestration with parallel, sequential, and delegated runs
 - Isolated delegated runs with git worktrees for CLI-backed agent sessions
 - Workflow state with todos, permission profiles, remote CLI session state, detached background jobs, and automatic verification
-- Sidebar agent activity rail for delegated runs, task tools, and team workers
+- Sidebar rails for subagents, detached background work, MCP servers, and LSP status
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 
@@ -159,8 +159,8 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/config` | show runtime config summary |
 | `/help` | show available commands |
 | `/doctor` | show runtime health and context info |
-| `/queue` | inspect and manage queued prompts |
-| `/jobs` | inspect, retry, promote, cancel, or read detached background job results |
+| `/queue` | inspect, run, promote, drop, or clear queued prompts |
+| `/jobs` | inspect, result, retry, promote, or cancel detached background jobs |
 | `/review` | run review checks against the current diff |
 | `/checkpoint` | create a git checkpoint commit |
 | `/undo` | revert the last ddudu checkpoint |
@@ -174,7 +174,7 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/hook` | inspect loaded hooks |
 | `/mcp` | inspect MCP server/tool state |
 | `/team` | run multi-agent orchestration |
-| `/quit` | exit ddudu |
+| `/quit` / `/exit` | exit ddudu |
 
 ## Project Layout
 
@@ -196,6 +196,7 @@ Typical setup:
 ├── rules/
 ├── prompts/
 ├── skills/
+├── jobs/
 └── sessions/
 ```
 
