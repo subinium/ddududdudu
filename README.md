@@ -27,6 +27,34 @@
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 
+## Harness Anatomy
+
+Across Claude Code, Codex, OpenCode, Cursor, Windsurf, Devin, and related systems, a harness tends to converge on the same shape: not a prompt wrapper, but a small operating layer around a model.
+
+### Core Layers
+
+| Layer | What it owns |
+| ----- | ------------ |
+| `execution kernel` | provider runtime, permissions, tool execution, model sessions |
+| `context engine` | retrieval, compaction, handoff, memory loading, context budgeting |
+| `session/state layer` | canonical transcript, plans, checkpoints, queued work, background jobs |
+| `orchestration layer` | routing, delegation, subagents, verification, recovery |
+| `operator surface` | the interface for inspecting progress, context, jobs, and decisions |
+
+### Supporting Utilities
+
+| Utility | Why it matters |
+| ------- | -------------- |
+| `rules and prompts` | shape behavior with project instructions, role constraints, and request scaffolding |
+| `tools and MCP` | connect the model to the repo, shell, web, and external systems |
+| `git and worktrees` | isolate risky edits, parallelize tasks, and make undo/review cheap |
+| `memory and skills` | persist working, episodic, semantic, and procedural knowledge |
+| `hooks and briefings` | keep context fresh and compress long sessions into stable signals |
+| `verifiers` | close the loop with lint, test, review, repair, and apply flows |
+| `background workers` | keep delegated jobs running without blocking the foreground session |
+
+ddudu is built around that model: one harness owning state, context, and orchestration, with provider runtimes acting as workers underneath it.
+
 ## Modes
 
 | Mode     | Provider       | Model               | Role                                      |
