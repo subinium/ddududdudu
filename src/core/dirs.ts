@@ -10,6 +10,7 @@ export interface DduduPaths {
   globalHooks: string;
   globalSkills: string;
   globalSessions: string;
+  globalJobs: string;
   globalAuth: string;
   globalInstructions: string;
   projectDir: string;
@@ -19,6 +20,7 @@ export interface DduduPaths {
   projectHooks: string;
   projectInstructions: string;
   projectSessions: string;
+  projectJobs: string;
 }
 
 export const getDduduPaths = (cwd?: string): DduduPaths => {
@@ -36,6 +38,7 @@ export const getDduduPaths = (cwd?: string): DduduPaths => {
     globalHooks: resolve(globalDir, 'hooks'),
     globalSkills: resolve(globalDir, 'skills'),
     globalSessions: resolve(globalDir, 'sessions'),
+    globalJobs: resolve(globalDir, 'jobs'),
     globalAuth: resolve(globalDir, 'auth.json'),
     globalInstructions: resolve(globalDir, 'DDUDU.md'),
     projectDir,
@@ -45,6 +48,7 @@ export const getDduduPaths = (cwd?: string): DduduPaths => {
     projectHooks: resolve(projectDir, 'hooks'),
     projectInstructions: resolve(projectDir, 'DDUDU.md'),
     projectSessions: resolve(projectDir, 'sessions'),
+    projectJobs: resolve(projectDir, 'jobs'),
   };
 };
 
@@ -58,6 +62,7 @@ export const ensureGlobalDirs = async (): Promise<void> => {
     mkdir(paths.globalHooks, { recursive: true }),
     mkdir(paths.globalSkills, { recursive: true }),
     mkdir(paths.globalSessions, { recursive: true }),
+    mkdir(paths.globalJobs, { recursive: true }),
   ]);
 };
 
@@ -69,6 +74,5 @@ export const ensureProjectDirs = async (cwd?: string): Promise<void> => {
     mkdir(paths.projectPrompts, { recursive: true }),
     mkdir(paths.projectRules, { recursive: true }),
     mkdir(paths.projectHooks, { recursive: true }),
-    mkdir(paths.projectSessions, { recursive: true }),
   ]);
 };

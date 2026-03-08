@@ -12,6 +12,7 @@ import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
 import { ChecksRunner } from '../../core/checks.js';
 import { loadConfig } from '../../core/config.js';
+import { deleteDduduConfigValue, setDduduConfigValue } from '../../core/config-editor.js';
 import {
   BackgroundJobStore,
   resolveBackgroundJobDirectory,
@@ -30,14 +31,14 @@ import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
-import { appendMemory, clearMemory, loadMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
+import { appendMemory, clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
 import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import { getDduduPaths } from '../../core/dirs.js';
-import type { DduduConfig, LoadedSession, NamedMode, SessionEntry } from '../../core/types.js';
+import type { DduduConfig, LoadedSession, NamedMode, SessionEntry, ToolPolicy } from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
 import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
 import type {
@@ -88,6 +89,17 @@ interface RequestPlan {
   mode: CliBackedRequestMode;
   note: string | null;
   remoteSessionId: string | null;
+}
+
+interface ContextSnapshotOptions {
+  includeChangedFiles?: boolean;
+  includeBriefing?: boolean;
+  includePlan?: boolean;
+  includeUncertainties?: boolean;
+  includeOperationalState?: boolean;
+  includeMemory?: boolean;
+  memoryScopes?: MemoryScope[];
+  maxArtifacts?: number;
 }
 
 interface AutoRouteDecision {
@@ -279,6 +291,10 @@ const normalizePermissionProfile = (value: unknown): PermissionProfile => {
   }
 
   return value === 'ask' ? 'ask' : DEFAULT_PERMISSION_PROFILE;
+};
+
+const isToolPolicy = (value: unknown): value is ToolPolicy => {
+  return value === 'inherit' || value === 'allow' || value === 'ask' || value === 'deny';
 };
 
 const toCompactionMessages = (messages: NativeMessageState[]): CompactionMessage[] => {
@@ -755,6 +771,7 @@ export class NativeBridgeController {
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
   private readonly backgroundJobStatusCache = new Map<string, BackgroundJobState['status']>();
   private readonly verificationRepairFingerprints = new Map<string, number>();
+  private readonly memoryPromotionFingerprints = new Set<string>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
 
@@ -2187,14 +2204,49 @@ export class NativeBridgeController {
     return 'dangerous';
   }
 
+  private getConfiguredToolPolicy(name: string): ToolPolicy {
+    const policies = this.config?.tools.policies ?? {};
+    if (isToolPolicy(policies[name])) {
+      return policies[name] as ToolPolicy;
+    }
+
+    for (const [pattern, value] of Object.entries(policies)) {
+      if (!isToolPolicy(value) || !pattern.endsWith('*')) {
+        continue;
+      }
+      const prefix = pattern.slice(0, -1);
+      if (prefix && name.startsWith(prefix)) {
+        return value;
+      }
+    }
+
+    return 'inherit';
+  }
+
+  private async setConfiguredToolPolicy(name: string, policy: ToolPolicy): Promise<void> {
+    if (policy === 'inherit') {
+      await deleteDduduConfigValue(process.cwd(), `tools.policies.${name}`);
+    } else {
+      await setDduduConfigValue(process.cwd(), `tools.policies.${name}`, policy);
+    }
+
+    this.config = await loadConfig();
+    this.scheduleStatePush();
+  }
+
   private async authorizeToolExecution(
     block: ToolUseBlock,
     toolContext: ToolContext,
   ): Promise<{ allowed: boolean; reason?: string }> {
     const input = typeof block.input === 'object' && block.input !== null ? block.input as Record<string, unknown> : {};
     const risk = this.classifyToolRisk(block.name, input);
+    const policy = this.getConfiguredToolPolicy(block.name);
 
-    if (this.permissionProfile === 'permissionless') {
+    if (policy === 'deny') {
+      return { allowed: false, reason: `Blocked ${block.name}: tool policy is deny.` };
+    }
+
+    if (this.permissionProfile === 'permissionless' && policy !== 'ask') {
       return { allowed: true };
     }
 
@@ -2203,6 +2255,25 @@ export class NativeBridgeController {
         return { allowed: true };
       }
       return { allowed: false, reason: `Blocked ${block.name}: current permission profile is plan (read-only).` };
+    }
+
+    if (policy === 'allow') {
+      return { allowed: true };
+    }
+
+    if (policy === 'ask') {
+      const summary = summarizeToolInput(block.name, input);
+      const answer = toolContext.askUser
+        ? await toolContext.askUser(
+          `Allow ${summary}?`,
+          ['Allow once', `Deny (${this.permissionProfile})`],
+        )
+        : 'Deny';
+
+      return {
+        allowed: answer.toLowerCase().includes('allow'),
+        reason: `Denied ${block.name}: approval was not granted.`,
+      };
     }
 
     if (this.permissionProfile === 'workspace-write') {
@@ -2452,21 +2523,16 @@ export class NativeBridgeController {
       }
 
       try {
-        const memory = await loadMemory(cwd);
+        const memory = await loadSelectedMemory(cwd, this.getSystemMemoryScopes(mode), 360);
         if (hasMeaningfulMemory(memory)) {
-          prompt += `\n\n<memory>\n${memory}\n</memory>`;
+          prompt += `\n\n<stable_memory>\n${memory}\n</stable_memory>`;
         }
       } catch {
         // Memory is optional; keep prompt generation resilient.
       }
 
-      const planSummary = this.formatPlanSummary();
-      prompt += `\n\n<workflow>\npermission_profile: ${this.permissionProfile}\n${planSummary}\n</workflow>`;
-      const contextSnapshot = await this.buildPromptContextSnapshot();
-      if (contextSnapshot) {
-        prompt += `\n\n${contextSnapshot}`;
-      }
-      this.state.contextPreview = contextSnapshot || null;
+      prompt += `\n\n<workflow>\npermission_profile: ${this.permissionProfile}\n${this.buildSlimWorkflowSummary()}\n</workflow>`;
+      this.state.contextPreview = null;
 
       this.systemPrompt = prompt;
     } catch {
@@ -2475,6 +2541,53 @@ export class NativeBridgeController {
     }
 
     this.syncUsageState();
+  }
+
+  private getSystemMemoryScopes(mode: NamedMode = this.currentMode): MemoryScope[] {
+    if (mode === 'lisa') {
+      return ['procedural', 'working'];
+    }
+
+    if (mode === 'rosé') {
+      return ['project', 'semantic', 'procedural'];
+    }
+
+    if (mode === 'jisoo') {
+      return ['project', 'semantic'];
+    }
+
+    return ['project', 'procedural', 'semantic'];
+  }
+
+  private getRequestMemoryScopes(purpose: DelegationPurpose | 'general'): MemoryScope[] {
+    switch (purpose) {
+      case 'execution':
+        return ['working', 'semantic', 'procedural'];
+      case 'planning':
+        return ['project', 'episodic', 'semantic'];
+      case 'research':
+        return ['episodic', 'semantic', 'project'];
+      case 'review':
+        return ['semantic', 'procedural', 'working'];
+      case 'design':
+        return ['project', 'semantic', 'procedural'];
+      case 'oracle':
+        return ['semantic', 'procedural'];
+      default:
+        return ['working', 'semantic'];
+    }
+  }
+
+  private buildSlimWorkflowSummary(): string {
+    const activeItems = this.todos
+      .filter((item) => item.status !== 'completed')
+      .slice(0, 3)
+      .map((item) => `plan_item: [${item.status}] ${previewText(item.step, 140)}`);
+
+    return [
+      `mode: ${HARNESS_MODES[this.currentMode].label}`,
+      activeItems.length > 0 ? activeItems.join('\n') : 'plan_item: none',
+    ].join('\n');
   }
 
   private getWorkflowSnapshot(): WorkflowStateSnapshot {
@@ -2955,7 +3068,7 @@ export class NativeBridgeController {
       return;
     }
 
-    const entries = Object.entries(this.config.mcp.servers ?? {});
+    const entries = Object.entries(this.config.mcp.servers ?? {}).filter(([, server]) => server.enabled !== false);
     if (entries.length === 0) {
       return;
     }
@@ -2972,6 +3085,25 @@ export class NativeBridgeController {
 
     this.mcpManager = manager;
     this.syncMcpState();
+  }
+
+  private async reloadMcpRuntime(): Promise<void> {
+    this.config = await loadConfig();
+    this.mcpManager?.disconnectAll();
+    this.mcpManager = null;
+    this.toolRegistry?.removeMatching((name) => name.startsWith('mcp__'));
+    await this.initializeMcpTools();
+    this.syncMcpState();
+    await this.refreshSystemPrompt();
+    this.scheduleStatePush();
+  }
+
+  private async setMcpServerEnabled(name: string, enabled: boolean): Promise<void> {
+    if (!this.config?.mcp.servers[name]) {
+      throw new Error(`Unknown MCP server: ${name}`);
+    }
+    await setDduduConfigValue(process.cwd(), `mcp.servers.${name}.enabled`, enabled);
+    await this.reloadMcpRuntime();
   }
 
   private syncMcpState(): void {
@@ -3675,9 +3807,20 @@ export class NativeBridgeController {
   private async buildPromptContextSnapshot(
     prompt?: string,
     purpose?: DelegationPurpose | 'general',
+    options: ContextSnapshotOptions = {},
   ): Promise<string> {
     const parts: string[] = [];
     const effectivePurpose = purpose ?? (prompt ? this.inferPromptPurpose(prompt) : 'general');
+    const snapshotOptions: Required<ContextSnapshotOptions> = {
+      includeChangedFiles: options.includeChangedFiles ?? true,
+      includeBriefing: options.includeBriefing ?? true,
+      includePlan: options.includePlan ?? true,
+      includeUncertainties: options.includeUncertainties ?? (effectivePurpose === 'planning' || effectivePurpose === 'research' || effectivePurpose === 'review'),
+      includeOperationalState: options.includeOperationalState ?? (effectivePurpose === 'planning' || effectivePurpose === 'general'),
+      includeMemory: options.includeMemory ?? true,
+      memoryScopes: options.memoryScopes ?? this.getRequestMemoryScopes(effectivePurpose),
+      maxArtifacts: options.maxArtifacts ?? (effectivePurpose === 'planning' || effectivePurpose === 'review' ? 4 : 3),
+    };
     if (prompt) {
       parts.push(`request_focus: ${effectivePurpose}`);
       const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
@@ -3688,77 +3831,99 @@ export class NativeBridgeController {
         );
       }
     }
-    const recentArtifacts = this.artifacts.slice(0, 3);
-    if (recentArtifacts.length > 0) {
+    const relevantArtifacts = this.getArtifactsForPurpose(effectivePurpose, snapshotOptions.maxArtifacts);
+    if (relevantArtifacts.length > 0) {
       parts.push(
-        ...recentArtifacts.map((artifact) => {
+        ...relevantArtifacts.map((artifact) => {
           const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
           return `artifact: [${artifact.kind}] ${artifact.title}${mode} · ${previewText(artifact.summary, 140)}`;
         }),
       );
     }
-    const changedFiles = await this.getChangedFiles(8);
-    if (changedFiles.length > 0) {
-      parts.push(
-        'changed_files:',
-        ...changedFiles.map((filePath) => `- ${filePath}`),
-      );
-    }
-
-    const artifactDir = this.getSessionArtifactDirectory();
-    if (artifactDir) {
+    if (snapshotOptions.includeMemory) {
       try {
-        const briefing = await loadBriefing(artifactDir);
-        if (briefing) {
-          parts.push(
-            `briefing_summary: ${previewText(briefing.summary, 220)}`,
-            ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
-          );
+        const selectedMemory = await loadSelectedMemory(process.cwd(), snapshotOptions.memoryScopes, 320);
+        if (hasMeaningfulMemory(selectedMemory)) {
+          parts.push('<memory_selection>', selectedMemory, '</memory_selection>');
         }
       } catch {
-        // Briefing is optional.
+        // Selected memory is optional.
       }
     }
 
-    if (this.todos.length > 0) {
+    if (snapshotOptions.includeChangedFiles) {
+      const changedFiles = await this.getChangedFiles(8);
+      if (changedFiles.length > 0) {
+        parts.push(
+          'changed_files:',
+          ...changedFiles.map((filePath) => `- ${filePath}`),
+        );
+      }
+    }
+
+    if (snapshotOptions.includeBriefing) {
+      const artifactDir = this.getSessionArtifactDirectory();
+      if (artifactDir) {
+        try {
+          const briefing = await loadBriefing(artifactDir);
+          if (briefing) {
+            parts.push(
+              `briefing_summary: ${previewText(briefing.summary, 220)}`,
+              ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
+            );
+          }
+        } catch {
+          // Briefing is optional.
+        }
+      }
+    }
+
+    if (snapshotOptions.includePlan && this.todos.length > 0) {
       parts.push(
-        ...this.todos.slice(0, 5).map((item) => `plan_item: [${item.status}] ${previewText(item.step, 180)}`),
+        ...this.todos
+          .filter((item) => effectivePurpose === 'planning' || item.status !== 'completed')
+          .slice(0, 5)
+          .map((item) => `plan_item: [${item.status}] ${previewText(item.step, 180)}`),
       );
     }
 
-    const uncertainties = this.epistemicState.getState().activeUncertainties
-      .slice(0, 3)
-      .map((item) => item.content)
-      .filter((item) => item.trim().length > 0);
-    if (uncertainties.length > 0) {
-      parts.push(...uncertainties.map((item) => `uncertainty: ${previewText(item, 180)}`));
+    if (snapshotOptions.includeUncertainties) {
+      const uncertainties = this.epistemicState.getState().activeUncertainties
+        .slice(0, 3)
+        .map((item) => item.content)
+        .filter((item) => item.trim().length > 0);
+      if (uncertainties.length > 0) {
+        parts.push(...uncertainties.map((item) => `uncertainty: ${previewText(item, 180)}`));
+      }
     }
 
-    const activeAgents = this.agentActivities
-      .filter((item) => item.status === 'running' || item.status === 'verifying' || item.status === 'queued')
-      .slice(0, 4);
-    if (activeAgents.length > 0) {
-      parts.push(
-        ...activeAgents.map((item) => {
-          const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
-            .filter((part): part is string => Boolean(part))
-            .join(' · ');
-          const detail = item.detail ? ` · ${previewText(item.detail, 120)}` : '';
-          return `active_agent: ${scope} · ${item.status}${detail}`;
-        }),
-      );
-    }
+    if (snapshotOptions.includeOperationalState) {
+      const activeAgents = this.agentActivities
+        .filter((item) => item.status === 'running' || item.status === 'verifying' || item.status === 'queued')
+        .slice(0, 2);
+      if (activeAgents.length > 0) {
+        parts.push(
+          ...activeAgents.map((item) => {
+            const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
+              .filter((part): part is string => Boolean(part))
+              .join(' · ');
+            const detail = item.detail ? ` · ${previewText(item.detail, 100)}` : '';
+            return `active_agent: ${scope} · ${item.status}${detail}`;
+          }),
+        );
+      }
 
-    const activeBackgroundJobs = this.backgroundJobs
-      .filter((job) => job.status === 'running')
-      .slice(0, 3);
-    if (activeBackgroundJobs.length > 0) {
-      parts.push(
-        ...activeBackgroundJobs.map((job) => {
-          const detail = job.detail ? ` · ${previewText(job.detail, 120)}` : '';
-          return `background_job: ${job.label} · ${job.kind}${detail}`;
-        }),
-      );
+      const activeBackgroundJobs = this.backgroundJobs
+        .filter((job) => job.status === 'running')
+        .slice(0, 2);
+      if (activeBackgroundJobs.length > 0) {
+        parts.push(
+          ...activeBackgroundJobs.map((job) => {
+            const detail = job.detail ? ` · ${previewText(job.detail, 100)}` : '';
+            return `background_job: ${job.label} · ${job.kind}${detail}`;
+          }),
+        );
+      }
     }
 
     if (this.state.workspace?.path) {
@@ -4324,6 +4489,51 @@ export class NativeBridgeController {
     });
   }
 
+  private async autoPromoteSuccessfulRunMemory(input: {
+    reason?: string | null;
+    purpose: DelegationPurpose | 'general';
+    output: string;
+    mode: NamedMode;
+    verification: VerificationSummary;
+  }): Promise<void> {
+    const fingerprint = input.verification.fingerprint ?? `${input.purpose}:${input.verification.summary}`;
+    if (this.memoryPromotionFingerprints.has(fingerprint)) {
+      return;
+    }
+    this.memoryPromotionFingerprints.add(fingerprint);
+
+    const files = input.verification.changedFiles.length > 0
+      ? input.verification.changedFiles.slice(0, 6).join(', ')
+      : 'not detected';
+
+    await appendMemory(
+      process.cwd(),
+      [
+        `Outcome: ${input.purpose} verified successfully in ${HARNESS_MODES[input.mode].label}.`,
+        `Files: ${files}`,
+        `Verification: ${input.verification.summary}`,
+        `Result: ${previewText(input.output, 280)}`,
+      ].join('\n'),
+      'semantic',
+    );
+
+    if (input.reason === 'verification auto-retry' || input.reason?.startsWith('Verification escalation') === true) {
+      await appendMemory(
+        process.cwd(),
+        [
+          `Repair pattern succeeded for ${input.purpose}.`,
+          `Mode: ${HARNESS_MODES[input.mode].label}`,
+          `Files: ${files}`,
+          `Verification: ${input.verification.summary}`,
+          'Guideline: prefer the smallest isolated patch that lands cleanly and rerun verification before returning control.',
+        ].join('\n'),
+        'procedural',
+      );
+    }
+
+    await this.refreshSystemPrompt();
+  }
+
   private async finalizeVerificationRecovery(input: {
     reason?: string | null;
     purpose: DelegationPurpose | 'general';
@@ -4346,6 +4556,13 @@ export class NativeBridgeController {
         verification,
       });
     }
+    await this.autoPromoteSuccessfulRunMemory({
+      reason: input.reason,
+      purpose: input.purpose,
+      output: input.output,
+      mode: input.mode,
+      verification,
+    });
   }
 
   private buildVerificationFollowupPrompt(input: {
@@ -4587,10 +4804,49 @@ export class NativeBridgeController {
     return 'none';
   }
 
+  private formatToolPolicySummary(): string {
+    const policies = Object.entries(this.config?.tools.policies ?? {})
+      .filter(([, value]) => isToolPolicy(value))
+      .sort(([left], [right]) => left.localeCompare(right));
+
+    if (policies.length === 0) {
+      return 'Tool policies\nnone';
+    }
+
+    return [
+      'Tool policies',
+      ...policies.map(([name, value]) => `${name} · ${value}`),
+    ].join('\n');
+  }
+
   private async runPermissionsCommand(args: string[]): Promise<string> {
     const requested = args[0]?.trim().toLowerCase();
     if (!requested) {
-      return `Permissions\ncurrent: ${this.permissionProfile}\nprofiles: plan, ask, workspace-write, permissionless`;
+      return [
+        'Permissions',
+        `current: ${this.permissionProfile}`,
+        'profiles: plan, ask, workspace-write, permissionless',
+        '',
+        this.formatToolPolicySummary(),
+      ].join('\n');
+    }
+
+    if (requested === 'tools') {
+      return this.formatToolPolicySummary();
+    }
+
+    if (requested === 'tool') {
+      const name = args[1]?.trim();
+      const policy = args[2]?.trim().toLowerCase();
+      if (!name || !policy || !isToolPolicy(policy)) {
+        return 'Usage: /permissions tool <tool-name|prefix*> <inherit|allow|ask|deny>';
+      }
+      await this.setConfiguredToolPolicy(name, policy);
+      return [
+        `Tool policy updated: ${name} -> ${policy}`,
+        '',
+        this.formatToolPolicySummary(),
+      ].join('\n');
     }
 
     const nextProfile =
@@ -5326,8 +5582,8 @@ export class NativeBridgeController {
       `connected: ${connected.size}/${entries.length}`,
       `tools: ${toolCount}`,
       ...entries.map(([name, config]) => {
-        const status = connected.has(name) ? 'connected' : 'disconnected';
-        return `${name} · ${config.command} · ${status}`;
+        const enabled = config.enabled === false ? 'disabled' : connected.has(name) ? 'connected' : 'disconnected';
+        return `${name} · ${config.command} · ${enabled}`;
       }),
     ].join('\n');
   }
@@ -5354,17 +5610,49 @@ export class NativeBridgeController {
     }
 
     if (command === 'reload') {
-      this.config = await loadConfig();
-      this.mcpManager?.disconnectAll();
-      this.mcpManager = null;
-      this.toolRegistry?.removeMatching((name) => name.startsWith('mcp__'));
-      await this.initializeMcpTools();
-      this.syncMcpState();
-      this.scheduleStatePush();
+      await this.reloadMcpRuntime();
       return this.formatMcpSummary();
     }
 
-    return 'Usage: /mcp [status|list|path|reload]';
+    if (command === 'add') {
+      const name = args[1]?.trim();
+      const executable = args[2]?.trim();
+      const commandArgs = args.slice(3).map((value) => value.trim()).filter(Boolean);
+      if (!name || !executable) {
+        return 'Usage: /mcp add <name> <command> [args...]';
+      }
+      await setDduduConfigValue(process.cwd(), `mcp.servers.${name}`, {
+        command: executable,
+        args: commandArgs,
+        enabled: true,
+      });
+      await this.reloadMcpRuntime();
+      return `Added MCP server ${name}.\n\n${this.formatMcpSummary()}`;
+    }
+
+    if (command === 'enable' || command === 'disable') {
+      const name = args[1]?.trim();
+      if (!name) {
+        return `Usage: /mcp ${command} <name>`;
+      }
+      await this.setMcpServerEnabled(name, command === 'enable');
+      return `${command === 'enable' ? 'Enabled' : 'Disabled'} MCP server ${name}.\n\n${this.formatMcpSummary()}`;
+    }
+
+    if (command === 'remove') {
+      const name = args[1]?.trim();
+      if (!name) {
+        return 'Usage: /mcp remove <name>';
+      }
+      if (!this.config?.mcp.servers[name]) {
+        return `Unknown MCP server: ${name}`;
+      }
+      await deleteDduduConfigValue(process.cwd(), `mcp.servers.${name}`);
+      await this.reloadMcpRuntime();
+      return `Removed MCP server ${name}.\n\n${this.formatMcpSummary()}`;
+    }
+
+    return 'Usage: /mcp [status|list|path|reload|add <name> <command> [args...]|enable <name>|disable <name>|remove <name>]';
   }
 
   private async runHookCommand(args: string[]): Promise<string> {
@@ -6054,6 +6342,8 @@ export class NativeBridgeController {
     nextPrompt: string,
   ): Promise<string> {
     const profile = this.getContextProfile(remoteSession.provider, remoteSession.lastModel);
+    const purpose = this.inferPromptPurpose(nextPrompt);
+    const handoffArtifacts = this.getArtifactsForPurpose(purpose, 4);
     const compactionMessages = buildCompactionMessages(
       missingMessages,
       this.getCompactionBuildOptions(remoteSession.provider),
@@ -6063,10 +6353,25 @@ export class NativeBridgeController {
         ? compactionMessages.map((message) => `[${message.role}] ${message.content}`).join('\n')
         : await this.compactionEngine.compact(compactionMessages, 'Sync this provider session to ddudu canonical context.');
 
+    const artifactSection = handoffArtifacts.length > 0
+      ? [
+          '<handoff_artifacts>',
+          ...handoffArtifacts.map((artifact) => {
+            const mode = artifact.mode ? ` mode="${artifact.mode}"` : '';
+            return `<artifact kind="${artifact.kind}" title="${artifact.title.replace(/"/g, '\'')}"${mode}>${previewText(artifact.summary, 240)}</artifact>`;
+          }),
+          '</handoff_artifacts>',
+          '',
+        ].join('\n')
+      : '';
+
     return [
       'ddudu canonical session has advanced while you were inactive.',
       `Resume the existing provider session and treat the following delta as authoritative context since session ${remoteSession.sessionId.slice(0, 8)}:`,
       '',
+      'Use artifacts and stable signals first; treat transcript delta as supporting detail.',
+      '',
+      artifactSection,
       delta,
       '',
       'After syncing, answer this new user message:',

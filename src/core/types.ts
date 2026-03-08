@@ -9,6 +9,7 @@ export type SessionRecordType =
   | 'tool_result'
   | 'compaction';
 export type RoutingPriority = 'cheap' | 'balanced' | 'quality';
+export type ToolPolicy = 'inherit' | 'allow' | 'ask' | 'deny';
 
 export interface ModelConfig {
   id: string;
@@ -228,6 +229,7 @@ export type ToolPermission = 'auto' | 'ask' | 'deny';
 export interface ToolsConfig {
   permission: ToolPermission;
   toolbox_dirs: string[];
+  policies?: Record<string, ToolPolicy>;
 }
 
 export interface McpConfig {
@@ -235,6 +237,7 @@ export interface McpConfig {
     command: string;
     args?: string[];
     env?: Record<string, string>;
+    enabled?: boolean;
   }>;
 }
 
@@ -259,6 +262,7 @@ export interface ContextBudgetConfig {
 export interface ToolsConfigOverride {
   permission?: ToolPermission;
   toolbox_dirs?: string[];
+  policies?: Record<string, ToolPolicy>;
 }
 
 export interface McpConfigOverride {
@@ -266,6 +270,7 @@ export interface McpConfigOverride {
     command: string;
     args?: string[];
     env?: Record<string, string>;
+    enabled?: boolean;
   }>;
 }
 

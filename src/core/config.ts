@@ -97,6 +97,7 @@ const DEFAULT_CONFIG: DduduConfig = {
   tools: {
     permission: 'auto' as const,
     toolbox_dirs: [],
+    policies: {},
   } as ToolsConfig,
   mcp: {
     servers: {},

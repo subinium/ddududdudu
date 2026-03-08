@@ -55,6 +55,8 @@ Across Claude Code, Codex, OpenCode, Cursor, Windsurf, Devin, and related system
 
 ddudu is built around that model: one harness owning state, context, and orchestration, with provider runtimes acting as workers underneath it.
 
+A practical harness is less about adding more prompt text and more about balancing a few infrastructure concerns well: context quality, session continuity, isolated delegation, verification, trust boundaries, and extensibility through tools, hooks, skills, and MCP.
+
 ## Modes
 
 | Mode     | Provider       | Model               | Role                                      |
@@ -142,8 +144,9 @@ ddudu keeps one canonical local session and layers provider-specific CLI session
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - background runs can continue as detached workers, keep inspectable job state, and can be retried, promoted, cancelled, or reopened later
 - `/plan` and `/todo` manage the shared execution plan
-- `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`
+- `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`, and can pin per-tool policies such as `allow`, `ask`, or `deny`
 - direct and delegated execution paths can auto-run review checks, repair retries, and verification summaries
+- successful verified runs can promote compact semantic and procedural memory entries automatically
 - `/handoff`, `/fork`, `/briefing`, and `/drift` help carry long-running work forward without losing context
 
 ## CLI Commands
@@ -181,7 +184,7 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/model` | switch the current mode's model |
 | `/plan` | show the shared execution plan |
 | `/todo` | add, update, or clear plan items |
-| `/permissions` | change the active permission profile |
+| `/permissions` | change the active permission profile or configure per-tool policies |
 | `/memory` | read, write, append, or clear scoped memory |
 | `/session` | list sessions or resume a saved session |
 | `/config` | show runtime config summary |
@@ -200,7 +203,7 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 | `/init` | initialize `.ddudu/` files |
 | `/skill` | inspect or load skills |
 | `/hook` | inspect or reload file-based hooks |
-| `/mcp` | inspect config paths or reload MCP servers |
+| `/mcp` | inspect, add, enable, disable, remove, or reload MCP servers |
 | `/team` | run multi-agent orchestration |
 | `/quit` / `/exit` | exit ddudu |
 

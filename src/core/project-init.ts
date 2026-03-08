@@ -46,6 +46,14 @@ session:
   auto_save: true
 openclaw:
   enabled: true
+tools:
+  permission: auto
+  policies: {}
+# Example:
+# tools:
+#   policies:
+#     bash: ask
+#     mcp__*: deny
 mcp:
   servers: {}
 # Example:
@@ -56,6 +64,7 @@ mcp:
 #       args:
 #         - -y
 #         - "@modelcontextprotocol/server-memory"
+#       enabled: true
 `;
 
 export const buildProjectInstructionsTemplate = (

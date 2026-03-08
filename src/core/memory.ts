@@ -11,6 +11,15 @@ export type MemoryScope =
   | 'semantic'
   | 'procedural';
 
+const ALL_MEMORY_SCOPES: MemoryScope[] = [
+  'global',
+  'project',
+  'working',
+  'episodic',
+  'semantic',
+  'procedural',
+];
+
 const PROJECT_MEMORY_FILES: Record<Exclude<MemoryScope, 'global'>, string> = {
   project: 'memory.md',
   working: 'memory/working.md',
@@ -50,27 +59,58 @@ const ensureMemoryDir = async (filePath: string): Promise<void> => {
 };
 
 export const loadMemory = async (cwd: string): Promise<string> => {
-  const scopes: MemoryScope[] = [
-    'global',
-    'project',
-    'working',
-    'episodic',
-    'semantic',
-    'procedural',
-  ];
-
-  const contents = await Promise.all(
-    scopes.map(async (scope) => ({
-      scope,
-      content: await readMemoryFile(getMemoryPath(cwd, scope)),
-    })),
-  );
+  const contents = await loadMemoryScopes(cwd);
 
   return contents
     .map(({ scope, content }) => {
       const title = scope.charAt(0).toUpperCase() + scope.slice(1);
       return `## ${title} Memory\n${content}`;
     })
+    .join('\n\n');
+};
+
+export const loadMemoryScopes = async (
+  cwd: string,
+  scopes: MemoryScope[] = ALL_MEMORY_SCOPES,
+): Promise<Array<{ scope: MemoryScope; content: string }>> => {
+  return Promise.all(
+    scopes.map(async (scope) => ({
+      scope,
+      content: await readMemoryFile(getMemoryPath(cwd, scope)),
+    })),
+  );
+};
+
+const clipMemory = (value: string, maxChars: number): string => {
+  const normalized = value.trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxChars) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trimEnd()}…`;
+};
+
+export const loadSelectedMemory = async (
+  cwd: string,
+  scopes: MemoryScope[],
+  maxCharsPerScope: number = 500,
+): Promise<string> => {
+  const contents = await loadMemoryScopes(cwd, scopes);
+
+  return contents
+    .map(({ scope, content }) => {
+      const clipped = clipMemory(content, maxCharsPerScope);
+      if (!clipped) {
+        return '';
+      }
+      const title = scope.charAt(0).toUpperCase() + scope.slice(1);
+      return `## ${title} Memory\n${clipped}`;
+    })
+    .filter((entry) => entry.length > 0)
     .join('\n\n');
 };
 
