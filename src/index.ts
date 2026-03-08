@@ -6,6 +6,7 @@ import {
   AUTH_PROVIDERS,
   AUTH_SETUP_HINTS,
   buildGeminiLoginHelp,
+  buildResolvedModeSummary,
   normalizeAuthProviderName,
   resolveRequestedAuthProvider,
   type AuthProviderName,
@@ -449,6 +450,10 @@ const completeAuthLogin = async (provider: AuthProviderName): Promise<void> => {
   }
 
   process.stdout.write(`\nAuthenticated ${provider} via ${auth.source}\n`);
+  process.stdout.write('\nResolved mode lineup:\n');
+  for (const line of buildResolvedModeSummary((name) => discovered.has(name))) {
+    process.stdout.write(`${line}\n`);
+  }
 };
 
 const handleAuth = async (parsed: ParsedCommand): Promise<void> => {

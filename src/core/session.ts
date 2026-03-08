@@ -9,8 +9,9 @@ import {
   type SessionHeader,
   type SessionListItem,
 } from './types.js';
+import { getDduduPaths } from './dirs.js';
 
-const DEFAULT_SESSION_DIR = '.ddudu/sessions';
+const DEFAULT_SESSION_DIR = getDduduPaths().globalSessions;
 
 const parseLine = (line: string): SessionEntry | null => {
   if (!line.trim()) {

@@ -1,6 +1,13 @@
 export type AuthProviderName = 'claude' | 'codex' | 'gemini';
+type HarnessModeName = 'jennie' | 'lisa' | 'rosé' | 'jisoo';
 
 export const AUTH_PROVIDERS: AuthProviderName[] = ['claude', 'codex', 'gemini'];
+const MODE_LABELS: Record<HarnessModeName, string> = {
+  jennie: 'JENNIE',
+  lisa: 'LISA',
+  'rosé': 'ROSÉ',
+  jisoo: 'JISOO',
+};
 
 export const AUTH_SETUP_HINTS: Record<AuthProviderName, string> = {
   claude: "Run 'claude auth login' or set ANTHROPIC_API_KEY",
@@ -58,4 +65,37 @@ export const buildGeminiLoginHelp = (): string[] => {
     '',
     'Then run: ddudu auth',
   ];
+};
+
+const MODE_BINDINGS: Record<HarnessModeName, { provider: AuthProviderName; model: string }[]> = {
+  jennie: [
+    { provider: 'claude', model: 'claude-opus-4-6' },
+    { provider: 'codex', model: 'gpt-5.4' },
+    { provider: 'gemini', model: 'gemini-2.5-pro' },
+  ],
+  lisa: [
+    { provider: 'codex', model: 'gpt-5.4' },
+    { provider: 'claude', model: 'claude-sonnet-4-6' },
+    { provider: 'gemini', model: 'gemini-2.5-pro' },
+  ],
+  'rosé': [
+    { provider: 'claude', model: 'claude-sonnet-4-6' },
+    { provider: 'codex', model: 'gpt-5.4' },
+    { provider: 'gemini', model: 'gemini-2.5-pro' },
+  ],
+  jisoo: [
+    { provider: 'gemini', model: 'gemini-2.5-pro' },
+    { provider: 'claude', model: 'claude-sonnet-4-6' },
+    { provider: 'codex', model: 'gpt-5.4' },
+  ],
+};
+
+export const buildResolvedModeSummary = (
+  hasProvider: (provider: AuthProviderName) => boolean,
+): string[] => {
+  const modes: HarnessModeName[] = ['jennie', 'lisa', 'rosé', 'jisoo'];
+  return modes.map((mode) => {
+    const resolved = MODE_BINDINGS[mode].find((binding) => hasProvider(binding.provider)) ?? MODE_BINDINGS[mode][0];
+    return `  ${MODE_LABELS[mode]} -> ${resolved.model} (${resolved.provider})`;
+  });
 };

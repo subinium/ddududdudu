@@ -1,0 +1,13 @@
+- id: fix-cli-flag
+  repo: ./examples/fixture-cli
+  prompt: fix the resume-last flag handling and add a regression test
+  success_command: npm test
+  timeout_minutes: 20
+  difficulty: medium
+
+- id: repair-build
+  repo: ./examples/fixture-app
+  prompt: fix the failing TypeScript build and keep the behavior unchanged
+  success_command: npm run build
+  timeout_minutes: 20
+  difficulty: medium

@@ -145,6 +145,8 @@ ddudu auth login claude
 ddudu auth login codex
 ```
 
+After login, ddudu rechecks local credentials and shows how the current four-mode lineup resolves against the providers you actually have available.
+
 ## Workflow
 
 ddudu keeps one canonical local session and layers provider-specific CLI sessions on top of it.
@@ -171,6 +173,21 @@ ddudu session list    # list saved sessions
 ddudu session last    # reopen the most recent saved local session
 ddudu session resume <id>  # reopen a saved local session in the native TUI
 ```
+
+## Benchmarks
+
+ddudu includes a minimal benchmark skeleton so you can compare the same task set across different harnesses or vendor CLIs.
+
+```bash
+npm run bench:run -- \
+  --tasks bench/tasks.example.yaml \
+  --command-template 'ddudu run "{prompt}"' \
+  --out bench/results/ddudu.jsonl
+
+npm run bench:report -- bench/results/ddudu.jsonl
+```
+
+The runner copies each task repo into a temporary workspace, runs the command template with the task prompt, then runs the task's `success_command` and records pass/fail, duration, and clipped stdout/stderr.
 
 ## TUI Shortcuts
 
@@ -219,9 +236,12 @@ ddudu session resume <id>  # reopen a saved local session in the native TUI
 
 ## Project Layout
 
-Project-level files live under `.ddudu/`.
+Runtime state is global-first by default.
 
-Typical setup:
+- `~/.ddudu/` stores sessions, detached jobs, auth reuse, and user-level defaults
+- project `.ddudu/` stores instructions, rules, prompts, hooks, skills, and project overrides
+
+Typical project setup:
 
 ```text
 .ddudu/
@@ -237,11 +257,20 @@ Typical setup:
 ├── rules/
 ├── prompts/
 ├── skills/
-├── jobs/
-└── sessions/
 ```
 
-User-level state can also live under `~/.ddudu/`.
+Typical runtime state:
+
+```text
+~/.ddudu/
+├── config.yaml
+├── sessions/
+├── jobs/
+├── prompts/
+├── rules/
+├── hooks/
+└── skills/
+```
 
 ## License
 

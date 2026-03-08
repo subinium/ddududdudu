@@ -42,7 +42,7 @@ compaction:
   preserve_recent_turns: 5
 session:
   format: jsonl
-  directory: .ddudu/sessions
+  directory: \${HOME}/.ddudu/sessions
   auto_save: true
 openclaw:
   enabled: true

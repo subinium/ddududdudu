@@ -16,6 +16,9 @@ import {
   type SkillsConfig,
   type ToolsConfig,
 } from './types.js';
+import { getDduduPaths } from './dirs.js';
+
+const DDUDU_PATHS = getDduduPaths();
 
 const BUILTIN_PROVIDERS: { [name: string]: ProviderConfig } = {
   claude: {
@@ -81,7 +84,7 @@ const DEFAULT_CONFIG: DduduConfig = {
   },
   session: {
     format: 'jsonl',
-    directory: '.ddudu/sessions',
+    directory: DDUDU_PATHS.globalSessions,
     auto_save: true,
   },
   openclaw: {
