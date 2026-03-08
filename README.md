@@ -238,10 +238,10 @@ The runner copies each task repo into a temporary workspace, runs the command te
 
 Runtime state is global-first by default.
 
-- `~/.ddudu/` stores sessions, detached jobs, auth reuse, and user-level defaults
-- project `.ddudu/` stores instructions, rules, prompts, hooks, skills, and project overrides
+- `~/.ddudu/` is the default home for sessions, detached jobs, and user-level defaults
+- project `.ddudu/` is for repository-specific instructions, overrides, and working memory
 
-Typical project setup:
+Common project-local files:
 
 ```text
 .ddudu/
@@ -256,14 +256,18 @@ Typical project setup:
 ├── hooks/
 ├── rules/
 ├── prompts/
-├── skills/
+├── checks/      # optional
+├── skills/      # optional
+└── tools/       # optional
 ```
 
-Typical runtime state:
+Common global state:
 
 ```text
 ~/.ddudu/
 ├── config.yaml
+├── DDUDU.md     # optional
+├── memory.md    # optional
 ├── sessions/
 ├── jobs/
 ├── prompts/
