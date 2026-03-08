@@ -1,35 +1,16 @@
-import { spawn } from 'node:child_process';
+import { Codex, type ThreadEvent, type ThreadItem, type ThreadOptions } from '@openai/codex-sdk';
 
 import type {
   ApiMessage,
   StreamCallbacks,
   ToolStateUpdate,
+  UsageSummary,
 } from './anthropic-client.js';
 
 export interface CodexClientConfig {
   model: string;
   cwd?: string;
   command?: string;
-}
-
-interface CodexJsonItem {
-  id?: string;
-  type?: string;
-  text?: string;
-  command?: string;
-  aggregated_output?: string;
-  status?: string;
-}
-
-interface CodexJsonEvent {
-  type?: string;
-  thread_id?: string;
-  item?: CodexJsonItem;
-  usage?: {
-    input_tokens?: number;
-    cached_input_tokens?: number;
-    output_tokens?: number;
-  };
 }
 
 const DEFAULT_COMMAND = 'codex';
@@ -60,9 +41,7 @@ const buildPrompt = (systemPrompt: string, messages: ApiMessage[]): string => {
     lines.push('</system>');
   }
 
-  lines.push(
-    '<conversation>',
-  );
+  lines.push('<conversation>');
 
   for (const message of messages) {
     lines.push(`<message role="${message.role}">`);
@@ -80,6 +59,14 @@ const toError = (error: unknown, fallbackMessage: string): Error => {
   }
 
   return new Error(fallbackMessage);
+};
+
+const createExecEnv = (): Record<string, string> => {
+  return Object.fromEntries(
+    Object.entries(process.env).filter(
+      (entry): entry is [string, string] => typeof entry[1] === 'string',
+    ),
+  );
 };
 
 const emitToolState = (
@@ -100,15 +87,42 @@ const emitToolState = (
   callbacks.onToolState?.([state]);
 };
 
+const summarizeFileChanges = (
+  changes: Array<{ path: string; kind: string }> | undefined,
+): string => {
+  if (!changes || changes.length === 0) {
+    return '';
+  }
+
+  const visible = changes
+    .slice(0, 6)
+    .map((change) => `${change.kind}:${change.path}`);
+  const hidden = changes.length - visible.length;
+  return hidden > 0 ? `${visible.join(', ')} (+${hidden} more)` : visible.join(', ');
+};
+
+const toThreadOptions = (
+  model: string,
+  cwd: string,
+): ThreadOptions => ({
+  model,
+  workingDirectory: cwd,
+  skipGitRepoCheck: true,
+  approvalPolicy: 'never',
+  sandboxMode: 'danger-full-access',
+  networkAccessEnabled: true,
+});
+
 export class CodexClient {
-  private readonly config: Required<CodexClientConfig>;
+  private readonly model: string;
+  private readonly cwd: string;
+  private readonly commandOverride: string | null;
 
   public constructor(config: CodexClientConfig) {
-    this.config = {
-      model: config.model,
-      cwd: config.cwd ?? process.cwd(),
-      command: config.command?.trim() || process.env.DDUDU_CODEX_COMMAND?.trim() || DEFAULT_COMMAND,
-    };
+    this.model = config.model;
+    this.cwd = config.cwd ?? process.cwd();
+    this.commandOverride =
+      config.command?.trim() || process.env.DDUDU_CODEX_COMMAND?.trim() || null;
   }
 
   public async stream(
@@ -121,193 +135,160 @@ export class CodexClient {
     const prompt = sessionId
       ? normalizeContent(messages[messages.length - 1]?.content ?? '')
       : buildPrompt(systemPrompt, messages);
-    const args = sessionId
-      ? [
-          'exec',
-          'resume',
-          '--json',
-          '--skip-git-repo-check',
-          '--dangerously-bypass-approvals-and-sandbox',
-          '--model',
-          this.config.model,
-          sessionId,
-          prompt,
-        ]
-      : [
-          'exec',
-          '--json',
-          '--skip-git-repo-check',
-          '--dangerously-bypass-approvals-and-sandbox',
-          '--model',
-          this.config.model,
-          prompt,
-        ];
 
-    await new Promise<void>((resolve, reject) => {
-      let fullText = '';
-      let stderr = '';
-      let inputTokens = 0;
-      let outputTokens = 0;
-      let finished = false;
-      let stdoutBuffer = '';
-      const emittedStates = new Map<string, string>();
-
-      const child = spawn(this.config.command, args, {
-        cwd: this.config.cwd,
-        env: process.env,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      const finalizeDone = (): void => {
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-        callbacks.onDone(fullText, { input: inputTokens, output: outputTokens });
-        resolve();
-      };
-
-      const finalizeError = (error: Error): void => {
-        if (finished) {
-          return;
-        }
-
-        finished = true;
-        callbacks.onError(error);
-        reject(error);
-      };
-
-      const processLine = (line: string): void => {
-        const trimmed = line.trim();
-        if (!trimmed) {
-          return;
-        }
-
-        let parsed: CodexJsonEvent;
-        try {
-          parsed = JSON.parse(trimmed) as CodexJsonEvent;
-        } catch {
-          return;
-        }
-
-        if (parsed.type === 'thread.started' && parsed.thread_id) {
-          callbacks.onSession?.(parsed.thread_id);
-          return;
-        }
-
-        if (parsed.type === 'item.started' && parsed.item?.type === 'command_execution') {
-          emitToolState(callbacks, emittedStates, {
-            id: parsed.item.id ?? `cmd-${Date.now()}`,
-            name: 'bash',
-            status: 'running',
-            input: { command: parsed.item.command ?? '' },
-          });
-          return;
-        }
-
-        if (parsed.type === 'item.completed' && parsed.item?.type === 'command_execution') {
-          emitToolState(callbacks, emittedStates, {
-            id: parsed.item.id ?? `cmd-${Date.now()}`,
-            name: 'bash',
-            status: parsed.item.status === 'completed' ? 'done' : 'error',
-            input: { command: parsed.item.command ?? '' },
-            result: parsed.item.aggregated_output ?? '',
-          });
-          return;
-        }
-
-        if (parsed.type === 'item.completed' && parsed.item?.type === 'agent_message') {
-          const text = parsed.item.text ?? '';
-          if (text) {
-            fullText = text;
-          }
-          return;
-        }
-
-        if (parsed.type === 'turn.completed') {
-          const uncachedInput = parsed.usage?.input_tokens ?? 0;
-          const cachedInput = parsed.usage?.cached_input_tokens ?? 0;
-          inputTokens = uncachedInput + cachedInput;
-          outputTokens = parsed.usage?.output_tokens ?? 0;
-          if (finished) {
-            return;
-          }
-
-          finished = true;
-          callbacks.onDone(fullText, {
-            input: inputTokens,
-            output: outputTokens,
-            uncachedInput,
-            cachedInput,
-            cacheWriteInput: 0,
-          });
-          resolve();
-        }
-      };
-
-      const flushStdoutBuffer = (): void => {
-        let boundary = stdoutBuffer.indexOf('\n');
-        while (boundary !== -1) {
-          const line = stdoutBuffer.slice(0, boundary);
-          stdoutBuffer = stdoutBuffer.slice(boundary + 1);
-          processLine(line);
-          boundary = stdoutBuffer.indexOf('\n');
-        }
-      };
-
-      const abortHandler = (): void => {
-        child.kill('SIGTERM');
-        setTimeout(() => {
-          if (!finished) {
-            child.kill('SIGKILL');
-          }
-        }, 250);
-      };
-
-      signal?.addEventListener('abort', abortHandler, { once: true });
-
-      child.stdout.setEncoding('utf8');
-      child.stdout.on('data', (chunk: string) => {
-        stdoutBuffer += chunk;
-        flushStdoutBuffer();
-      });
-
-      child.stderr.setEncoding('utf8');
-      child.stderr.on('data', (chunk: string) => {
-        stderr += chunk;
-      });
-
-      child.on('error', (error: Error) => {
-        signal?.removeEventListener('abort', abortHandler);
-        finalizeError(toError(error, 'Failed to start Codex bridge.'));
-      });
-
-      child.on('close', (code) => {
-        signal?.removeEventListener('abort', abortHandler);
-
-        if (stdoutBuffer.trim()) {
-          processLine(stdoutBuffer);
-          stdoutBuffer = '';
-        }
-
-        if (finished) {
-          return;
-        }
-
-        if (signal?.aborted) {
-          finalizeError(new Error('Codex request aborted.'));
-          return;
-        }
-
-        if (code === 0) {
-          finalizeDone();
-          return;
-        }
-
-        const message = stderr.trim() || `codex exited with code ${code ?? 'unknown'}.`;
-        finalizeError(new Error(message));
-      });
+    const codex = new Codex({
+      codexPathOverride:
+        this.commandOverride && this.commandOverride !== DEFAULT_COMMAND
+          ? this.commandOverride
+          : undefined,
+      env: createExecEnv(),
     });
+
+    const threadOptions = toThreadOptions(this.model, this.cwd);
+    const thread = sessionId
+      ? codex.resumeThread(sessionId, threadOptions)
+      : codex.startThread(threadOptions);
+
+    const messageTexts = new Map<string, string>();
+    const messageOrder: string[] = [];
+    const emittedStates = new Map<string, string>();
+    let aggregateText = '';
+    let finalUsage: UsageSummary = {
+      input: 0,
+      output: 0,
+      uncachedInput: 0,
+      cachedInput: 0,
+      cacheWriteInput: 0,
+    };
+
+    const updateAggregateText = (item: ThreadItem): void => {
+      if (item.type !== 'agent_message') {
+        return;
+      }
+
+      if (!messageTexts.has(item.id)) {
+        messageOrder.push(item.id);
+      }
+      messageTexts.set(item.id, item.text);
+
+      const nextText = messageOrder
+        .map((id) => messageTexts.get(id) ?? '')
+        .filter((text) => text.trim().length > 0)
+        .join('\n\n');
+
+      if (nextText.startsWith(aggregateText)) {
+        const delta = nextText.slice(aggregateText.length);
+        if (delta) {
+          callbacks.onText(delta);
+        }
+      }
+
+      aggregateText = nextText;
+    };
+
+    const handleItemEvent = (item: ThreadItem, eventType: ThreadEvent['type']): void => {
+      updateAggregateText(item);
+
+      if (item.type === 'command_execution') {
+        emitToolState(callbacks, emittedStates, {
+          id: item.id,
+          name: 'bash',
+          status:
+            item.status === 'in_progress'
+              ? 'running'
+              : item.status === 'completed'
+                ? 'done'
+                : 'error',
+          input: { command: item.command },
+          result: item.aggregated_output || '',
+        });
+        return;
+      }
+
+      if (item.type === 'mcp_tool_call') {
+        emitToolState(callbacks, emittedStates, {
+          id: item.id,
+          name: `${item.server}:${item.tool}`,
+          status:
+            item.status === 'in_progress'
+              ? 'running'
+              : item.status === 'completed'
+                ? 'done'
+                : 'error',
+          input: { arguments: item.arguments ?? {} },
+          result:
+            item.error?.message ??
+            item.result?.content
+              ?.map((block) => ('text' in block ? String(block.text ?? '') : ''))
+              .join('\n') ??
+            '',
+        });
+        return;
+      }
+
+      if (item.type === 'web_search') {
+        emitToolState(callbacks, emittedStates, {
+          id: item.id,
+          name: 'web_search',
+          status: eventType === 'item.completed' ? 'done' : 'running',
+          input: { query: item.query },
+        });
+        return;
+      }
+
+      if (item.type === 'file_change') {
+        emitToolState(callbacks, emittedStates, {
+          id: item.id,
+          name: 'patch',
+          status: item.status === 'completed' ? 'done' : 'error',
+          result: summarizeFileChanges(item.changes),
+        });
+      }
+    };
+
+    try {
+      const streamedTurn = await thread.runStreamed(prompt, { signal });
+
+      for await (const event of streamedTurn.events) {
+        if (event.type === 'thread.started') {
+          callbacks.onSession?.(event.thread_id);
+          continue;
+        }
+
+        if (
+          event.type === 'item.started' ||
+          event.type === 'item.updated' ||
+          event.type === 'item.completed'
+        ) {
+          handleItemEvent(event.item, event.type);
+          continue;
+        }
+
+        if (event.type === 'turn.completed') {
+          finalUsage = {
+            input: (event.usage.input_tokens ?? 0) + (event.usage.cached_input_tokens ?? 0),
+            output: event.usage.output_tokens ?? 0,
+            uncachedInput: event.usage.input_tokens ?? 0,
+            cachedInput: event.usage.cached_input_tokens ?? 0,
+            cacheWriteInput: 0,
+          };
+          continue;
+        }
+
+        if (event.type === 'turn.failed') {
+          throw new Error(event.error.message);
+        }
+
+        if (event.type === 'error') {
+          throw new Error(event.message);
+        }
+      }
+
+      callbacks.onDone(aggregateText, finalUsage);
+    } catch (error: unknown) {
+      const normalized = toError(error, 'Failed to stream Codex response.');
+      callbacks.onError(normalized);
+      throw normalized;
+    }
   }
 }
