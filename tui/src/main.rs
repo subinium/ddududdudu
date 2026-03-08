@@ -692,8 +692,8 @@ impl App {
                 &mut lines,
                 "◎",
                 SUCCESS,
-                format!("bridge {}", preview_line(remote_session_id, 16)),
-                Some("active remote session".to_string()),
+                format!("session {}", preview_line(remote_session_id, 16)),
+                Some("active provider session".to_string()),
                 FG,
                 ACCENT_DIM,
             );
@@ -702,8 +702,8 @@ impl App {
                 &mut lines,
                 "◎",
                 ACCENT_DIM,
-                format!("bridge {}", format_count(self.state.remote_session_count)),
-                Some("saved remote sessions".to_string()),
+                format!("sessions {}", format_count(self.state.remote_session_count)),
+                Some("saved provider sessions".to_string()),
                 FG,
                 ACCENT_DIM,
             );
@@ -819,15 +819,12 @@ impl App {
                 );
             }
         }
-        lines.push(Line::from(Span::raw("")));
-
-        lines.push(sidebar_header("Agents"));
         if self.state.agent_activities.is_empty() {
             push_sidebar_rail_item(
                 &mut lines,
                 "·",
                 ACCENT_DIM,
-                "no active agents".to_string(),
+                "agents idle".to_string(),
                 None,
                 FG,
                 ACCENT_DIM,
@@ -839,13 +836,14 @@ impl App {
                     "verifying" => ("◌", ACCENT),
                     "done" => ("✓", SUCCESS),
                     "error" => ("!", ERROR),
+                    "queued" => ("•", ACCENT_DIM),
                     _ => ("·", ACCENT_DIM),
                 };
                 let title = match (&item.mode, &item.purpose) {
-                    (Some(mode), Some(purpose)) => format!("{} · {}", title_case_label(mode), purpose),
+                    (Some(mode), Some(purpose)) => format!("agent {} · {}", title_case_label(mode), purpose),
                     (Some(mode), None) => title_case_label(mode),
-                    (None, Some(purpose)) => format!("{} · {}", item.label, purpose),
-                    (None, None) => item.label.clone(),
+                    (None, Some(purpose)) => format!("agent {} · {}", item.label, purpose),
+                    (None, None) => format!("agent {}", item.label),
                 };
                 let detail = item
                     .detail

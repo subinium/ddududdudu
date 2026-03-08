@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
+import { execFile } from 'node:child_process';
 import { basename } from 'node:path';
+import { promisify } from 'node:util';
 
 import { DEFAULT_ANTHROPIC_BASE_URL } from '../../api/anthropic-base-url.js';
 import type { ApiMessage, ContentBlock, ToolUseContentBlock } from '../../api/anthropic-client.js';
@@ -99,10 +101,14 @@ type AskUserResolver = {
   reject: (error: Error) => void;
 };
 
+const execFileAsync = promisify(execFile);
+
 const MAX_TOOL_TURNS_FALLBACK = 25;
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
 const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
+const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
+const DIFF_FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
 
 const normalizeProviders = (
   providers: Map<string, ProviderAuth>,
@@ -779,7 +785,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /review, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /fire, /init, /skill, /hook, /mcp, /team',
         );
         return;
       case '/plan':
@@ -796,6 +802,9 @@ export class NativeBridgeController {
         return;
       case '/doctor':
         this.appendSystemMessage(this.formatDoctorSummary());
+        return;
+      case '/context':
+        this.appendSystemMessage(await this.formatContextSummary());
         return;
       case '/review':
         this.appendSystemMessage(await this.runReviewSummary());
@@ -1968,6 +1977,10 @@ export class NativeBridgeController {
 
       const planSummary = this.formatPlanSummary();
       prompt += `\n\n<workflow>\npermission_profile: ${this.permissionProfile}\n${planSummary}\n</workflow>`;
+      const contextSnapshot = await this.buildPromptContextSnapshot();
+      if (contextSnapshot) {
+        prompt += `\n\n${contextSnapshot}`;
+      }
 
       this.systemPrompt = prompt;
     } catch {
@@ -2602,6 +2615,159 @@ export class NativeBridgeController {
     }
   }
 
+  private async getChangedFiles(limit: number = 8): Promise<string[]> {
+    try {
+      const { stdout } = await execFileAsync('git', ['status', '--short'], {
+        cwd: process.cwd(),
+        encoding: 'utf8',
+        maxBuffer: 4 * 1024 * 1024,
+      });
+
+      return stdout
+        .split('\n')
+        .map((line) => line.replace(/\r/g, ''))
+        .map((line) => STATUS_FILE_PATTERN.exec(line)?.[1]?.trim() ?? '')
+        .filter((line) => line.length > 0)
+        .map((line) => line.replace(/^.* -> /, ''))
+        .slice(0, limit);
+    } catch {
+      try {
+        const git = new GitCheckpoint(process.cwd());
+        const diff = await git.getDiff();
+        const files = new Set<string>();
+        let match = DIFF_FILE_PATTERN.exec(diff);
+        while (match) {
+          const filePath = match[1]?.trim();
+          if (filePath) {
+            files.add(filePath);
+          }
+          match = DIFF_FILE_PATTERN.exec(diff);
+        }
+        DIFF_FILE_PATTERN.lastIndex = 0;
+        return Array.from(files.values()).slice(0, limit);
+      } catch {
+        return [];
+      }
+    }
+  }
+
+  private async buildPromptContextSnapshot(): Promise<string> {
+    const parts: string[] = [];
+    const changedFiles = await this.getChangedFiles(8);
+    if (changedFiles.length > 0) {
+      parts.push(
+        'changed_files:',
+        ...changedFiles.map((filePath) => `- ${filePath}`),
+      );
+    }
+
+    const artifactDir = this.getSessionArtifactDirectory();
+    if (artifactDir) {
+      try {
+        const briefing = await loadBriefing(artifactDir);
+        if (briefing) {
+          parts.push(
+            `briefing_summary: ${previewText(briefing.summary, 220)}`,
+            ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
+          );
+        }
+      } catch {
+        // Briefing is optional.
+      }
+    }
+
+    if (this.todos.length > 0) {
+      parts.push(
+        ...this.todos.slice(0, 5).map((item) => `plan_item: [${item.status}] ${previewText(item.step, 180)}`),
+      );
+    }
+
+    const uncertainties = this.epistemicState.getState().activeUncertainties
+      .slice(0, 3)
+      .map((item) => item.content)
+      .filter((item) => item.trim().length > 0);
+    if (uncertainties.length > 0) {
+      parts.push(...uncertainties.map((item) => `uncertainty: ${previewText(item, 180)}`));
+    }
+
+    const activeAgents = this.agentActivities
+      .filter((item) => item.status === 'running' || item.status === 'verifying' || item.status === 'queued')
+      .slice(0, 4);
+    if (activeAgents.length > 0) {
+      parts.push(
+        ...activeAgents.map((item) => {
+          const scope = [item.mode ? BLACKPINK_MODES[item.mode].label : item.label, item.purpose]
+            .filter((part): part is string => Boolean(part))
+            .join(' · ');
+          const detail = item.detail ? ` · ${previewText(item.detail, 120)}` : '';
+          return `active_agent: ${scope} · ${item.status}${detail}`;
+        }),
+      );
+    }
+
+    if (this.state.workspace?.path) {
+      parts.push(`workspace: ${this.state.workspace.path}`);
+    }
+
+    if (parts.length === 0) {
+      return '';
+    }
+
+    return `<context_snapshot>\n${parts.join('\n')}\n</context_snapshot>`;
+  }
+
+  private async formatContextSummary(): Promise<string> {
+    const changedFiles = await this.getChangedFiles(12);
+    const artifactDir = this.getSessionArtifactDirectory();
+    let briefingSummary = 'none';
+    let briefingSteps: string[] = [];
+    if (artifactDir) {
+      try {
+        const briefing = await loadBriefing(artifactDir);
+        if (briefing) {
+          briefingSummary = previewText(briefing.summary, 220);
+          briefingSteps = briefing.nextSteps.slice(0, 5);
+        }
+      } catch {
+        briefingSummary = 'unavailable';
+      }
+    }
+
+    const activeAgents = this.agentActivities
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, 6)
+      .map((item) => {
+        const scope = [item.mode ? BLACKPINK_MODES[item.mode].label : item.label, item.purpose]
+          .filter((part): part is string => Boolean(part))
+          .join(' · ');
+        return `${scope} · ${item.status}${item.detail ? ` · ${previewText(item.detail, 120)}` : ''}`;
+      });
+
+    return [
+      'Context Snapshot',
+      '',
+      'What ddudu currently includes in the live prompt:',
+      '- base system prompt + mode prompt addition',
+      '- DDUDU.md / AGENTS.md / provider instruction files',
+      '- global + project rules',
+      '- loaded skills',
+      '- layered memory',
+      '- workflow state (permissions + todo plan)',
+      '- dynamic context snapshot (changed files, briefing, uncertainties, active agents, workspace)',
+      '',
+      `Changed files: ${changedFiles.length > 0 ? changedFiles.join(', ') : 'none'}`,
+      `Briefing: ${briefingSummary}`,
+      ...(briefingSteps.length > 0
+        ? ['Next steps:', ...briefingSteps.map((step) => `- ${step}`)]
+        : ['Next steps: none']),
+      ...(activeAgents.length > 0
+        ? ['Recent agents:', ...activeAgents.map((entry) => `- ${entry}`)]
+        : ['Recent agents: none']),
+      `Uncertainties: ${this.epistemicState.getStats().uncertainties}`,
+    ].join('\n');
+  }
+
   private async formatSkillSummary(): Promise<string> {
     try {
       const loader = new SkillLoader(process.cwd());
@@ -3079,6 +3245,16 @@ export class NativeBridgeController {
     if (teamAgents.length < 2) {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
+    for (const agent of teamAgents) {
+      this.updateAgentActivity({
+        id: `team:queued:${agent.id}`,
+        label: agent.name,
+        status: 'queued',
+        mode: agent.mode,
+        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
+        detail: `${strategy} · ${agent.role}`,
+      });
+    }
 
     const assistantMessageId = randomUUID();
     const notice = options.routeNote
@@ -3252,6 +3428,9 @@ export class NativeBridgeController {
     signal: AbortSignal,
   ): Promise<string> {
     const runtime = this.createDelegationRuntime();
+    const queuedActivityId = `team:queued:${agent.id}`;
+    this.agentActivities = this.agentActivities.filter((activity) => activity.id !== queuedActivityId);
+    this.syncAgentActivities();
     const activityId = `team:${round}:${agent.id}`;
     const purpose: DelegationPurpose =
       agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';

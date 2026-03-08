@@ -113,6 +113,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/config', description: 'Show current configuration', value: '/config' },
   { label: '/help', description: 'Show available commands', value: '/help' },
   { label: '/doctor', description: 'Check system health', value: '/doctor' },
+  { label: '/context', description: 'Show active prompt context snapshot', value: '/context' },
   { label: '/review', description: 'Run code review checks', value: '/review' },
   { label: '/checkpoint', description: 'Create a git checkpoint', value: '/checkpoint' },
   { label: '/undo', description: 'Undo the last ddudu checkpoint', value: '/undo' },
