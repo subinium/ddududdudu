@@ -78,7 +78,7 @@ import type {
   WorkflowBackgroundJobSnapshot,
   WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
-import { planWorkAllocation } from '../../core/work-allocation.js';
+import { planWorkAllocation, type WorkAllocationPlan } from '../../core/work-allocation.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
 import type { ToolContext } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
@@ -4956,6 +4956,36 @@ export class NativeBridgeController {
     });
   }
 
+  private rememberTeamPlanArtifact(
+    strategy: 'parallel' | 'sequential' | 'delegate',
+    task: string,
+    allocation: WorkAllocationPlan,
+  ): WorkflowArtifact {
+    const planSteps = allocation.units.map((unit) => unit.label);
+    const assignments = allocation.units.map((unit) => {
+      const modeLabel = unit.preferredMode ? HARNESS_MODES[unit.preferredMode]?.label ?? unit.preferredMode : 'Auto';
+      const access = unit.readOnly ? 'read-only' : 'write';
+      return `${modeLabel} · ${unit.role} · ${unit.label} · ${access}`;
+    });
+
+    return this.rememberArtifact({
+      kind: 'plan',
+      title: `team ${strategy} plan`,
+      summary: `${previewText(task, 120)} · ${planSteps.join(' · ')}`,
+      payload: buildArtifactPayload({
+        kind: 'plan',
+        purpose: 'planning',
+        task,
+        strategy,
+        assignments,
+        notes: allocation.units.map((unit) => unit.brief),
+        summary: planSteps.map((step, index) => `${index + 1}. ${step}`).join('\n'),
+      }),
+      source: 'team',
+      mode: this.currentMode,
+    });
+  }
+
   private artifactScoreForPurpose(
     artifact: WorkflowArtifact,
     purpose: DelegationPurpose | 'general',
@@ -6538,10 +6568,12 @@ export class NativeBridgeController {
     }
     this.resetEphemeralAgentActivities();
 
-    const teamAgents = this.buildTeamAgents(task, strategy);
-    if (teamAgents.length < 2) {
+    const teamPlan = this.createTeamExecutionPlan(task, strategy);
+    const teamAgents = teamPlan?.agents ?? [];
+    if (teamAgents.length < 2 || !teamPlan) {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
+    this.rememberTeamPlanArtifact(strategy, task, teamPlan.allocation);
     const runId = randomUUID();
     for (const agent of teamAgents.filter((item) => isRunnableTeamAgent(item))) {
       this.updateAgentActivity({
@@ -6667,8 +6699,9 @@ export class NativeBridgeController {
     task: string,
     options: { routeNote?: string; attempt?: number } = {},
   ): Promise<void> {
-    const teamAgents = this.buildTeamAgents(task, strategy);
-    if (teamAgents.length < 2) {
+    const teamPlan = this.createTeamExecutionPlan(task, strategy);
+    const teamAgents = teamPlan?.agents ?? [];
+    if (teamAgents.length < 2 || !teamPlan) {
       this.appendSystemMessage('Team run unavailable: need at least one lead and one worker with valid auth.');
       return;
     }
@@ -6689,7 +6722,8 @@ export class NativeBridgeController {
       timestamp: Date.now(),
     });
     const contextSnapshot = await this.buildPromptContextSnapshot(task, 'planning');
-    const artifacts = this.getArtifactsForPurpose('planning', 4);
+    const planArtifact = this.rememberTeamPlanArtifact(strategy, task, teamPlan.allocation);
+    const artifacts = [planArtifact, ...this.getArtifactsForPurpose('planning', 4).filter((item) => item.id !== planArtifact.id)];
     const checklist = buildTeamJobChecklist(teamAgents, strategy);
     const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
@@ -6748,10 +6782,13 @@ export class NativeBridgeController {
     }
   }
 
-  private buildTeamAgents(task: string, strategy: 'parallel' | 'sequential' | 'delegate'): TeamAgentRole[] {
+  private createTeamExecutionPlan(
+    task: string,
+    strategy: 'parallel' | 'sequential' | 'delegate',
+  ): { allocation: WorkAllocationPlan; agents: TeamAgentRole[] } | null {
     const availableModes = this.getTeamEligibleModes();
     if (availableModes.length === 0) {
-      return [];
+      return null;
     }
     const allocation = planWorkAllocation(task, strategy, availableModes);
     const leadMode =
@@ -6816,7 +6853,11 @@ export class NativeBridgeController {
       );
     }
 
-    return agents;
+    return { allocation, agents };
+  }
+
+  private buildTeamAgents(task: string, strategy: 'parallel' | 'sequential' | 'delegate'): TeamAgentRole[] {
+    return this.createTeamExecutionPlan(task, strategy)?.agents ?? [];
   }
 
   private async executeTeamAgent(
@@ -6978,6 +7019,9 @@ export class NativeBridgeController {
     const recentMessages = messages
       .slice(-6)
       .map((message) => `- ${message.from} -> ${message.to} [${message.type}] ${previewText(message.content, 92)}`);
+    const assignments = agents
+      .filter((agent) => isRunnableTeamAgent(agent))
+      .map((agent) => `- ${formatTeamAgentLabel(agent)}: ${agent.taskLabel ?? agent.role}`);
 
     return [
       '# Team Run',
@@ -6987,6 +7031,9 @@ export class NativeBridgeController {
       `rounds: ${rounds}`,
       `task: ${task}`,
       `agents: ${agents.map((agent) => `${agent.name}/${agent.model}`).join(', ')}`,
+      '',
+      '## Assignments',
+      ...(assignments.length > 0 ? assignments : ['- No specialist assignments recorded.']),
       '',
       '## Final Output',
       output.trim() || 'No final output.',

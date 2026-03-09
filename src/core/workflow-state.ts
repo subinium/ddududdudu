@@ -11,6 +11,7 @@ export interface WorkflowArtifactPayload {
   task?: string;
   strategy?: 'parallel' | 'sequential' | 'delegate';
   files?: string[];
+  assignments?: string[];
   planSteps?: string[];
   findings?: string[];
   risks?: string[];

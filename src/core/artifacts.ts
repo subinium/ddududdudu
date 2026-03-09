@@ -97,6 +97,7 @@ export const buildArtifactPayload = (input: {
   summary?: string;
   strategy?: 'parallel' | 'sequential' | 'delegate';
   files?: string[];
+  assignments?: string[];
   verification?: VerificationSummary;
   workspaceApply?: {
     applied: boolean;
@@ -114,6 +115,7 @@ export const buildArtifactPayload = (input: {
     prompt: input.prompt ? previewText(input.prompt, 220) : undefined,
     strategy: input.strategy,
     files: cleanItems(input.files, 6),
+    assignments: cleanItems(input.assignments, 8),
     notes: cleanItems(input.notes, 6),
     verification: buildVerificationPayload(input.verification),
     workspaceApply: input.workspaceApply
@@ -179,6 +181,9 @@ const payloadLines = (payload: WorkflowArtifactPayload | undefined): string[] =>
   }
   if (payload.files && payload.files.length > 0) {
     lines.push(`files: ${payload.files.join(', ')}`);
+  }
+  if (payload.assignments && payload.assignments.length > 0) {
+    lines.push(...payload.assignments.map((item) => `assignment: ${item}`));
   }
   if (payload.planSteps && payload.planSteps.length > 0) {
     lines.push(...payload.planSteps.map((step) => `plan_step: ${step}`));
