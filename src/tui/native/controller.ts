@@ -2018,6 +2018,89 @@ export class NativeBridgeController {
     return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
   }
 
+  private shouldRunPlanningInterview(prompt: string, decision: AutoRouteDecision): boolean {
+    if (decision.kind === 'direct') {
+      return false;
+    }
+
+    const normalized = normalizeSingleLine(prompt);
+    const lower = normalized.toLowerCase();
+    const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
+    const hasExplicitConstraints =
+      /\b(keep|preserve|avoid|without|must|should not|don't|do not|only|exactly)\b/u.test(lower);
+    const hasExplicitSuccessCriteria =
+      /\b(done|success|pass|green|working|ship|finish|complete|acceptance|criteria)\b/u.test(lower);
+    const clearlySmall =
+      wordCount <= 10 &&
+      !/\b(across the repo|codebase|architecture|end-to-end|refactor|research|review|design)\b/u.test(lower);
+
+    if (clearlySmall) {
+      return false;
+    }
+
+    if (decision.kind === 'team') {
+      return !hasExplicitConstraints || !hasExplicitSuccessCriteria;
+    }
+
+    return (
+      decision.purpose === 'planning'
+      || decision.purpose === 'design'
+      || (decision.purpose === 'execution' && (!hasExplicitConstraints || !hasExplicitSuccessCriteria) && wordCount >= 14)
+    );
+  }
+
+  private async runPlanningInterview(
+    prompt: string,
+    decision: AutoRouteDecision,
+  ): Promise<{ prompt: string; artifact: WorkflowArtifact }> {
+    const done = await this.promptForInput(
+      'Before I split this up: what should count as done?',
+      ['smallest correct change', 'production-ready result', 'plan first, then execute'],
+    );
+    const constraints = await this.promptForInput(
+      'Any important constraints or things I should not break?',
+      ['keep the API stable', 'minimal diff', 'no UI changes', 'none'],
+    );
+    const optimizeFor = await this.promptForInput(
+      'What should I optimize for?',
+      ['speed', 'minimal diff', 'thoroughness'],
+    );
+
+    const summary = [
+      `Primary outcome: ${done || 'not specified'}`,
+      `Constraints: ${constraints || 'none specified'}`,
+      `Optimize for: ${optimizeFor || 'balanced execution'}`,
+    ].join('\n');
+
+    const artifact = this.rememberArtifact({
+      kind: 'plan',
+      title: `${HARNESS_MODES['rosé'].label} interview brief`,
+      summary: `${previewText(prompt, 120)} · ${previewText(summary, 220)}`,
+      payload: buildArtifactPayload({
+        kind: 'plan',
+        purpose: decision.purpose ?? 'planning',
+        prompt,
+        summary,
+        notes: [done, constraints, optimizeFor].filter((value): value is string => Boolean(value && value.trim())),
+      }),
+      source: 'session',
+      mode: 'rosé',
+    });
+
+    return {
+      prompt: [
+        prompt,
+        '',
+        '<planning_brief>',
+        `done: ${done || 'not specified'}`,
+        `constraints: ${constraints || 'none specified'}`,
+        `optimize_for: ${optimizeFor || 'balanced execution'}`,
+        '</planning_brief>',
+      ].join('\n'),
+      artifact,
+    };
+  }
+
   private canStartBackgroundJob(): boolean {
     const runningJobs = this.backgroundJobs.filter((job) => job.status === 'running').length;
     return runningJobs < MAX_BACKGROUND_JOBS;
@@ -2062,6 +2145,18 @@ export class NativeBridgeController {
       return false;
     }
 
+    let routedContent = trimmedContent;
+    if (this.shouldRunPlanningInterview(trimmedContent, decision)) {
+      const interview = await this.runPlanningInterview(trimmedContent, decision);
+      routedContent = interview.prompt;
+      this.state.messages.push({
+        id: randomUUID(),
+        role: 'system',
+        content: `Planning brief captured · ${interview.artifact.title}`,
+        timestamp: Date.now(),
+      });
+    }
+
     const userMessage: NativeMessageState = {
       id: randomUUID(),
       role: 'user',
@@ -2072,13 +2167,13 @@ export class NativeBridgeController {
     this.state.messages.push(userMessage);
 
     if (decision.kind === 'team') {
-      await this.executeTeamRun(decision.strategy ?? 'parallel', trimmedContent, {
+      await this.executeTeamRun(decision.strategy ?? 'parallel', routedContent, {
         routeNote: this.formatAutoRouteNotice(decision),
       });
       return true;
     }
 
-    await this.executeDelegatedRoute(userMessage, decision);
+    await this.executeDelegatedRoute(userMessage, decision, routedContent);
     return true;
   }
 
@@ -2174,6 +2269,7 @@ export class NativeBridgeController {
   private async executeDelegatedRoute(
     userMessage: NativeMessageState,
     decision: AutoRouteDecision,
+    executionPrompt: string = userMessage.content,
   ): Promise<void> {
     this.resetEphemeralAgentActivities();
     const assistantMessage: NativeMessageState = {
@@ -2208,12 +2304,12 @@ export class NativeBridgeController {
       status: 'running',
       mode: decision.preferredMode ?? null,
       purpose: decision.purpose ?? 'general',
-      detail: previewText(userMessage.content, 72),
+      detail: previewText(executionPrompt, 72),
     });
 
     try {
       const contextSnapshot = await this.buildPromptContextSnapshot(
-        userMessage.content,
+        executionPrompt,
         decision.purpose ?? 'general',
       );
       await this.hookRegistry.emit('beforeSend', {
@@ -2222,14 +2318,14 @@ export class NativeBridgeController {
         sessionId: this.state.sessionId,
         remoteSessionId: null,
         requestMode: 'full',
-        prompt: userMessage.content,
+        prompt: executionPrompt,
       });
 
       const runtime = this.createDelegationRuntime();
       const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
       const result = await runtime.run(
         {
-          prompt: userMessage.content,
+          prompt: executionPrompt,
           purpose: decision.purpose,
           preferredMode: decision.preferredMode,
           parentSessionId: this.state.sessionId,
@@ -2298,7 +2394,7 @@ export class NativeBridgeController {
         requestedKind: result.requestedArtifactKind,
         mode: result.mode,
         text: finalText,
-        task: userMessage.content,
+        task: executionPrompt,
         verification: result.verification,
         workspaceApply: result.workspaceApply
           ? {
@@ -3945,6 +4041,10 @@ export class NativeBridgeController {
       };
       this.scheduleStatePush();
     });
+  }
+
+  private async promptForInput(question: string, options: string[] = []): Promise<string> {
+    return this.promptForChoice(question, options);
   }
 
   private async resumeSessionById(sessionId: string): Promise<void> {
