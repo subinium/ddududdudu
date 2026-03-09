@@ -48,3 +48,30 @@ test('WorktreeManager.applyToBase lands tracked and new files from an isolated w
     await rm(repoRoot, { recursive: true, force: true });
   }
 });
+
+test('WorktreeManager creates unique isolated worktrees for concurrent runs', async () => {
+  const repoRoot = await mkdtemp(resolve(tmpdir(), 'ddudu-worktree-parallel-'));
+  try {
+    await runGit(repoRoot, ['init']);
+    await runGit(repoRoot, ['config', 'user.name', 'ddudu-test']);
+    await runGit(repoRoot, ['config', 'user.email', 'ddudu@test.local']);
+
+    await writeFile(resolve(repoRoot, 'app.txt'), 'hello\n', 'utf8');
+    await runGit(repoRoot, ['add', 'app.txt']);
+    await runGit(repoRoot, ['commit', '-m', 'init']);
+
+    const manager = new WorktreeManager(repoRoot, '.ddudu/test-worktrees');
+    const first = await manager.create('parallel-worker');
+    const second = await manager.create('parallel-worker');
+
+    assert.ok(first, 'expected first isolated workspace');
+    assert.ok(second, 'expected second isolated workspace');
+    assert.notEqual(first.path, second.path);
+    assert.notEqual(first.id, second.id);
+
+    await manager.remove(first);
+    await manager.remove(second);
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});

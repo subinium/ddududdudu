@@ -368,6 +368,39 @@ const previewText = (value: string, maxLength: number = 96): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
+const purposeWorkerRole = (purpose?: string | null): string => {
+  switch (purpose) {
+    case 'planning':
+      return 'planner';
+    case 'research':
+      return 'research';
+    case 'review':
+      return 'review';
+    case 'design':
+      return 'design';
+    case 'execution':
+      return 'executor';
+    case 'oracle':
+      return 'oracle';
+    default:
+      return 'delegate';
+  }
+};
+
+const formatModeWorkerLabel = (mode: NamedMode | null | undefined, purpose?: string | null): string => {
+  if (!mode) {
+    return purposeWorkerRole(purpose);
+  }
+
+  return `${HARNESS_MODES[mode].label} · ${purposeWorkerRole(purpose)}`;
+};
+
+const formatTeamAgentLabel = (agent: { name: string; role: 'lead' | 'worker' | 'reviewer' }): string =>
+  `${agent.name} · ${agent.role}`;
+
+const isRunnableTeamAgent = (agent: { role: 'lead' | 'worker' | 'reviewer' }): boolean =>
+  agent.role !== 'lead';
+
 const formatRiskConcerns = (assessment: ToolRiskAssessment): string => {
   if (assessment.concerns.length === 0) {
     return assessment.level;
@@ -419,19 +452,16 @@ const buildDelegateJobChecklist = (
 ): BackgroundJobChecklistItem[] => {
   const owner = mode ? HARNESS_MODES[mode].label : 'Delegate';
   const items: BackgroundJobChecklistItem[] = [
-    createChecklistItem('route', 'Route the task', 'completed', { owner: 'ddudu' }),
-    createChecklistItem('execute', 'Run delegated work', 'in_progress', { owner }),
+    createChecklistItem('execute', `Complete ${purpose} task`, 'in_progress', { owner }),
   ];
 
   if (verificationMode && verificationMode !== 'none') {
-    items.push(createChecklistItem('verify', 'Verify the result', 'pending', { owner }));
+    items.push(createChecklistItem('verify', 'Run verification checks', 'pending', { owner }));
   }
 
   if (purpose === 'execution' || purpose === 'design') {
-    items.push(createChecklistItem('apply', 'Apply workspace changes', 'pending', { owner: 'ddudu' }));
+    items.push(createChecklistItem('apply', 'Land workspace changes', 'pending', { owner: 'ddudu' }));
   }
-
-  items.push(createChecklistItem('report', 'Publish the result', 'pending', { owner: 'ddudu' }));
   return items;
 };
 
@@ -439,16 +469,18 @@ const buildTeamJobChecklist = (
   teamAgents: TeamAgentRole[],
   strategy: 'parallel' | 'sequential' | 'delegate',
 ): BackgroundJobChecklistItem[] => [
-  createChecklistItem('route', `Route ${strategy} team run`, 'completed', {
-    owner: 'ddudu',
-  }),
-  ...teamAgents.map((agent) =>
+  ...teamAgents
+    .filter((agent) => isRunnableTeamAgent(agent))
+    .map((agent) =>
     createChecklistItem(`agent:${agent.id}`, `Run ${agent.name}`, 'pending', {
       owner: agent.name,
     })),
-  createChecklistItem('synthesize', 'Synthesize agent outputs', 'pending', { owner: 'Jennie' }),
-  createChecklistItem('verify', 'Verify team result', 'pending', { owner: 'Jennie' }),
-  createChecklistItem('report', 'Publish the result', 'pending', { owner: 'ddudu' }),
+  createChecklistItem('synthesize', `Merge ${strategy} worker output`, 'pending', {
+    owner: teamAgents.find((agent) => agent.role === 'lead')?.name ?? 'lead',
+  }),
+  createChecklistItem('review', 'Review merged result', 'pending', {
+    owner: teamAgents.find((agent) => agent.role === 'reviewer')?.name ?? 'reviewer',
+  }),
 ];
 
 const summarizeChecklistProgress = (checklist: BackgroundJobChecklistItem[]): string | null => {
@@ -2126,7 +2158,7 @@ export class NativeBridgeController {
     const routeActivityId = randomUUID();
     this.updateAgentActivity({
       id: routeActivityId,
-      label: 'route',
+      label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
       status: 'running',
       mode: decision.preferredMode ?? null,
       purpose: decision.purpose ?? 'general',
@@ -2174,9 +2206,7 @@ export class NativeBridgeController {
             this.updateMessage(assistantMessage.id, current + delta);
             this.updateAgentActivity({
               id: routeActivityId,
-              label: decision.preferredMode
-                ? HARNESS_MODES[decision.preferredMode].label
-                : 'Delegate',
+              label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
               status: 'running',
               mode: decision.preferredMode ?? null,
               purpose: decision.purpose ?? 'general',
@@ -2189,9 +2219,7 @@ export class NativeBridgeController {
             if (activeTool) {
               this.updateAgentActivity({
                 id: routeActivityId,
-                label: decision.preferredMode
-                  ? HARNESS_MODES[decision.preferredMode].label
-                  : 'Delegate',
+                label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
                 status: 'running',
                 mode: decision.preferredMode ?? null,
                 purpose: decision.purpose ?? 'general',
@@ -2202,9 +2230,7 @@ export class NativeBridgeController {
           onVerificationState: (state) => {
             this.updateAgentActivity({
               id: routeActivityId,
-              label: decision.preferredMode
-                ? HARNESS_MODES[decision.preferredMode].label
-                : 'Delegate',
+              label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
               status:
                 state.status === 'running'
                   ? 'verifying'
@@ -2271,7 +2297,7 @@ export class NativeBridgeController {
       });
       this.updateAgentActivity({
         id: routeActivityId,
-        label: HARNESS_MODES[result.mode].label,
+        label: formatModeWorkerLabel(result.mode, result.purpose),
         status: 'done',
         mode: result.mode,
         purpose: result.purpose,
@@ -2325,7 +2351,7 @@ export class NativeBridgeController {
       if (!controller.signal.aborted) {
         this.updateAgentActivity({
           id: routeActivityId,
-          label: 'route',
+          label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
           status: 'error',
           mode: decision.preferredMode ?? null,
           purpose: decision.purpose ?? 'general',
@@ -2342,7 +2368,7 @@ export class NativeBridgeController {
       } else {
         this.updateAgentActivity({
           id: routeActivityId,
-          label: 'route',
+          label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
           status: 'error',
           mode: decision.preferredMode ?? null,
           purpose: decision.purpose ?? 'general',
@@ -6471,10 +6497,10 @@ export class NativeBridgeController {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
     const runId = randomUUID();
-    for (const agent of teamAgents) {
+    for (const agent of teamAgents.filter((item) => isRunnableTeamAgent(item))) {
       this.updateAgentActivity({
         id: `team:${runId}:queued:${agent.id}`,
-        label: agent.name,
+        label: formatTeamAgentLabel(agent),
         status: 'queued',
         mode: agent.mode,
         purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
@@ -6638,9 +6664,9 @@ export class NativeBridgeController {
       teamAgents,
       teamSharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
       checklist,
-      agentActivities: teamAgents.map((agent) => ({
+      agentActivities: teamAgents.filter((agent) => isRunnableTeamAgent(agent)).map((agent) => ({
         id: `job:${backgroundJobId}:${agent.id}:queued`,
-        label: agent.name,
+        label: formatTeamAgentLabel(agent),
         mode: agent.mode ?? null,
         purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
         checklistId: `agent:${agent.id}`,
@@ -6758,16 +6784,16 @@ export class NativeBridgeController {
     const queuedActivityId = `team:${runId}:queued:${agent.id}`;
     this.agentActivities = this.agentActivities.filter((activity) => activity.id !== queuedActivityId);
     this.syncAgentActivities();
-    const activityId = `team:${runId}:${round}:${agent.id}`;
-    const purpose: DelegationPurpose =
-      agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
-    this.updateAgentActivity({
-      id: activityId,
-      label: agent.name,
-      status: 'running',
-      mode: agent.mode,
-      purpose,
-      detail: `round ${round} · ${agent.role}`,
+      const activityId = `team:${runId}:${round}:${agent.id}`;
+      const purpose: DelegationPurpose =
+        agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
+      this.updateAgentActivity({
+        id: activityId,
+        label: formatTeamAgentLabel(agent),
+        status: 'running',
+        mode: agent.mode,
+        purpose,
+        detail: `round ${round} · ${agent.role}`,
     });
     try {
       const contextSnapshot = await this.buildPromptContextSnapshot(input, purpose);
@@ -6797,7 +6823,7 @@ export class NativeBridgeController {
             if (delta.trim()) {
               this.updateAgentActivity({
                 id: activityId,
-                label: agent.name,
+                label: formatTeamAgentLabel(agent),
                 status: 'running',
                 mode: agent.mode,
                 purpose,
@@ -6810,7 +6836,7 @@ export class NativeBridgeController {
             if (activeTool) {
               this.updateAgentActivity({
                 id: activityId,
-                label: agent.name,
+                label: formatTeamAgentLabel(agent),
                 status: 'running',
                 mode: agent.mode,
                 purpose,
@@ -6821,7 +6847,7 @@ export class NativeBridgeController {
           onVerificationState: (state) => {
             this.updateAgentActivity({
               id: activityId,
-              label: agent.name,
+              label: formatTeamAgentLabel(agent),
               status:
                 state.status === 'running'
                   ? 'verifying'
@@ -6857,7 +6883,7 @@ export class NativeBridgeController {
       }
       this.updateAgentActivity({
         id: activityId,
-        label: agent.name,
+        label: formatTeamAgentLabel(agent),
         status: 'done',
         mode: agent.mode,
         purpose,
@@ -6869,7 +6895,7 @@ export class NativeBridgeController {
     } catch (error: unknown) {
       this.updateAgentActivity({
         id: activityId,
-        label: agent.name,
+        label: formatTeamAgentLabel(agent),
         status: 'error',
         mode: agent.mode,
         purpose,

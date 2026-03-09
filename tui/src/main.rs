@@ -1,5 +1,4 @@
 use std::cmp::min;
-use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -30,7 +29,6 @@ const SUCCESS: Color = Color::Rgb(80, 220, 120);
 const ERROR: Color = Color::Rgb(255, 90, 110);
 const MUTED: Color = Color::Rgb(128, 96, 108);
 const TOOL_MUTED: Color = Color::Rgb(144, 140, 146);
-const TOOL_RUNNING: Color = Color::Rgb(166, 160, 168);
 const LINK: Color = Color::Rgb(132, 203, 255);
 const PATH: Color = Color::Rgb(255, 208, 120);
 const PANEL_TOP_PADDING: u16 = 2;
@@ -355,8 +353,6 @@ enum SidebarTarget {
     Plan(usize),
     ContextOverview,
     ContextEstimate,
-    ContextPreview,
-    ContextDiff,
     McpSummary,
     LspSummary,
 }
@@ -929,7 +925,7 @@ impl App {
         let queue_height = if !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none() {
             let visible = self.state.queued_prompts.len().min(3);
             let more_row = usize::from(self.state.queued_prompts.len() > visible);
-            (visible + more_row) as u16
+            (visible + more_row + 1) as u16
         } else {
             0
         };
@@ -1087,9 +1083,9 @@ impl App {
         );
         lines.push(Line::from(Span::raw("")));
         let mut item_index = 0usize;
-        self.render_sidebar_jobs_tab(&mut lines, &mut item_index);
-        lines.push(Line::from(Span::raw("")));
         self.render_sidebar_plan_tab(&mut lines, &mut item_index);
+        lines.push(Line::from(Span::raw("")));
+        self.render_sidebar_jobs_tab(&mut lines, &mut item_index);
         lines.push(Line::from(Span::raw("")));
         self.render_sidebar_context_tab(&mut lines, &mut item_index);
         lines.push(Line::from(Span::raw("")));
@@ -1111,6 +1107,29 @@ impl App {
         if !self.state.agent_activities.is_empty() {
             has_activity = true;
             lines.push(sidebar_header("Workers"));
+            let runnable_workers = self.state.agent_activities.len();
+            let active_workers = self
+                .state
+                .agent_activities
+                .iter()
+                .filter(|item| item.status == "running" || item.status == "verifying" || item.status == "queued")
+                .count();
+            let strategy = active_job
+                .and_then(|job| job.strategy.as_ref().cloned())
+                .or_else(|| self.state.team_run_strategy.clone());
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                format!("{} workers", format_count(runnable_workers as u64)),
+                Some(match strategy {
+                    Some(strategy) => format!("{} active · {strategy}", format_count(active_workers as u64)),
+                    None => format!("{} active", format_count(active_workers as u64)),
+                }),
+                FG,
+                ACCENT_DIM,
+            );
+            lines.push(Line::from(Span::raw("")));
         }
         for (index, item) in self.state.agent_activities.iter().enumerate().take(4) {
             let (marker, color) = match item.status.as_str() {
@@ -1122,9 +1141,13 @@ impl App {
                 _ => ("·", ACCENT_DIM),
             };
             let title = match (&item.mode, &item.purpose) {
-                (Some(mode), Some(purpose)) => format!("{} · {}", title_case_label(mode), purpose),
+                (Some(mode), Some(purpose)) => {
+                    format!("{} · {}", title_case_label(mode), display_purpose_role(purpose))
+                }
                 (Some(mode), None) => title_case_label(mode),
-                (None, Some(purpose)) => format!("{} · {}", item.label, purpose),
+                (None, Some(purpose)) => {
+                    format!("{} · {}", item.label, display_purpose_role(purpose))
+                }
                 (None, None) => item.label.clone(),
             };
             let linked_detail = item
@@ -1137,6 +1160,15 @@ impl App {
                     }
                     _ => todo_ref,
                 });
+            let title = if let Some(todo_ref) = item
+                .checklist_id
+                .as_ref()
+                .and_then(|id| active_job.and_then(|job| checklist_todo_ref(&job.checklist, id)))
+            {
+                format!("{todo_ref} · {}", preview_line(&title, 18))
+            } else {
+                title
+            };
             push_sidebar_selectable_item(
                 lines,
                 *item_index == self.sidebar_selection,
@@ -1144,6 +1176,7 @@ impl App {
                 color,
                 preview_line(&title, 28),
                 linked_detail
+                    .map(|detail| preview_line(&detail, 28))
                     .or_else(|| item.detail.as_ref().map(|detail| preview_line(detail, 28)))
                     .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 28))),
                 FG,
@@ -1155,52 +1188,12 @@ impl App {
             }
         }
 
-        let recent_tools = collect_recent_tool_calls(&self.state.messages, 4);
-        let active_tools = recent_tools
-            .iter()
-            .filter(|tool| tool.status == "running" || tool.status == "pending")
-            .collect::<Vec<_>>();
-        if !active_tools.is_empty() {
+        if !self.state.background_jobs.is_empty() {
             has_activity = true;
             if !self.state.agent_activities.is_empty() {
                 lines.push(Line::from(Span::raw("")));
             }
-            lines.push(sidebar_header("Tools"));
-
-            for tool in &active_tools {
-                let (marker, color) = match tool.status.as_str() {
-                    "running" => (SPINNER_FRAMES[self.spinner_index], TOOL_RUNNING),
-                    "pending" => ("·", TOOL_RUNNING),
-                    "done" => ("·", TOOL_MUTED),
-                    "error" => ("!", ERROR),
-                    _ => ("·", TOOL_MUTED),
-                };
-                let detail = match tool.status.as_str() {
-                    "running" | "pending" => Some(preview_line(&tool.summary, 28)),
-                    _ => tool
-                        .result
-                        .as_ref()
-                        .map(|result| preview_line(result, 28))
-                        .or_else(|| Some(preview_line(&tool.summary, 28))),
-                };
-                push_sidebar_rail_item(
-                    lines,
-                    marker,
-                    color,
-                    preview_line(&tool.name.replace('_', " "), 28),
-                    detail,
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-        }
-
-        if !self.state.background_jobs.is_empty() {
-            has_activity = true;
-            if !self.state.agent_activities.is_empty() || !active_tools.is_empty() {
-                lines.push(Line::from(Span::raw("")));
-            }
-            lines.push(sidebar_header("Jobs"));
+            lines.push(sidebar_header("Background"));
         }
         for job in self.state.background_jobs.iter().take(4) {
             let (marker, color) = match job.status.as_str() {
@@ -1238,30 +1231,6 @@ impl App {
             *item_index += 1;
         }
 
-        if !self.state.queued_prompts.is_empty() {
-            has_activity = true;
-            if !self.state.background_jobs.is_empty()
-                || !self.state.agent_activities.is_empty()
-                || !active_tools.is_empty()
-            {
-                lines.push(Line::from(Span::raw("")));
-            }
-            lines.push(sidebar_header("Queue"));
-        }
-        for (index, prompt) in self.state.queued_prompts.iter().enumerate().take(4) {
-            push_sidebar_selectable_item(
-                lines,
-                *item_index == self.sidebar_selection,
-                "•",
-                ACCENT_DIM,
-                format!("{}. {}", index + 1, preview_line(prompt, 24)),
-                Some("waiting to run".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-            *item_index += 1;
-        }
-
         if !has_activity {
             push_sidebar_rail_item(
                 lines,
@@ -1285,27 +1254,35 @@ impl App {
         item_index: &mut usize,
     ) {
         lines.push(sidebar_header("Current Run"));
-        if let Some(workspace) = &self.state.workspace {
-            push_sidebar_rail_item(
-                lines,
-                "▣",
-                ACCENT,
-                preview_line(&workspace.label, 28),
-                Some(preview_line(&workspace.path, 28)),
-                FG,
-                ACCENT_DIM,
-            );
+        let run_title = if let Some(job) = active_sidebar_job(&self.state) {
+            job.prompt_preview
+                .as_ref()
+                .map(|preview| preview_line(preview, 28))
+                .unwrap_or_else(|| preview_line(&job.label, 28))
+        } else if self.state.loading && !self.state.loading_label.trim().is_empty() {
+            preview_line(&self.state.loading_label, 28)
         } else {
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "root workspace".to_string(),
-                Some(preview_line(&self.state.cwd, 28)),
-                FG,
-                ACCENT_DIM,
-            );
-        }
+            preview_line(&self.state.cwd, 28)
+        };
+        let run_detail = if let Some(job) = active_sidebar_job(&self.state) {
+            checklist_progress(&job.checklist)
+                .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
+        } else if let Some(workspace) = &self.state.workspace {
+            Some(preview_line(&workspace.label, 28))
+        } else if self.state.loading {
+            Some("active foreground run".to_string())
+        } else {
+            None
+        };
+        push_sidebar_rail_item(
+            lines,
+            "·",
+            ACCENT_DIM,
+            run_title,
+            run_detail,
+            FG,
+            ACCENT_DIM,
+        );
         if let Some(verification) = &self.state.verification {
             let (marker, color) = match verification.status.as_str() {
                 "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
@@ -1330,12 +1307,30 @@ impl App {
         if let Some(active_job) = active_sidebar_job(&self.state) {
             lines.push(Line::from(Span::raw("")));
             lines.push(sidebar_header("Todo Board"));
+            let worker_count = active_job
+                .checklist
+                .iter()
+                .filter(|item| item.id.starts_with("agent:") || item.id == "execute")
+                .count();
             push_sidebar_rail_item(
                 lines,
                 "·",
                 ACCENT_DIM,
                 preview_line(&active_job.label, 28),
-                checklist_progress(&active_job.checklist),
+                Some(
+                    [
+                        active_job
+                            .strategy
+                            .as_ref()
+                            .map(|strategy| format!("{strategy}")),
+                        (worker_count > 0).then(|| format!("{} workers", format_count(worker_count as u64))),
+                        checklist_progress(&active_job.checklist),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                ),
                 FG,
                 ACCENT_DIM,
             );
@@ -1356,6 +1351,29 @@ impl App {
                     FG,
                     ACCENT_DIM,
                 );
+            }
+        } else if self.state.loading {
+            let synthetic = synthetic_foreground_checklist(&self.state);
+            if !synthetic.is_empty() {
+                lines.push(Line::from(Span::raw("")));
+                lines.push(sidebar_header("Todo Board"));
+                for (index, (label, status, color, detail)) in synthetic.into_iter().enumerate() {
+                    let marker = match status {
+                        "completed" => "[x]",
+                        "in_progress" => SPINNER_FRAMES[self.spinner_index],
+                        "error" => "[!]",
+                        _ => "[ ]",
+                    };
+                    push_sidebar_rail_item(
+                        lines,
+                        marker,
+                        color,
+                        format!("{}. {}", index + 1, preview_line(&label, 28)),
+                        detail,
+                        FG,
+                        ACCENT_DIM,
+                    );
+                }
             }
         }
 
@@ -1423,7 +1441,11 @@ impl App {
             "·",
             ACCENT_DIM,
             format!("{} · {}", self.current_mode_label(), display_model_name(&self.state.model)),
-            Some(preview_line(&self.state.provider, 28)),
+            Some(if self.state.loading {
+                "active runtime".to_string()
+            } else {
+                "ready".to_string()
+            }),
             FG,
             ACCENT_DIM,
         );
@@ -1433,18 +1455,30 @@ impl App {
                 *item_index == self.sidebar_selection,
                 "→",
                 ACCENT,
-                format!("{} request", estimate.mode),
+                "next request".to_string(),
                 Some(format!(
-                    "system {} · history {} · tools {} · prompt {}",
-                    format_count(estimate.system),
-                    format_count(estimate.history),
-                    format_count(estimate.tools),
-                    format_count(estimate.prompt)
+                    "{} total · prompt {}",
+                    format_count(estimate.total),
+                    format_count(estimate.prompt),
                 )),
                 FG,
                 ACCENT_DIM,
             );
             *item_index += 1;
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "request mix".to_string(),
+                Some(format!(
+                    "system {} · history {} · tools {}",
+                    format_count(estimate.system),
+                    format_count(estimate.history),
+                    format_count(estimate.tools),
+                )),
+                FG,
+                ACCENT_DIM,
+            );
         }
 
         if let Some(preview) = &self.state.context_preview {
@@ -1452,7 +1486,7 @@ impl App {
                 lines,
                 "≡",
                 ACCENT_DIM,
-                "injected context ready".to_string(),
+                "context snapshot".to_string(),
                 Some(preview_line(preview, 28)),
                 FG,
                 ACCENT_DIM,
@@ -1546,7 +1580,7 @@ impl App {
                     "○",
                     ACCENT_DIM,
                     "semantic tools only".to_string(),
-                    Some("no language server detected".to_string()),
+                    Some("fallback search active".to_string()),
                     FG,
                     ACCENT_DIM,
                 );
@@ -1560,7 +1594,7 @@ impl App {
                     Some(preview_line(&lsp.connected_labels.join(" · "), 28))
                 } else {
                     Some(format!(
-                        "not connected · {}",
+                        "available · {}",
                         preview_line(&lsp.server_labels.join(" · "), 28)
                     ))
                 };
@@ -1593,6 +1627,14 @@ impl App {
         let mut targets = Vec::new();
         targets.extend(
             self.state
+                .todos
+                .iter()
+                .enumerate()
+                .take(10)
+                .map(|(index, _)| SidebarTarget::Plan(index)),
+        );
+        targets.extend(
+            self.state
                 .agent_activities
                 .iter()
                 .enumerate()
@@ -1607,30 +1649,10 @@ impl App {
                 .take(4)
                 .map(|(index, _)| SidebarTarget::Job(index)),
         );
-        targets.extend(
-            self.state
-                .queued_prompts
-                .iter()
-                .enumerate()
-                .take(4)
-                .map(|(index, _)| SidebarTarget::Queue(index)),
-        );
-        targets.extend(
-            self.state
-                .todos
-                .iter()
-                .enumerate()
-                .take(10)
-                .map(|(index, _)| SidebarTarget::Plan(index)),
-        );
         targets.push(SidebarTarget::ContextOverview);
         if self.state.request_estimate.is_some() {
             targets.push(SidebarTarget::ContextEstimate);
         }
-        if self.state.context_preview.is_some() {
-            targets.push(SidebarTarget::ContextPreview);
-        }
-        targets.push(SidebarTarget::ContextDiff);
         if self.state.mcp.is_some() {
             targets.push(SidebarTarget::McpSummary);
         }
@@ -1656,19 +1678,16 @@ impl App {
     }
 
     fn section_start_index(&self, tab: SidebarTab) -> usize {
-        let jobs_len = self.state.agent_activities.iter().take(4).count()
-            + self.state.background_jobs.iter().take(4).count()
-            + self.state.queued_prompts.iter().take(4).count();
         let plan_len = self.state.todos.iter().take(10).count();
+        let jobs_len = self.state.agent_activities.iter().take(4).count()
+            + self.state.background_jobs.iter().take(4).count();
         let context_len = 1
-            + usize::from(self.state.request_estimate.is_some())
-            + usize::from(self.state.context_preview.is_some())
-            + 1;
+            + usize::from(self.state.request_estimate.is_some());
         match tab {
-            SidebarTab::Jobs => 0,
-            SidebarTab::Plan => jobs_len,
-            SidebarTab::Context => jobs_len + plan_len,
-            SidebarTab::Systems => jobs_len + plan_len + context_len,
+            SidebarTab::Plan => 0,
+            SidebarTab::Jobs => plan_len,
+            SidebarTab::Context => plan_len + jobs_len,
+            SidebarTab::Systems => plan_len + jobs_len + context_len,
         }
     }
 
@@ -1783,13 +1802,6 @@ impl App {
             }
             spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
             spans.push(Span::styled("Esc interrupt", Style::default().fg(ACCENT_DIM)));
-            if !self.state.queued_prompts.is_empty() {
-                spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-                spans.push(Span::styled(
-                    format!("queue {}", format_count(self.state.queued_prompts.len() as u64)),
-                    Style::default().fg(ACCENT),
-                ));
-            }
         } else if let Some(prompt) = &self.state.ask_user {
             spans.push(Span::styled(
                 "ask",
@@ -1814,8 +1826,15 @@ impl App {
             return;
         }
 
+        let mut lines = vec![Line::from(vec![
+            Span::styled("Queue ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} waiting", format_count(self.state.queued_prompts.len() as u64)),
+                Style::default().fg(ACCENT_DIM),
+            ),
+        ])];
+
         let preview_rows = self.state.queued_prompts.len().min(3);
-        let mut lines = Vec::new();
         for (index, prompt) in self.state.queued_prompts.iter().take(preview_rows).enumerate() {
             let marker = format!("{:>2}. ", index + 1);
             let marker_width = marker.width();
@@ -2666,12 +2685,8 @@ impl App {
             SidebarTarget::Job(index) => self.build_job_inspector(index),
             SidebarTarget::Queue(index) => self.build_queue_inspector(index),
             SidebarTarget::Plan(index) => self.build_plan_inspector(index),
-            SidebarTarget::ContextOverview
-            | SidebarTarget::ContextEstimate
-            | SidebarTarget::ContextPreview => Some(self.build_context_inspector()),
-            SidebarTarget::ContextDiff => {
-                self.open_diff_viewer(None, "Workspace Diff".to_string())?;
-                return Ok(());
+            SidebarTarget::ContextOverview | SidebarTarget::ContextEstimate => {
+                Some(self.build_context_inspector())
             }
             SidebarTarget::McpSummary => self.build_mcp_summary_inspector(),
             SidebarTarget::LspSummary => self.build_lsp_summary_inspector(),
@@ -3218,6 +3233,109 @@ fn active_sidebar_job<'a>(state: &'a NativeTuiState) -> Option<&'a NativeBackgro
         .or_else(|| state.background_jobs.iter().find(|job| !job.checklist.is_empty()))
 }
 
+fn agent_task_status(status: &str) -> &'static str {
+    match status {
+        "done" => "completed",
+        "running" | "verifying" => "in_progress",
+        "error" => "error",
+        _ => "pending",
+    }
+}
+
+fn synthetic_foreground_checklist(
+    state: &NativeTuiState,
+) -> Vec<(String, &'static str, Color, Option<String>)> {
+    if !state.loading {
+        return Vec::new();
+    }
+
+    let mut items: Vec<(String, &'static str, Color, Option<String>)> = state
+        .agent_activities
+        .iter()
+        .take(6)
+        .map(|activity| {
+            let status = agent_task_status(&activity.status);
+            let color = match status {
+                "completed" => SUCCESS,
+                "in_progress" => ACCENT,
+                "error" => ERROR,
+                _ => ACCENT_DIM,
+            };
+            let detail = activity
+                .detail
+                .as_ref()
+                .map(|detail| preview_line(detail, 28))
+                .or_else(|| activity.workspace_path.as_ref().map(|path| preview_line(path, 28)));
+            (preview_line(&activity.label, 28), status, color, detail)
+        })
+        .collect();
+
+    if state.team_run_strategy.is_some() && !items.is_empty() {
+        let workers_done = state
+            .agent_activities
+            .iter()
+            .all(|activity| matches!(activity.status.as_str(), "done" | "error"));
+        let synthesis_status = if state.verification.is_some() {
+            "completed"
+        } else if workers_done {
+            "in_progress"
+        } else {
+            "pending"
+        };
+        let synthesis_color = match synthesis_status {
+            "completed" => SUCCESS,
+            "in_progress" => ACCENT,
+            "error" => ERROR,
+            _ => ACCENT_DIM,
+        };
+        items.push((
+            "merge worker output".to_string(),
+            synthesis_status,
+            synthesis_color,
+            state
+                .team_run_strategy
+                .as_ref()
+                .map(|strategy| format!("{strategy} team synthesis")),
+        ));
+    }
+
+    if let Some(verification) = &state.verification {
+        let verify_status = match verification.status.as_str() {
+            "running" => "in_progress",
+            "passed" => "completed",
+            "failed" => "error",
+            _ => "pending",
+        };
+        let verify_color = match verify_status {
+            "completed" => SUCCESS,
+            "in_progress" => ACCENT,
+            "error" => ERROR,
+            _ => ACCENT_DIM,
+        };
+        items.push((
+            "verify result".to_string(),
+            verify_status,
+            verify_color,
+            verification
+                .summary
+                .as_ref()
+                .map(|summary| preview_line(summary, 28))
+                .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 28))),
+        ));
+    }
+
+    if items.is_empty() {
+        items.push((
+            "run current task".to_string(),
+            "in_progress",
+            ACCENT,
+            Some(preview_line(&state.loading_label, 28)),
+        ));
+    }
+
+    items
+}
+
 fn title_case_label(value: &str) -> String {
     let lower = value.trim().to_lowercase();
     let mut chars = lower.chars();
@@ -3226,6 +3344,19 @@ fn title_case_label(value: &str) -> String {
     };
 
     format!("{}{}", first.to_uppercase(), chars.collect::<String>())
+}
+
+fn display_purpose_role(value: &str) -> String {
+    match value {
+        "execution" => "executor".to_string(),
+        "planning" => "planner".to_string(),
+        "research" => "research".to_string(),
+        "review" => "review".to_string(),
+        "design" => "design".to_string(),
+        "oracle" => "oracle".to_string(),
+        "general" => "delegate".to_string(),
+        other => other.replace('_', " "),
+    }
 }
 
 fn display_model_name(model: &str) -> String {
@@ -3297,7 +3428,11 @@ fn current_run_summary(state: &NativeTuiState) -> (String, Option<String>) {
         };
         return (
             format!("{} · {}", preview_line(&job.label, 20), status),
-            checklist_progress(&job.checklist).or_else(|| job.detail.clone()),
+            job.prompt_preview
+                .as_ref()
+                .map(|preview| preview_line(preview, 28))
+                .or_else(|| checklist_progress(&job.checklist))
+                .or_else(|| job.detail.clone()),
         );
     }
 
@@ -3420,33 +3555,6 @@ fn looks_like_url_token(token: &str) -> bool {
     });
 
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
-fn collect_recent_tool_calls(messages: &[NativeMessageState], limit: usize) -> Vec<NativeToolCallState> {
-    let mut seen = HashSet::new();
-    let mut running = Vec::new();
-    let mut recent = Vec::new();
-
-    for message in messages.iter().rev() {
-        for tool in message.tool_calls.iter().rev() {
-            if tool.name == "task" || tool.name == "oracle" {
-                continue;
-            }
-            if !seen.insert(tool.id.clone()) {
-                continue;
-            }
-
-            if tool.status == "running" || tool.status == "pending" {
-                running.push(tool.clone());
-            } else {
-                recent.push(tool.clone());
-            }
-        }
-    }
-
-    running.extend(recent);
-    running.truncate(limit);
-    running
 }
 
 fn format_elapsed(started_at_ms: Option<u64>) -> String {

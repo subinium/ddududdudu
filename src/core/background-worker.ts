@@ -66,6 +66,9 @@ const previewText = (value: string, maxLength: number = 96): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
+const formatTeamAgentLabel = (agent: { name: string; role: 'lead' | 'worker' | 'reviewer' }): string =>
+  `${agent.name} · ${agent.role}`;
+
 const artifactKindForPurpose = (purpose?: DelegationPurpose | 'general'): WorkflowArtifactKind => {
   switch (purpose) {
     case 'execution':
@@ -214,21 +217,11 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
     detail: job.detail ?? 'starting…',
     checklist:
       job.kind === 'delegate'
-        ? updateChecklistItem(
-            updateChecklistItem(job.checklist, 'route', {
-              status: 'completed',
-              detail: 'worker selected',
-            }),
-            'execute',
-            {
-              status: 'in_progress',
-              detail: 'booting delegated worker',
-            },
-          )
-        : updateChecklistItem(job.checklist, 'route', {
-            status: 'completed',
-            detail: 'starting team workers',
-          }),
+        ? updateChecklistItem(job.checklist, 'execute', {
+            status: 'in_progress',
+            detail: 'booting delegated worker',
+          })
+        : job.checklist,
   });
 
   let persistChain = Promise.resolve();
@@ -482,19 +475,6 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                 updatedAt: Date.now(),
               };
             }
-            if (item.id === 'report') {
-              return {
-                ...item,
-                status:
-                  result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
-                    ? 'error'
-                    : result.verification?.status === 'failed'
-                      ? 'error'
-                      : 'completed',
-                detail: previewText(finalText, 72),
-                updatedAt: Date.now(),
-              };
-            }
             return item;
           }),
         agentActivities: updateActivity(current.agentActivities, {
@@ -507,7 +487,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               ? 'apply'
               : result.verification
                 ? 'verify'
-                : 'report',
+                : 'execute',
           status:
             result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
               ? 'error'
@@ -543,7 +523,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           queuePersist({
             agentActivities: updateActivity(current.agentActivities, {
               id: `job:${current.id}:${agent.id}:${round}`,
-              label: agent.name,
+              label: formatTeamAgentLabel(agent),
               mode: agent.mode ?? null,
               purpose,
               checklistId: `agent:${agent.id}`,
@@ -583,7 +563,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                 queuePersist({
                   agentActivities: updateActivity(current.agentActivities, {
                     id: `job:${current.id}:${agent.id}:${round}`,
-                    label: agent.name,
+                    label: formatTeamAgentLabel(agent),
                     mode: agent.mode ?? null,
                     purpose,
                     checklistId: `agent:${agent.id}`,
@@ -607,7 +587,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                 queuePersist({
                   agentActivities: updateActivity(current.agentActivities, {
                     id: `job:${current.id}:${agent.id}:${round}`,
-                    label: agent.name,
+                    label: formatTeamAgentLabel(agent),
                     mode: agent.mode ?? null,
                     purpose,
                     checklistId: `agent:${agent.id}`,
@@ -627,7 +607,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                 queuePersist({
                   agentActivities: updateActivity(current.agentActivities, {
                     id: `job:${current.id}:${agent.id}:${round}`,
-                    label: agent.name,
+                    label: formatTeamAgentLabel(agent),
                     mode: agent.mode ?? null,
                     purpose,
                     checklistId: `agent:${agent.id}`,
@@ -663,7 +643,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
           queuePersist({
             agentActivities: updateActivity(current.agentActivities, {
               id: `job:${current.id}:${agent.id}:${round}`,
-              label: agent.name,
+              label: formatTeamAgentLabel(agent),
               mode: agent.mode ?? null,
               purpose,
               checklistId: `agent:${agent.id}`,
@@ -739,22 +719,20 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
         },
         artifact,
         checklist: current.checklist.map((item) => {
-          if (item.id === 'route' || item.id === 'synthesize' || item.id === 'report') {
+          if (item.id === 'synthesize') {
             return {
               ...item,
               status: 'completed',
               detail:
-                item.id === 'report'
-                  ? previewText(finalText, 72)
-                  : item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
+                item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
               updatedAt: Date.now(),
             };
           }
-          if (item.id === 'verify') {
+          if (item.id === 'review') {
             return {
               ...item,
               status: result.success ? 'completed' : 'error',
-              detail: result.success ? 'team output verified' : 'team output incomplete',
+              detail: result.success ? 'team output reviewed' : 'team output incomplete',
               updatedAt: Date.now(),
             };
           }
