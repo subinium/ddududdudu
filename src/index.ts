@@ -16,7 +16,7 @@ import { getAuthStorePath, setStoredProviderAuth } from './auth/store.js';
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
 
-const DISPLAY_VERSION = process.env.DDUDU_VERSION ?? '0.2.0';
+const DISPLAY_VERSION = process.env.DDUDU_VERSION ?? '0.3.0';
 
 const previewText = (value: string, maxLength: number = 68): string => {
   const normalized = value.replace(/\s+/g, ' ').trim();

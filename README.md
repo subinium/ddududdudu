@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.2.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.3.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
