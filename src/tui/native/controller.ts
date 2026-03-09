@@ -1026,13 +1026,6 @@ export class NativeBridgeController {
     }
     this.syncMcpState();
     try {
-      await this.lspManager.refresh(process.cwd());
-    } catch (error: unknown) {
-      this.appendSystemMessage(`[lsp] ${serializeError(error)}`);
-    }
-    this.syncLspState();
-
-    try {
       await loadHookFiles(process.cwd(), this.hookRegistry);
     } catch (error: unknown) {
       this.appendSystemMessage(`[hooks] ${serializeError(error)}`);
@@ -1069,6 +1062,7 @@ export class NativeBridgeController {
     this.scheduleIdleWarmup();
     this.state.ready = true;
     this.emitStateNow();
+    void this.refreshLspInBackground();
   }
 
   public shutdown(): void {
@@ -1102,6 +1096,16 @@ export class NativeBridgeController {
       clearTimeout(this.backgroundJobPollTimer);
     }
     this.scheduleBackgroundJobPoll();
+  }
+
+  private async refreshLspInBackground(): Promise<void> {
+    try {
+      await this.lspManager.refresh(process.cwd());
+    } catch (error: unknown) {
+      this.appendSystemMessage(`[lsp] ${serializeError(error)}`);
+    }
+    this.syncLspState();
+    this.scheduleStatePush();
   }
 
   private scheduleBackgroundJobPoll(delayMs?: number): void {
@@ -2052,12 +2056,15 @@ export class NativeBridgeController {
     }
 
     if (hasExecution) {
-      return {
-        kind: 'delegate',
-        purpose: 'execution',
-        preferredMode: 'lisa',
-        reason: 'implementation request',
-      };
+      if (multiStep || wordCount >= 18) {
+        return {
+          kind: 'delegate',
+          purpose: 'execution',
+          preferredMode: 'lisa',
+          reason: 'large implementation request',
+        };
+      }
+      return { kind: 'direct', reason: 'single execution request' };
     }
 
     return { kind: 'direct', reason: 'no strong orchestration signal' };
@@ -2241,8 +2248,8 @@ export class NativeBridgeController {
     const backgroundJobId = randomUUID();
     const routeNotice = `${this.formatAutoRouteNotice(decision)} · background`;
     const label = decision.preferredMode
-      ? `${HARNESS_MODES[decision.preferredMode].label} ${decision.purpose ?? 'general'}`
-      : `delegate ${decision.purpose ?? 'general'}`;
+      ? `${HARNESS_MODES[decision.preferredMode].label} · ${decision.purpose ?? 'general'}`
+      : `delegate · ${decision.purpose ?? 'general'}`;
 
     this.state.messages.push({
       id: randomUUID(),

@@ -621,12 +621,12 @@ impl App {
             bridge,
             state: NativeTuiState {
                 ready: false,
-                version: String::new(),
+                version: env!("CARGO_PKG_VERSION").to_string(),
                 cwd: String::new(),
                 mode: "jennie".into(),
                 modes: Vec::new(),
-                provider: String::new(),
-                model: String::new(),
+                provider: "anthropic".into(),
+                model: "claude-opus-4-6".into(),
                 models: Vec::new(),
                 auth_type: None,
                 auth_source: None,
@@ -1429,6 +1429,18 @@ impl App {
         item_index: &mut usize,
     ) {
         lines.push(sidebar_header("Context"));
+        if !self.state.ready {
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "starting runtime".to_string(),
+                Some("discovering auth, model bindings, and context".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
+            return;
+        }
         push_sidebar_selectable_item(
             lines,
             *item_index == self.sidebar_selection,
@@ -1522,6 +1534,19 @@ impl App {
             FG,
             ACCENT_DIM,
         );
+        if !self.state.ready {
+            lines.push(Line::from(Span::raw("")));
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "runtime booting".to_string(),
+                Some("waiting for native controller state".to_string()),
+                FG,
+                ACCENT_DIM,
+            );
+            return;
+        }
         lines.push(Line::from(Span::raw("")));
         if let Some(mcp) = &self.state.mcp {
             if mcp.configured_servers == 0 {
@@ -2276,7 +2301,9 @@ impl App {
             return Ok(());
         }
 
-        if key.code == KeyCode::BackTab {
+        if key.code == KeyCode::BackTab
+            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+        {
             self.bridge
                 .send(BridgeCommand::CycleMode { direction: 1 })?;
             return Ok(());
@@ -2357,6 +2384,11 @@ impl App {
         match key.code {
             KeyCode::Enter => self.submit_or_accept(popup_visible, &suggestions),
             KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.bridge
+                        .send(BridgeCommand::CycleMode { direction: 1 })?;
+                    return Ok(());
+                }
                 if popup_visible {
                     self.accept_suggestion(&suggestions)?;
                 } else {
@@ -3358,6 +3390,15 @@ fn title_case_label(value: &str) -> String {
     format!("{}{}", first.to_uppercase(), chars.collect::<String>())
 }
 
+fn default_model_for_mode(mode: &str) -> &'static str {
+    match mode {
+        "lisa" => "gpt-5.4",
+        "rosé" => "claude-sonnet-4-6",
+        "jisoo" => "gemini-2.5-pro",
+        _ => "claude-opus-4-6",
+    }
+}
+
 fn display_purpose_role(value: &str) -> String {
     match value {
         "execution" => "executor".to_string(),
@@ -3424,13 +3465,24 @@ fn build_mode_badge_spans(state: &NativeTuiState) -> Vec<Span<'static>> {
         format!(
             "● {} ({})",
             title_case_label(&state.mode),
-            display_model_name(&state.model)
+            display_model_name(if state.model.trim().is_empty() {
+                default_model_for_mode(&state.mode)
+            } else {
+                &state.model
+            })
         ),
         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
     )]
 }
 
 fn current_run_summary(state: &NativeTuiState) -> (String, Option<String>) {
+    if !state.ready {
+        return (
+            format!("{} · booting", title_case_label(&state.mode)),
+            Some("discovering auth and runtime".to_string()),
+        );
+    }
+
     if let Some(job) = active_sidebar_job(state) {
         let status = match job.status.as_str() {
             "running" => "running",

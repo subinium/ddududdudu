@@ -10,7 +10,6 @@ import {
   resolveModeForSpecialistRole,
   type SpecialistRole,
 } from '../core/specialist-roles.js';
-import { SubAgentPool } from '../core/sub-agent.js';
 import { HARNESS_MODES } from '../tui/shared/theme.js';
 import type { WorkflowArtifactKind } from '../core/workflow-state.js';
 import type { Tool } from './index.js';
@@ -305,6 +304,7 @@ export const taskTool: Tool = {
       };
     }
 
+    const { SubAgentPool } = await import('../core/sub-agent.js');
     const pool = new SubAgentPool({
       token,
       baseUrl: ctx.authBaseUrl || resolveBaseUrl(),

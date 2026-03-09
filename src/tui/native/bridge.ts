@@ -90,30 +90,16 @@ export const runNativeBridge = async (): Promise<void> => {
   redirectConsoleToStderr();
 
   const controller = new NativeBridgeController(writeEvent);
-  await controller.boot();
-
   const rl = createInterface({
     input: process.stdin,
     crlfDelay: Infinity,
   });
 
-  rl.on('line', (line: string) => {
-    let command: NativeBridgeCommand | null = null;
+  let booted = false;
+  let bootFailed = false;
+  const queuedCommands: NativeBridgeCommand[] = [];
 
-    try {
-      command = parseCommand(line);
-    } catch (error: unknown) {
-      console.error(
-        '[ddudu bridge] ignored invalid command:',
-        error instanceof Error ? error.message : String(error),
-      );
-      return;
-    }
-
-    if (!command) {
-      return;
-    }
-
+  const handleCommand = (command: NativeBridgeCommand): void => {
     switch (command.type) {
       case 'submit':
         void controller.submit(command.content);
@@ -151,9 +137,54 @@ export const runNativeBridge = async (): Promise<void> => {
       default:
         break;
     }
+  };
+
+  rl.on('line', (line: string) => {
+    let command: NativeBridgeCommand | null = null;
+
+    try {
+      command = parseCommand(line);
+    } catch (error: unknown) {
+      console.error(
+        '[ddudu bridge] ignored invalid command:',
+        error instanceof Error ? error.message : String(error),
+      );
+      return;
+    }
+
+    if (!command) {
+      return;
+    }
+
+    if (bootFailed) {
+      return;
+    }
+
+    if (!booted) {
+      queuedCommands.push(command);
+      return;
+    }
+
+    handleCommand(command);
   });
 
   rl.on('close', () => {
     controller.shutdown();
   });
+
+  try {
+    await controller.boot();
+    booted = true;
+    for (const command of queuedCommands.splice(0)) {
+      handleCommand(command);
+    }
+  } catch (error: unknown) {
+    bootFailed = true;
+    writeEvent({
+      type: 'fatal',
+      message:
+        error instanceof Error ? `Bridge boot failed: ${error.message}` : `Bridge boot failed: ${String(error)}`,
+    });
+    rl.close();
+  }
 };

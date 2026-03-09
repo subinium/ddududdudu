@@ -240,7 +240,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       job.kind === 'delegate'
         ? updateChecklistItem(job.checklist, 'execute', {
             status: 'in_progress',
-            detail: 'booting delegated worker',
+            detail: job.label ? `starting ${job.label}` : 'starting delegated worker',
           })
         : job.checklist,
   });

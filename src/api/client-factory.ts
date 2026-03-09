@@ -1,14 +1,9 @@
-import {
-  AnthropicClient,
-  type ApiMessage,
-  type ToolStateUpdate,
-  type UsageSummary,
+import type {
+  ApiMessage,
+  ToolStateUpdate,
+  UsageSummary,
 } from './anthropic-client.js';
 import { DEFAULT_ANTHROPIC_BASE_URL } from './anthropic-base-url.js';
-import { ClaudeCliClient } from './claude-cli-client.js';
-import { CodexClient } from './codex-client.js';
-import { GeminiClient } from './gemini-client.js';
-import { OpenAIClient } from './openai-client.js';
 
 export interface StreamEvent {
   type: 'text' | 'done' | 'error' | 'tool_use' | 'tool_state' | 'session';
@@ -148,6 +143,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {
             if (tokenType === 'oauth') {
+              const { ClaudeCliClient } = await import('./claude-cli-client.js');
               const client = new ClaudeCliClient({
                 model: streamOptions.model,
                 cwd: streamOptions.cwd,
@@ -169,6 +165,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
               return;
             }
 
+            const { AnthropicClient } = await import('./anthropic-client.js');
             const client = new AnthropicClient({
               token,
               tokenType: 'apikey',
@@ -203,6 +200,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {
             if (tokenType === 'bearer') {
+              const { CodexClient } = await import('./codex-client.js');
               const client = new CodexClient({
                 model: streamOptions.model,
                 cwd: streamOptions.cwd,
@@ -232,6 +230,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
               throw error;
             }
 
+            const { OpenAIClient } = await import('./openai-client.js');
             const client = new OpenAIClient({
               token,
               baseUrl: streamOptions.baseUrl ?? 'https://api.openai.com',
@@ -262,6 +261,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
       stream(messages: ApiMessage[], options: StreamOptions): AsyncGenerator<StreamEvent> {
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {
+            const { GeminiClient } = await import('./gemini-client.js');
             const client = new GeminiClient({
               token,
               tokenType: tokenType === 'oauth' ? 'oauth' : 'apikey',

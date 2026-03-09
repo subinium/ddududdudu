@@ -3,7 +3,6 @@ import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
-import { AnthropicClient } from '../api/anthropic-client.js';
 import type { NamedMode } from '../core/types.js';
 import type { WorkflowArtifactKind } from '../core/workflow-state.js';
 import { HARNESS_MODES } from '../tui/shared/theme.js';
@@ -239,6 +238,7 @@ export const oracleTool: Tool = {
       }
     }
 
+    const { AnthropicClient } = await import('../api/anthropic-client.js');
     const client = new AnthropicClient({
       token,
       baseUrl: ctx.authBaseUrl || resolveBaseUrl(),
