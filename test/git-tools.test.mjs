@@ -43,6 +43,11 @@ test('git_status and git_diff report working tree changes', async () => {
     const diff = await gitDiffTool.execute({}, { cwd: root });
     assert.equal(diff.isError, undefined);
     assert.match(diff.output, /\+world/);
+    assert.deepEqual(diff.metadata?.files, ['note.txt']);
+    assert.equal(diff.metadata?.fileCount, 1);
+    assert.equal(diff.metadata?.insertions, 1);
+    assert.equal(diff.metadata?.deletions, 0);
+    assert.match(String(diff.metadata?.summary ?? ''), /1 file changed/i);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -73,6 +78,8 @@ test('patch_apply validates and applies a patch', async () => {
     );
     assert.equal(check.isError, undefined);
     assert.match(check.output, /Patch check passed/);
+    assert.deepEqual(check.metadata?.files, ['note.txt']);
+    assert.equal(check.metadata?.fileCount, 1);
 
     const apply = await patchApplyTool.execute(
       { patch },
@@ -80,6 +87,8 @@ test('patch_apply validates and applies a patch', async () => {
     );
     assert.equal(apply.isError, undefined);
     assert.match(apply.output, /Patch applied successfully/);
+    assert.deepEqual(apply.metadata?.files, ['note.txt']);
+    assert.equal(apply.metadata?.fileCount, 1);
     assert.equal(await readFile(filePath, 'utf8'), 'hello\nworld\n');
   } finally {
     await rm(root, { recursive: true, force: true });

@@ -71,7 +71,15 @@ const buildVerificationPayload = (
     commands: cleanItems(
       verification.commands
         .filter((command) => !command.ok)
-        .map((command) => `${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`),
+        .map((command) => {
+          const parts = [
+            `${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`,
+            command.category ? `category: ${command.category}` : null,
+            command.files && command.files.length > 0 ? `files: ${command.files.slice(0, 2).join(', ')}` : null,
+            command.rerunHint ? `rerun: ${command.rerunHint}` : null,
+          ].filter((part): part is string => Boolean(part));
+          return parts.join(' · ');
+        }),
       4,
     ),
     highlights: cleanItems(

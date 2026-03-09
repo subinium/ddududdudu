@@ -48,6 +48,7 @@ The deeper technical notes live in [`docs/`](./docs/):
 - [Design Principles](./docs/design-principles.md)
 - [Harness Anatomy](./docs/harness-anatomy.md)
 - [Context Engine](./docs/context-engine.md)
+- [Memory System](./docs/memory-system.md)
 - [Session And State](./docs/session-and-state.md)
 - [Delegation And Artifacts](./docs/delegation-and-artifacts.md)
 - [Trust And Sandbox](./docs/trust-and-sandbox.md)

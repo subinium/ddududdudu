@@ -52,6 +52,9 @@ const createRunnerTool = (kind: 'lint' | 'test' | 'build'): Tool => ({
         summary: result.summary,
         highlights: result.highlights,
         truncated: result.truncated,
+        category: result.category,
+        files: result.files,
+        rerunHint: result.rerunHint,
       },
     };
   },

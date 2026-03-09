@@ -65,6 +65,9 @@ test('test_runner reports failures with highlights', async () => {
     assert.equal(result.metadata?.ok, false);
     assert.match(String(result.metadata?.summary ?? ''), /test failed/i);
     assert.ok(Array.isArray(result.metadata?.highlights));
+    assert.equal(result.metadata?.category, 'test-failure');
+    assert.ok(Array.isArray(result.metadata?.files));
+    assert.match(String(result.metadata?.rerunHint ?? ''), /rerun/i);
     assert.match(String(result.output), /FAIL sample\.spec\.ts:4/i);
   } finally {
     await rm(root, { recursive: true, force: true });

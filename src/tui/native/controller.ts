@@ -4986,10 +4986,15 @@ export class NativeBridgeController {
       .map((command) => {
         const parts = [
           `${command.kind}: ${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`,
+          command.category ? `category: ${command.category}` : null,
           command.summary ? `summary: ${command.summary}` : null,
+          command.files && command.files.length > 0
+            ? `files: ${command.files.slice(0, 2).join(', ')}`
+            : null,
           command.highlights && command.highlights.length > 0
             ? `highlights: ${command.highlights.slice(0, 2).join(' | ')}`
             : null,
+          command.rerunHint ? `rerun: ${command.rerunHint}` : null,
         ].filter((part): part is string => Boolean(part));
         return `- ${parts.join(' · ')}`;
       })

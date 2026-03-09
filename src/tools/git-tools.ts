@@ -28,6 +28,52 @@ const parseMaxBytes = (value: unknown, fallback: number): number => {
   return Math.max(2 * 1024, Math.min(256 * 1024, Math.floor(value)));
 };
 
+const PATCH_FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
+
+const extractPatchFiles = (diff: string): string[] => {
+  const files = new Set<string>();
+  PATCH_FILE_PATTERN.lastIndex = 0;
+  let match = PATCH_FILE_PATTERN.exec(diff);
+  while (match) {
+    const filePath = match[1]?.trim();
+    if (filePath) {
+      files.add(filePath);
+    }
+    match = PATCH_FILE_PATTERN.exec(diff);
+  }
+
+  return Array.from(files.values());
+};
+
+const parseNumstat = (
+  value: string,
+): { files: string[]; insertions: number; deletions: number } => {
+  const files: string[] = [];
+  let insertions = 0;
+  let deletions = 0;
+
+  for (const line of value.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const [added, removed, ...rest] = trimmed.split('\t');
+    const filePath = rest.join('\t').trim();
+    if (!filePath) {
+      continue;
+    }
+    files.push(filePath);
+    if (/^\d+$/.test(added)) {
+      insertions += Number.parseInt(added, 10);
+    }
+    if (/^\d+$/.test(removed)) {
+      deletions += Number.parseInt(removed, 10);
+    }
+  }
+
+  return { files, insertions, deletions };
+};
+
 const runGit = async (cwd: string, args: string[]): Promise<string> => {
   const { stdout } = await execFileAsync('git', args, {
     cwd,
@@ -169,6 +215,15 @@ export const gitDiffTool: Tool = {
 
     try {
       const output = await runGit(ctx.cwd, commandArgs);
+      const numstatArgs = ['diff', '--no-ext-diff', '--minimal', '--numstat'];
+      if (staged) {
+        numstatArgs.push('--cached');
+      }
+      if (scopedPath) {
+        numstatArgs.push('--', scopedPath);
+      }
+      const numstat = await runGit(ctx.cwd, numstatArgs).catch(() => '');
+      const parsed = parseNumstat(numstat);
       if (!output.trim()) {
         return {
           output: staged ? 'No staged diff.' : 'No working tree diff.',
@@ -178,6 +233,11 @@ export const gitDiffTool: Tool = {
             staged,
             statOnly,
             truncated: false,
+            files: [],
+            fileCount: 0,
+            insertions: 0,
+            deletions: 0,
+            summary: staged ? 'no staged changes' : 'no working tree changes',
           },
         };
       }
@@ -192,6 +252,11 @@ export const gitDiffTool: Tool = {
           statOnly,
           truncated: truncated.truncated,
           maxBytes,
+          files: parsed.files,
+          fileCount: parsed.files.length,
+          insertions: parsed.insertions,
+          deletions: parsed.deletions,
+          summary: `${parsed.files.length} file${parsed.files.length === 1 ? '' : 's'} changed · +${parsed.insertions} -${parsed.deletions}`,
         },
       };
     } catch (error: unknown) {
@@ -237,6 +302,11 @@ export const patchApplyTool: Tool = {
     try {
       await mkdir(tempDir, { recursive: true });
       await writeFile(patchPath, args.patch, 'utf8');
+      const files = extractPatchFiles(args.patch);
+      const summary =
+        files.length > 0
+          ? `${files.length} file${files.length === 1 ? '' : 's'} touched`
+          : 'patch parsed';
 
       const baseArgs = ['apply', '--whitespace=nowarn'];
       if (reverse) {
@@ -251,6 +321,9 @@ export const patchApplyTool: Tool = {
             repoRoot,
             checkOnly: true,
             reverse,
+            files,
+            fileCount: files.length,
+            summary,
           },
         };
       }
@@ -258,13 +331,16 @@ export const patchApplyTool: Tool = {
       await runGit(repoRoot, [...baseArgs, patchPath]);
       return {
         output: 'Patch applied successfully.',
-        metadata: {
-          repoRoot,
-          checkOnly: false,
-          reverse,
-        },
-      };
-    } catch (error: unknown) {
+          metadata: {
+            repoRoot,
+            checkOnly: false,
+            reverse,
+            files,
+            fileCount: files.length,
+            summary,
+          },
+        };
+      } catch (error: unknown) {
       return {
         output: error instanceof Error ? error.message : String(error),
         isError: true,
@@ -272,6 +348,8 @@ export const patchApplyTool: Tool = {
           repoRoot,
           checkOnly,
           reverse,
+          files: extractPatchFiles(args.patch),
+          fileCount: extractPatchFiles(args.patch).length,
         },
       };
     } finally {

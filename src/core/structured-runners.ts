@@ -25,6 +25,9 @@ export interface StructuredRunnerResult {
   truncated: boolean;
   summary: string;
   highlights: string[];
+  category?: string;
+  files?: string[];
+  rerunHint?: string;
 }
 
 const exists = async (filePath: string): Promise<boolean> => {
@@ -129,6 +132,89 @@ export const collectHighlights = (output: string, maxHighlights: number = 6): st
   return pool.slice(0, maxHighlights).map((line) => preview(line, 180));
 };
 
+const FILE_HINT_PATTERN =
+  /(?:^|[\s("'])([A-Za-z0-9_./-]+\.(?:ts|tsx|js|jsx|mjs|cjs|json|md|py|rb|go|rs|java|kt|swift|yml|yaml|css|scss|html))(?:[:(]\d+(?::\d+)?)?/g;
+
+const collectFileHints = (output: string, maxFiles: number = 6): string[] => {
+  const files = new Set<string>();
+  FILE_HINT_PATTERN.lastIndex = 0;
+  let match = FILE_HINT_PATTERN.exec(output);
+  while (match) {
+    const value = match[1]?.trim();
+    if (value) {
+      files.add(value.replace(/^[("']+|[)"',.:;]+$/g, ''));
+    }
+    if (files.size >= maxFiles) {
+      break;
+    }
+    match = FILE_HINT_PATTERN.exec(output);
+  }
+
+  return Array.from(files.values());
+};
+
+const classifyFailure = (
+  kind: 'lint' | 'test' | 'build',
+  output: string,
+): string | undefined => {
+  const normalized = output.toLowerCase();
+  if (!normalized.trim()) {
+    return undefined;
+  }
+
+  if (/\btimeout\b/.test(normalized)) {
+    return 'timeout';
+  }
+  if (/cannot find module|module not found|can't resolve|failed to resolve/i.test(output)) {
+    return 'module-resolution';
+  }
+  if (/ts\d{3,5}|type error|is not assignable|property .* does not exist on type/i.test(output)) {
+    return 'type-error';
+  }
+  if (/syntaxerror|unexpected token|parse error/i.test(output)) {
+    return 'syntax-error';
+  }
+
+  if (kind === 'test') {
+    if (/assert|expect|expected|received|failing|fail\b|not ok/i.test(output)) {
+      return 'test-failure';
+    }
+    return 'test-failure';
+  }
+
+  if (kind === 'lint') {
+    if (/eslint|prettier|stylelint|warning/i.test(output)) {
+      return 'lint-violation';
+    }
+    return 'lint-failure';
+  }
+
+  return 'build-failure';
+};
+
+const buildRerunHint = (input: {
+  kind: 'lint' | 'test' | 'build';
+  command: string;
+  files: string[];
+  category?: string;
+  scriptName?: string | null;
+}): string | undefined => {
+  const scopeTarget = input.files[0];
+  if (input.kind === 'test' && scopeTarget) {
+    return `rerun ${input.command} and focus on ${scopeTarget}`;
+  }
+  if ((input.category === 'type-error' || input.category === 'module-resolution') && scopeTarget) {
+    return `fix ${scopeTarget} first, then rerun ${input.command}`;
+  }
+  if (input.kind === 'lint' && scopeTarget) {
+    return `fix the highlighted issue in ${scopeTarget}, then rerun ${input.command}`;
+  }
+  if (input.scriptName) {
+    return `rerun ${input.command} after fixing the highlighted issues`;
+  }
+  return input.command ? `rerun ${input.command} after fixing the highlighted issues` : undefined;
+};
+
 export const summarizeStructuredOutput = (
   kind: 'lint' | 'test' | 'build',
   ok: boolean,
@@ -193,6 +279,8 @@ export const runStructuredVerifierCommand = async (
           ? `${combined}\n\n[timeout after ${timeoutMs}ms]`.trim()
           : combined;
         const truncated = truncateUtf8(effective, MAX_OUTPUT_BYTES);
+        const files = collectFileHints(effective);
+        const category = code === 0 && !timedOut ? undefined : classifyFailure(input.kind, effective);
         resolveResult({
           ok: code === 0 && !timedOut,
           command,
@@ -201,6 +289,17 @@ export const runStructuredVerifierCommand = async (
           truncated: truncated.truncated,
           summary: summarizeStructuredOutput(input.kind, code === 0 && !timedOut, effective),
           highlights: collectHighlights(effective),
+          category,
+          files,
+          rerunHint:
+            code === 0 && !timedOut
+              ? undefined
+              : buildRerunHint({
+                  kind: input.kind,
+                  command,
+                  files,
+                  category,
+                }),
         });
       });
     });
@@ -216,6 +315,9 @@ export const runStructuredVerifierCommand = async (
       truncated: false,
       summary: `${input.kind} script missing`,
       highlights: [],
+      category: 'missing-script',
+      files: [],
+      rerunHint: `add or configure a ${input.kind} script before rerunning verification`,
     };
   }
 
@@ -246,19 +348,32 @@ export const runStructuredVerifierCommand = async (
       truncated: truncated.truncated,
       summary: summarizeStructuredOutput(input.kind, true, output || `${script} passed`),
       highlights: collectHighlights(output),
+      files: collectFileHints(output),
     };
   } catch (error: unknown) {
     const err = error as { stdout?: string; stderr?: string; code?: number | null; message?: string };
     const output = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n');
     const truncated = truncateUtf8(output || `${script} failed`, MAX_OUTPUT_BYTES);
+    const files = collectFileHints(output);
+    const category = classifyFailure(input.kind, output || `${script} failed`);
+    const command = `${packageManager} ${args.join(' ')}`;
     return {
       ok: false,
-      command: `${packageManager} ${args.join(' ')}`,
+      command,
       exitCode: typeof err.code === 'number' ? err.code : null,
       output: truncated.text,
       truncated: truncated.truncated,
       summary: summarizeStructuredOutput(input.kind, false, output || `${script} failed`),
       highlights: collectHighlights(output),
+      category,
+      files,
+      rerunHint: buildRerunHint({
+        kind: input.kind,
+        command,
+        files,
+        category,
+        scriptName: script,
+      }),
     };
   }
 };

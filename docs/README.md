@@ -15,6 +15,7 @@ This directory is the architecture-facing layer:
 - how `ddudu` decomposes that problem
 - which tradeoffs belong to which subsystem
 - where performance, trust, and operator confidence usually come from
+- how durable knowledge should be selected, promoted, and retrieved
 
 ## Why These Docs Exist
 
@@ -51,6 +52,7 @@ These docs exist to make those design decisions explicit.
 | [Design Principles](./design-principles.md) | the high-level worldview behind the system |
 | [Harness Anatomy](./harness-anatomy.md) | subsystem decomposition, ownership, and boundaries |
 | [Context Engine](./context-engine.md) | prompt construction, retrieval, compaction, and context selection |
+| [Memory System](./memory-system.md) | memory scopes, promotion policy, retrieval boundaries, and failure modes |
 | [Session And State](./session-and-state.md) | canonical sessions, provider sessions, jobs, workspaces, durable state |
 | [Delegation And Artifacts](./delegation-and-artifacts.md) | delegation contracts, typed handoffs, review and repair loops |
 | [Trust And Sandbox](./trust-and-sandbox.md) | policy surfaces, trust boundaries, and enforcement limits |

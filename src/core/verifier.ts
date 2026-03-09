@@ -19,6 +19,9 @@ export interface VerificationCommandResult {
   summary?: string;
   highlights?: string[];
   truncated?: boolean;
+  category?: string;
+  files?: string[];
+  rerunHint?: string;
 }
 
 export interface VerificationSummary {
@@ -86,6 +89,9 @@ const toVerificationCommandResult = (
   summary: result.summary,
   highlights: result.highlights,
   truncated: result.truncated,
+  category: result.category,
+  files: result.files,
+  rerunHint: result.rerunHint,
 });
 
 export class VerificationRunner {
@@ -187,10 +193,19 @@ export class VerificationRunner {
         if (command.summary) {
           reportLines.push(`  summary: ${command.summary}`);
         }
+        if (command.category) {
+          reportLines.push(`  category: ${command.category}`);
+        }
         if (command.highlights && command.highlights.length > 0) {
           for (const highlight of command.highlights.slice(0, 3)) {
             reportLines.push(`  highlight: ${highlight}`);
           }
+        }
+        if (command.files && command.files.length > 0) {
+          reportLines.push(`  files: ${command.files.join(', ')}`);
+        }
+        if (command.rerunHint) {
+          reportLines.push(`  rerun: ${command.rerunHint}`);
         }
         if (command.output) {
           reportLines.push(`  ${command.output}`);
