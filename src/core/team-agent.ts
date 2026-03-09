@@ -1,14 +1,22 @@
 import type { NamedMode } from './types.js';
+import type { SpecialistRole } from './specialist-roles.js';
+import type { WorkflowArtifactKind } from './workflow-state.js';
 
 export interface AgentRole {
   id: string;
   name: string;
   role: 'lead' | 'worker' | 'reviewer';
   mode?: NamedMode;
+  roleProfile?: SpecialistRole;
   model: string;
   provider: string;
   systemPrompt: string;
   tools?: string[];
+  taskLabel?: string;
+  taskBrief?: string;
+  deliverable?: WorkflowArtifactKind;
+  successCriteria?: string[];
+  readOnly?: boolean;
 }
 
 export interface TeamMessage {
@@ -202,8 +210,8 @@ export class TeamOrchestrator {
   }
 
   private async executeParallelRound(round: number): Promise<void> {
-    const workerTasks = this.workerIds.map((workerId, index) => {
-      const taskText = this.buildWorkerSubtask(index, round, undefined);
+    const workerTasks = this.workerIds.map((workerId) => {
+      const taskText = this.buildWorkerSubtask(workerId, round, undefined);
       this.routeMessage({
         from: this.leadId,
         to: workerId,
@@ -223,15 +231,14 @@ export class TeamOrchestrator {
   private async executeSequentialRound(round: number): Promise<void> {
     let accumulated = '';
 
-    for (let index = 0; index < this.workerIds.length; index += 1) {
-      const workerId = this.workerIds[index];
-      const taskText = this.buildWorkerSubtask(index, round, accumulated || undefined);
+    for (const workerId of this.workerIds) {
+      const taskText = this.buildWorkerSubtask(workerId, round, accumulated || undefined);
       this.routeMessage({
         from: this.leadId,
         to: workerId,
         type: 'task',
         content: taskText,
-        metadata: { strategy: 'sequential', round, dependsOnPrior: index > 0 },
+        metadata: { strategy: 'sequential', round, dependsOnPrior: Boolean(accumulated) },
         timestamp: Date.now(),
       });
 
@@ -254,9 +261,8 @@ export class TeamOrchestrator {
     });
 
     const workerOutputs: string[] = [];
-    for (let index = 0; index < this.workerIds.length; index += 1) {
-      const workerId = this.workerIds[index];
-      const subtask = this.buildWorkerSubtask(index, round, undefined);
+    for (const workerId of this.workerIds) {
+      const subtask = this.buildWorkerSubtask(workerId, round, undefined);
       this.routeMessage({
         from: this.leadId,
         to: workerId,
@@ -296,7 +302,7 @@ export class TeamOrchestrator {
       queue && taskIndex >= 0
         ? queue.splice(taskIndex, 1)[0]
         : undefined;
-    const taskContent = assignedTask?.content ?? this.buildWorkerSubtask(0, round, priorOutput);
+    const taskContent = assignedTask?.content ?? this.buildWorkerSubtask(workerId, round, priorOutput);
 
     const workerOutput = await this.simulateAgentOutput(workerId, taskContent, round);
     this.agentOutputs.set(workerId, workerOutput);
@@ -327,6 +333,13 @@ export class TeamOrchestrator {
       this.config.sharedContext ? `Shared context: ${this.config.sharedContext}` : '',
       delegateNotes ? `Delegate notes: ${delegateNotes}` : '',
       workerOutputs.length > 0 ? `Worker outputs:\n${workerOutputs.join('\n')}` : 'Worker outputs: none',
+      `Assignments:\n${this.workerIds
+        .map((workerId) => {
+          const agent = this.agentsById.get(workerId);
+          return agent ? `- ${agent.name}: ${agent.taskLabel ?? agent.role}` : null;
+        })
+        .filter((item): item is string => Boolean(item))
+        .join('\n')}`,
     ]
       .filter((part) => part.length > 0)
       .join('\n\n');
@@ -403,14 +416,27 @@ export class TeamOrchestrator {
     ].join('\n');
   }
 
-  private buildWorkerSubtask(index: number, round: number, priorOutput?: string): string {
+  private buildWorkerSubtask(workerId: string, round: number, priorOutput?: string): string {
+    const agent = this.agentsById.get(workerId);
     const sharedContext = this.config.sharedContext ? `Shared context: ${this.config.sharedContext}` : '';
     const prior = priorOutput ? `Prior output:\n${priorOutput}` : '';
+    const label = agent?.taskLabel ? `Focused task: ${agent.taskLabel}` : `Focused subtask for round ${round}`;
+    const brief = agent?.taskBrief ? `Brief: ${agent.taskBrief}` : '';
+    const deliverable = agent?.deliverable ? `Deliverable: ${agent.deliverable}` : '';
+    const criteria =
+      agent?.successCriteria && agent.successCriteria.length > 0
+        ? ['Success criteria:', ...agent.successCriteria.map((item) => `- ${item}`)].join('\n')
+        : '';
+    const readOnly = agent?.readOnly ? 'Constraint: stay read-only unless explicitly instructed otherwise.' : '';
 
     return [
       `Main task: ${this.activeTask}`,
-      `Subtask ${index + 1} for round ${round}: contribute a focused component of the solution.`,
+      label,
       sharedContext,
+      brief,
+      deliverable,
+      criteria,
+      readOnly,
       prior,
     ]
       .filter((part) => part.length > 0)

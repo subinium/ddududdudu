@@ -2,6 +2,7 @@ import type { ApiMessage, ToolStateUpdate } from '../api/anthropic-client.js';
 import { createClient } from '../api/client-factory.js';
 import { formatArtifactForHandoff } from './artifacts.js';
 import { resolveModeBinding } from './mode-resolution.js';
+import { buildSpecialistPrompt, type SpecialistRole } from './specialist-roles.js';
 import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
@@ -30,6 +31,8 @@ export interface DelegationRequest {
   purpose?: DelegationPurpose;
   requestedArtifactKind?: WorkflowArtifactKind;
   successCriteria?: string[];
+  roleProfile?: SpecialistRole | null;
+  taskLabel?: string | null;
   preferredMode?: NamedMode;
   preferredModel?: string;
   systemPrompt?: string;
@@ -221,6 +224,14 @@ const buildDelegationPrompt = (
 ): string => {
   const sections: string[] = [`Task purpose: ${purpose}`];
 
+  if (request.roleProfile) {
+    sections.push('<role_profile>', `role: ${request.roleProfile}`);
+    if (request.taskLabel) {
+      sections.push(`task: ${request.taskLabel}`);
+    }
+    sections.push('</role_profile>');
+  }
+
   if (request.requestedArtifactKind) {
     sections.push(
       '<requested_deliverable>',
@@ -235,6 +246,15 @@ const buildDelegationPrompt = (
       '<success_criteria>',
       ...request.successCriteria.map((criterion) => `- ${criterion}`),
       '</success_criteria>',
+    );
+  }
+
+  if (purpose === 'planning') {
+    sections.push(
+      '<planning_protocol>',
+      'First clarify scope, assumptions, constraints, success criteria, and open questions before proposing execution.',
+      'If critical information is missing, surface that gap explicitly instead of pretending the plan is settled.',
+      '</planning_protocol>',
     );
   }
 
@@ -329,7 +349,12 @@ export class DelegationRuntime {
 
     try {
       const messages: ApiMessage[] = [{ role: 'user', content: buildDelegationPrompt(request, purpose) }];
-      const combinedSystemPrompt = [request.systemPrompt ?? profile.systemPrompt, request.contextSnapshot]
+      const combinedSystemPrompt = [
+        profile.systemPrompt,
+        request.roleProfile ? buildSpecialistPrompt(request.roleProfile, request.taskLabel, request.successCriteria) : null,
+        request.systemPrompt,
+        request.contextSnapshot,
+      ]
         .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
       for await (const event of client.stream(messages, {

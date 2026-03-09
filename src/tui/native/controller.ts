@@ -42,6 +42,12 @@ import { resolveModeBinding, type HarnessProviderName } from '../../core/mode-re
 import { loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
+import {
+  buildSpecialistPrompt,
+  formatSpecialistLabel,
+  getSpecialistRoleProfile,
+  type SpecialistRole,
+} from '../../core/specialist-roles.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import {
@@ -72,6 +78,7 @@ import type {
   WorkflowBackgroundJobSnapshot,
   WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
+import { planWorkAllocation } from '../../core/work-allocation.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
 import type { ToolContext } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
@@ -395,11 +402,52 @@ const formatModeWorkerLabel = (mode: NamedMode | null | undefined, purpose?: str
   return `${HARNESS_MODES[mode].label} · ${purposeWorkerRole(purpose)}`;
 };
 
-const formatTeamAgentLabel = (agent: { name: string; role: 'lead' | 'worker' | 'reviewer' }): string =>
-  `${agent.name} · ${agent.role}`;
+const formatTeamAgentLabel = (agent: {
+  name: string;
+  mode?: NamedMode;
+  role: 'lead' | 'worker' | 'reviewer';
+  roleProfile?: SpecialistRole;
+}): string => {
+  if (agent.roleProfile) {
+    return formatSpecialistLabel(agent.roleProfile, agent.mode);
+  }
+
+  return `${agent.name} · ${agent.role}`;
+};
+
+const formatTeamAgentDetail = (
+  agent: Pick<TeamAgentRole, 'taskLabel' | 'role' | 'roleProfile'>,
+  fallback: string,
+): string => agent.taskLabel?.trim() || fallback;
 
 const isRunnableTeamAgent = (agent: { role: 'lead' | 'worker' | 'reviewer' }): boolean =>
   agent.role !== 'lead';
+
+const teamAgentPurpose = (agent: Pick<TeamAgentRole, 'role' | 'roleProfile'>): DelegationPurpose =>
+  agent.roleProfile
+    ? getSpecialistRoleProfile(agent.roleProfile).purpose
+    : agent.role === 'lead' || agent.role === 'reviewer'
+      ? 'review'
+      : 'execution';
+
+const buildDelegateTaskLabel = (purpose: DelegationPurpose | 'general'): string => {
+  switch (purpose) {
+    case 'planning':
+      return 'Define scope and success criteria';
+    case 'research':
+      return 'Collect supporting evidence';
+    case 'review':
+      return 'Review risks and verification gaps';
+    case 'design':
+      return 'Produce the design change set';
+    case 'execution':
+      return 'Implement the requested change';
+    case 'oracle':
+      return 'Produce a second-opinion review';
+    default:
+      return 'Complete the delegated task';
+  }
+};
 
 const formatRiskConcerns = (assessment: ToolRiskAssessment): string => {
   if (assessment.concerns.length === 0) {
@@ -452,7 +500,7 @@ const buildDelegateJobChecklist = (
 ): BackgroundJobChecklistItem[] => {
   const owner = mode ? HARNESS_MODES[mode].label : 'Delegate';
   const items: BackgroundJobChecklistItem[] = [
-    createChecklistItem('execute', `Complete ${purpose} task`, 'in_progress', { owner }),
+    createChecklistItem('execute', buildDelegateTaskLabel(purpose), 'in_progress', { owner }),
   ];
 
   if (verificationMode && verificationMode !== 'none') {
@@ -472,14 +520,12 @@ const buildTeamJobChecklist = (
   ...teamAgents
     .filter((agent) => isRunnableTeamAgent(agent))
     .map((agent) =>
-    createChecklistItem(`agent:${agent.id}`, `Run ${agent.name}`, 'pending', {
-      owner: agent.name,
+    createChecklistItem(`agent:${agent.id}`, agent.taskLabel ?? `Run ${agent.name}`, 'pending', {
+      owner: formatTeamAgentLabel(agent),
+      detail: agent.readOnly ? 'read-only' : null,
     })),
   createChecklistItem('synthesize', `Merge ${strategy} worker output`, 'pending', {
     owner: teamAgents.find((agent) => agent.role === 'lead')?.name ?? 'lead',
-  }),
-  createChecklistItem('review', 'Review merged result', 'pending', {
-    owner: teamAgents.find((agent) => agent.role === 'reviewer')?.name ?? 'reviewer',
   }),
 ];
 
@@ -1907,7 +1953,7 @@ export class NativeBridgeController {
     if (explicitTeam || (purposeCount >= 2 && multiStep)) {
       return {
         kind: 'team',
-        strategy: explicitTeam ? 'delegate' : 'parallel',
+        strategy: explicitTeam || (hasExecution && (hasPlanning || hasResearch || hasReview)) ? 'delegate' : 'parallel',
         reason: explicitTeam ? 'explicit orchestration request' : 'multi-domain request',
       };
     }
@@ -6492,7 +6538,7 @@ export class NativeBridgeController {
     }
     this.resetEphemeralAgentActivities();
 
-    const teamAgents = this.buildTeamAgents();
+    const teamAgents = this.buildTeamAgents(task, strategy);
     if (teamAgents.length < 2) {
       return 'Team run unavailable: need at least one lead and one worker with valid auth.';
     }
@@ -6503,8 +6549,8 @@ export class NativeBridgeController {
         label: formatTeamAgentLabel(agent),
         status: 'queued',
         mode: agent.mode,
-        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
-        detail: `${strategy} · ${agent.role}`,
+        purpose: teamAgentPurpose(agent),
+        detail: `${strategy} · ${formatTeamAgentDetail(agent, agent.roleProfile ?? agent.role)}`,
       });
     }
 
@@ -6621,7 +6667,7 @@ export class NativeBridgeController {
     task: string,
     options: { routeNote?: string; attempt?: number } = {},
   ): Promise<void> {
-    const teamAgents = this.buildTeamAgents();
+    const teamAgents = this.buildTeamAgents(task, strategy);
     if (teamAgents.length < 2) {
       this.appendSystemMessage('Team run unavailable: need at least one lead and one worker with valid auth.');
       return;
@@ -6668,13 +6714,13 @@ export class NativeBridgeController {
         id: `job:${backgroundJobId}:${agent.id}:queued`,
         label: formatTeamAgentLabel(agent),
         mode: agent.mode ?? null,
-        purpose: agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution',
+        purpose: teamAgentPurpose(agent),
         checklistId: `agent:${agent.id}`,
         status: 'queued',
         detail: formatChecklistLinkedDetail(
           checklist,
           `agent:${agent.id}`,
-          `${strategy} · ${agent.role}`,
+          `${strategy} · ${formatTeamAgentDetail(agent, agent.roleProfile ?? agent.role)}`,
         ),
         workspacePath: null,
         updatedAt: Date.now(),
@@ -6702,23 +6748,22 @@ export class NativeBridgeController {
     }
   }
 
-  private buildTeamAgents(): TeamAgentRole[] {
+  private buildTeamAgents(task: string, strategy: 'parallel' | 'sequential' | 'delegate'): TeamAgentRole[] {
     const availableModes = this.getTeamEligibleModes();
     if (availableModes.length === 0) {
       return [];
     }
-
-    const leadMode = availableModes.includes('jennie') ? 'jennie' : availableModes[0];
-    const workerModes = availableModes.filter((mode) => mode !== leadMode);
-    const primaryWorkerMode = workerModes[0] ?? leadMode;
-    const secondaryWorkerMode = workerModes[1] ?? null;
-    const reviewerMode = workerModes[2] ?? secondaryWorkerMode ?? primaryWorkerMode ?? leadMode;
+    const allocation = planWorkAllocation(task, strategy, availableModes);
+    const leadMode =
+      allocation.units.find((unit) => unit.role === 'planner' || unit.role === 'reviewer')?.preferredMode ??
+      (availableModes.includes('jennie') ? 'jennie' : availableModes[0]);
 
     const makeAgent = (
       id: string,
       mode: NamedMode,
       role: 'lead' | 'worker' | 'reviewer',
       systemPrompt: string,
+      options: Partial<TeamAgentRole> = {},
     ): TeamAgentRole => {
       const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
       return {
@@ -6729,6 +6774,7 @@ export class NativeBridgeController {
         provider: modeConfig.provider,
         model: this.selectedModels[mode] ?? modeConfig.model,
         systemPrompt,
+        ...options,
       };
     };
 
@@ -6737,34 +6783,35 @@ export class NativeBridgeController {
         'lead',
         leadMode,
         'lead',
-        'Coordinate a coding team. Break the task down, synthesize worker outputs, and return the best merged answer.',
-      ),
-      makeAgent(
-        'worker_fast',
-        primaryWorkerMode,
-        'worker',
-        'Execute one focused subtask. Be concrete, direct, and implementation-oriented.',
+        buildSpecialistPrompt(
+          'coordinator',
+          'Coordinate specialists, merge their outputs, and return the best merged answer.',
+        ),
+        {
+          roleProfile: 'coordinator',
+          taskLabel: 'Coordinate specialists and synthesize the result',
+          readOnly: true,
+        },
       ),
     ];
 
-    if (secondaryWorkerMode) {
+    let counter = 0;
+    for (const unit of allocation.units) {
+      const mode = unit.preferredMode ?? leadMode;
       agents.push(
         makeAgent(
-          'worker_deep',
-          secondaryWorkerMode,
-          'worker',
-          'Analyze edge cases and architecture risks for the assigned subtask before answering.',
-        ),
-      );
-    }
-
-    if (reviewerMode) {
-      agents.push(
-        makeAgent(
-          'reviewer',
-          reviewerMode,
-          'reviewer',
-          'Review the combined team output, point out risks, and suggest corrections if needed.',
+          `${unit.role}_${counter += 1}`,
+          mode,
+          unit.role === 'reviewer' ? 'reviewer' : 'worker',
+          buildSpecialistPrompt(unit.role, unit.label, unit.successCriteria),
+          {
+            roleProfile: unit.role,
+            taskLabel: unit.label,
+            taskBrief: unit.brief,
+            deliverable: unit.deliverable,
+            successCriteria: unit.successCriteria,
+            readOnly: unit.readOnly,
+          },
         ),
       );
     }
@@ -6784,16 +6831,15 @@ export class NativeBridgeController {
     const queuedActivityId = `team:${runId}:queued:${agent.id}`;
     this.agentActivities = this.agentActivities.filter((activity) => activity.id !== queuedActivityId);
     this.syncAgentActivities();
-      const activityId = `team:${runId}:${round}:${agent.id}`;
-      const purpose: DelegationPurpose =
-        agent.role === 'lead' ? 'review' : agent.role === 'reviewer' ? 'review' : 'execution';
-      this.updateAgentActivity({
-        id: activityId,
-        label: formatTeamAgentLabel(agent),
-        status: 'running',
-        mode: agent.mode,
-        purpose,
-        detail: `round ${round} · ${agent.role}`,
+    const activityId = `team:${runId}:${round}:${agent.id}`;
+    const purpose: DelegationPurpose = teamAgentPurpose(agent);
+    this.updateAgentActivity({
+      id: activityId,
+      label: formatTeamAgentLabel(agent),
+      status: 'running',
+      mode: agent.mode,
+      purpose,
+      detail: formatTeamAgentDetail(agent, `round ${round} · ${agent.roleProfile ?? agent.role}`),
     });
     try {
       const contextSnapshot = await this.buildPromptContextSnapshot(input, purpose);
@@ -6808,6 +6854,8 @@ export class NativeBridgeController {
           purpose,
           preferredMode: agent.mode,
           preferredModel: agent.model,
+          roleProfile: agent.roleProfile ?? null,
+          taskLabel: agent.taskLabel ?? null,
           systemPrompt: agent.systemPrompt,
           maxTokens: this.config ? getMaxTokens(this.config) : undefined,
           parentSessionId: this.state.sessionId,

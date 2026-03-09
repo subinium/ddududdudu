@@ -3,12 +3,20 @@ import { randomUUID } from 'node:crypto';
 import { DEFAULT_ANTHROPIC_BASE_URL, DEFAULT_OPENROUTER_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
 import type { DelegationPurpose } from '../core/delegation.js';
 import type { NamedMode } from '../core/types.js';
+import {
+  buildSpecialistPrompt,
+  formatSpecialistLabel,
+  getSpecialistRoleProfile,
+  resolveModeForSpecialistRole,
+  type SpecialistRole,
+} from '../core/specialist-roles.js';
 import { SubAgentPool } from '../core/sub-agent.js';
 import { HARNESS_MODES } from '../tui/shared/theme.js';
 import type { WorkflowArtifactKind } from '../core/workflow-state.js';
 import type { Tool } from './index.js';
 
 const DELIVERABLE_KINDS: WorkflowArtifactKind[] = ['answer', 'plan', 'review', 'design', 'patch', 'briefing', 'research'];
+const SPECIALIST_ROLES: SpecialistRole[] = ['planner', 'explorer', 'librarian', 'executor', 'designer', 'reviewer', 'oracle'];
 
 const resolveToken = (): string => {
   return process.env.ANTHROPIC_API_KEY ?? process.env.OPENROUTER_API_KEY ?? '';
@@ -39,8 +47,12 @@ const preview = (value: string, maxLength: number = 80): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
-const activityLabel = (mode?: NamedMode, purpose?: DelegationPurpose): string => {
-  const role = (() => {
+const activityLabel = (mode?: NamedMode, purpose?: DelegationPurpose, specialistRole?: SpecialistRole): string => {
+  if (specialistRole) {
+    return formatSpecialistLabel(specialistRole, mode);
+  }
+
+  const purposeRole = (() => {
     switch (purpose) {
       case 'planning':
         return 'planner';
@@ -60,10 +72,10 @@ const activityLabel = (mode?: NamedMode, purpose?: DelegationPurpose): string =>
   })();
 
   if (mode) {
-    return `${HARNESS_MODES[mode]?.label ?? mode} · ${role}`;
+    return `${HARNESS_MODES[mode]?.label ?? mode} · ${purposeRole}`;
   }
 
-  return role.charAt(0).toUpperCase() + role.slice(1);
+  return purposeRole.charAt(0).toUpperCase() + purposeRole.slice(1);
 };
 
 const buildDeliverablePrompt = (
@@ -108,6 +120,11 @@ export const taskTool: Tool = {
       },
       model: { type: 'string', description: 'Model override for the sub-agent.' },
       system_prompt: { type: 'string', description: 'Optional system prompt override for the delegated agent.' },
+      role: {
+        type: 'string',
+        description: 'Optional specialist role profile for the delegated worker.',
+        enum: SPECIALIST_ROLES,
+      },
       deliverable: {
         type: 'string',
         description: 'Requested deliverable kind for the delegated worker.',
@@ -140,6 +157,10 @@ export const taskTool: Tool = {
       typeof args.system_prompt === 'string' && args.system_prompt.trim().length > 0
         ? args.system_prompt
         : undefined;
+    const specialistRole =
+      typeof args.role === 'string' && SPECIALIST_ROLES.includes(args.role as SpecialistRole)
+        ? (args.role as SpecialistRole)
+        : undefined;
     const deliverable =
       typeof args.deliverable === 'string' && DELIVERABLE_KINDS.includes(args.deliverable as WorkflowArtifactKind)
         ? (args.deliverable as WorkflowArtifactKind)
@@ -147,36 +168,50 @@ export const taskTool: Tool = {
     const successCriteria = Array.isArray(args.success_criteria)
       ? args.success_criteria.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
       : [];
-    const delegatedPrompt = buildDeliverablePrompt(args.prompt, deliverable, successCriteria);
+    const roleProfile = specialistRole ? getSpecialistRoleProfile(specialistRole) : null;
+    const resolvedMode =
+      mode ??
+      (specialistRole && ctx.delegation
+        ? resolveModeForSpecialistRole(specialistRole, ctx.delegation.listAvailableModes())
+        : undefined);
+    const effectiveMode = resolvedMode ?? undefined;
+    const effectivePurpose = purpose ?? roleProfile?.purpose;
+    const effectiveDeliverable = deliverable ?? roleProfile?.deliverable;
+    const delegatedPrompt = buildDeliverablePrompt(args.prompt, effectiveDeliverable, successCriteria);
 
     if (ctx.delegation) {
       const activityId = randomUUID();
       ctx.onAgentActivity?.({
         id: activityId,
-        label: activityLabel(mode, purpose),
+        label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
         status: 'running',
-        mode,
-        purpose,
+        mode: effectiveMode,
+        purpose: effectivePurpose,
         detail: preview(args.prompt),
       });
 
       try {
         const contextSnapshot = ctx.contextSnapshot
-          ? await ctx.contextSnapshot(args.prompt, purpose)
+          ? await ctx.contextSnapshot(args.prompt, effectivePurpose)
           : undefined;
-        const artifacts = ctx.artifacts?.(purpose ?? 'general', 4);
+        const artifacts = ctx.artifacts?.(effectivePurpose ?? 'general', 4);
         const result = await ctx.delegation.run(
           {
             prompt: delegatedPrompt,
-            purpose,
-            requestedArtifactKind: deliverable,
+            purpose: effectivePurpose,
+            requestedArtifactKind: effectiveDeliverable,
             successCriteria,
-            preferredMode: mode,
+            roleProfile: specialistRole ?? null,
+            taskLabel: args.prompt,
+            preferredMode: effectiveMode,
             preferredModel: model,
-            systemPrompt,
+            systemPrompt:
+              specialistRole && !systemPrompt
+                ? buildSpecialistPrompt(specialistRole, args.prompt, successCriteria)
+                : systemPrompt,
             parentSessionId: ctx.sessionId,
             cwd: ctx.cwd,
-            isolatedLabel: `task-${purpose ?? mode ?? 'general'}`,
+            isolatedLabel: `task-${specialistRole ?? effectivePurpose ?? effectiveMode ?? 'general'}`,
             contextSnapshot,
             artifacts,
           },
@@ -186,10 +221,10 @@ export const taskTool: Tool = {
               if (text.trim()) {
                 ctx.onAgentActivity?.({
                   id: activityId,
-                  label: activityLabel(mode, purpose),
+                  label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
                   status: 'running',
-                  mode,
-                  purpose,
+                  mode: effectiveMode,
+                  purpose: effectivePurpose,
                   detail: preview(text, 64),
                 });
               }
@@ -197,25 +232,25 @@ export const taskTool: Tool = {
             onVerificationState: (state) => {
               ctx.onAgentActivity?.({
                 id: activityId,
-                label: activityLabel(mode, purpose),
+                label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
                 status:
                   state.status === 'running'
                     ? 'verifying'
                     : state.status === 'passed' || state.status === 'skipped'
                       ? 'done'
                       : 'error',
-                mode,
-                purpose,
+                mode: effectiveMode,
+                purpose: effectivePurpose,
                 detail: state.summary,
               });
-          },
+            },
             signal: ctx.abortSignal,
           },
         );
 
         ctx.onAgentActivity?.({
           id: activityId,
-          label: activityLabel(result.mode, result.purpose),
+          label: activityLabel(result.mode, result.purpose, specialistRole),
           status: 'done',
           mode: result.mode,
           purpose: result.purpose,
@@ -242,7 +277,7 @@ export const taskTool: Tool = {
             remoteSessionId: result.remoteSessionId,
             cwd: result.cwd,
             workspacePath: result.workspace?.path,
-            deliverable,
+            deliverable: effectiveDeliverable,
             successCriteria,
             verification: result.verification,
             usage: result.usage,
@@ -252,10 +287,10 @@ export const taskTool: Tool = {
       } catch (error: unknown) {
         ctx.onAgentActivity?.({
           id: activityId,
-          label: activityLabel(mode, purpose),
+          label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
           status: 'error',
-          mode,
-          purpose,
+          mode: effectiveMode,
+          purpose: effectivePurpose,
           detail: error instanceof Error ? error.message : String(error),
         });
         throw error;
@@ -299,7 +334,7 @@ export const taskTool: Tool = {
         metadata: {
           taskId,
           status: result.status,
-          deliverable,
+          deliverable: effectiveDeliverable,
           successCriteria,
           usage: result.usage,
           durationMs: result.durationMs,
@@ -312,7 +347,7 @@ export const taskTool: Tool = {
       metadata: {
         taskId,
         status: result.status,
-        deliverable,
+        deliverable: effectiveDeliverable,
         successCriteria,
         usage: result.usage,
         durationMs: result.durationMs,

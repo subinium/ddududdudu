@@ -11,6 +11,7 @@ import {
 import { DelegationRuntime, type DelegationCredentials, type DelegationPurpose } from './delegation.js';
 import { SessionManager } from './session.js';
 import { TeamOrchestrator, type AgentRole, type TeamMessage } from './team-agent.js';
+import { formatSpecialistLabel, getSpecialistRoleProfile, type SpecialistRole } from './specialist-roles.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { WorktreeManager } from './worktree-manager.js';
@@ -66,8 +67,28 @@ const previewText = (value: string, maxLength: number = 96): string => {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 };
 
-const formatTeamAgentLabel = (agent: { name: string; role: 'lead' | 'worker' | 'reviewer' }): string =>
-  `${agent.name} · ${agent.role}`;
+const formatTeamAgentLabel = (agent: {
+  name: string;
+  mode?: NamedMode;
+  role: 'lead' | 'worker' | 'reviewer';
+  roleProfile?: SpecialistRole;
+}): string => {
+  if (agent.roleProfile) {
+    return formatSpecialistLabel(agent.roleProfile, agent.mode);
+  }
+
+  return `${agent.name} · ${agent.role}`;
+};
+
+const formatTeamAgentDetail = (agent: AgentRole, fallback: string): string =>
+  agent.taskLabel?.trim() || fallback;
+
+const teamAgentPurpose = (agent: AgentRole): DelegationPurpose =>
+  agent.roleProfile
+    ? getSpecialistRoleProfile(agent.roleProfile).purpose
+    : agent.role === 'lead' || agent.role === 'reviewer'
+      ? 'review'
+      : 'execution';
 
 const artifactKindForPurpose = (purpose?: DelegationPurpose | 'general'): WorkflowArtifactKind => {
   switch (purpose) {
@@ -517,8 +538,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
         maxRounds: 2,
         sharedContext: current.teamSharedContext ?? `cwd=${current.cwd}`,
         runAgent: async (agent, input, round) => {
-          const purpose: DelegationPurpose =
-            agent.role === 'lead' || agent.role === 'reviewer' ? 'review' : 'execution';
+          const purpose: DelegationPurpose = teamAgentPurpose(agent);
 
           queuePersist({
             agentActivities: updateActivity(current.agentActivities, {
@@ -527,15 +547,15 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               mode: agent.mode ?? null,
               purpose,
               checklistId: `agent:${agent.id}`,
-              status: 'running',
-              detail: `round ${round} · ${agent.role}`,
+                status: 'running',
+              detail: formatTeamAgentDetail(agent, `round ${round} · ${agent.roleProfile ?? agent.role}`),
               workspacePath: null,
               updatedAt: Date.now(),
             }),
-            detail: `${agent.name} · round ${round}`,
+            detail: `${formatTeamAgentLabel(agent)} · ${formatTeamAgentDetail(agent, `round ${round}`)}`,
             checklist: updateChecklistItem(current.checklist, `agent:${agent.id}`, {
               status: 'in_progress',
-              detail: `round ${round} · ${agent.role}`,
+              detail: formatTeamAgentDetail(agent, `round ${round} · ${agent.roleProfile ?? agent.role}`),
             }),
           });
 
@@ -545,6 +565,8 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               purpose,
               preferredMode: agent.mode,
               preferredModel: agent.model,
+              roleProfile: agent.roleProfile ?? null,
+              taskLabel: agent.taskLabel ?? null,
               systemPrompt: agent.systemPrompt,
               maxTokens: getMaxTokens(config),
               parentSessionId: current.sessionId,
@@ -725,14 +747,6 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               status: 'completed',
               detail:
                 item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
-              updatedAt: Date.now(),
-            };
-          }
-          if (item.id === 'review') {
-            return {
-              ...item,
-              status: result.success ? 'completed' : 'error',
-              detail: result.success ? 'team output reviewed' : 'team output incomplete',
               updatedAt: Date.now(),
             };
           }
