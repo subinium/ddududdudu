@@ -10,6 +10,7 @@ import {
   repoMapTool,
   symbolSearchTool,
 } from './context-tools.js';
+import { docsLookupTool } from './docs-tool.js';
 import { editFileTool, listDirTool, readFileTool, writeFileTool } from './file-tools.js';
 import { gitDiffTool, gitStatusTool, patchApplyTool } from './git-tools.js';
 import type { Tool, ToolDefinition, ToolParameter } from './index.js';
@@ -18,6 +19,12 @@ import { oracleTool } from './oracle-tool.js';
 import { globTool, grepTool } from './search-tools.js';
 import { taskTool } from './task-tool.js';
 import { updatePlanTool } from './update-plan-tool.js';
+import {
+  buildRunnerTool,
+  lintRunnerTool,
+  testRunnerTool,
+  verifyChangesTool,
+} from './verifier-tools.js';
 import { webFetchTool, webSearchTool } from './web-tool.js';
 
 interface JsonSchema {
@@ -110,8 +117,13 @@ const BUILTIN_TOOLS: Tool[] = [
   changedFilesTool,
   fileImportanceTool,
   codebaseSearchTool,
+  docsLookupTool,
   webSearchTool,
   webFetchTool,
+  lintRunnerTool,
+  testRunnerTool,
+  buildRunnerTool,
+  verifyChangesTool,
   taskTool,
   oracleTool,
   askQuestionTool,

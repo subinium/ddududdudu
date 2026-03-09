@@ -6,6 +6,36 @@ import type { Tool } from './index.js';
 const DEFAULT_TIMEOUT_MS = 120_000;
 const MAX_OUTPUT_BYTES = 100 * 1024;
 
+const classifyCommand = (command: string): string => {
+  const normalized = command.trim();
+  if (/^\s*(npm|pnpm|yarn|bun)\s+(test|run test|run lint|run build)\b/i.test(normalized)) {
+    return 'project-script';
+  }
+  if (/^\s*(git)\b/i.test(normalized)) {
+    return 'git';
+  }
+  if (/^\s*(rg|grep|find)\b/i.test(normalized)) {
+    return 'search';
+  }
+  if (/^\s*(node|python|python3|ruby|go|cargo)\b/i.test(normalized)) {
+    return 'runtime';
+  }
+  return 'shell';
+};
+
+const preview = (value: string, maxLength: number = 160): string => {
+  const normalized = value.replace(/\s+/g, ' ').trim();
+  if (!normalized) {
+    return '';
+  }
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+};
+
 export const bashTool: Tool = {
   definition: {
     name: 'bash',
@@ -125,7 +155,16 @@ export const bashTool: Tool = {
         resolve({
           output,
           isError: exitCode !== 0,
-          metadata: { exitCode, signal, timeout, concerns: risk.concerns },
+          metadata: {
+            exitCode,
+            signal,
+            timeout,
+            concerns: risk.concerns,
+            class: classifyCommand(command),
+            command,
+            summary: preview(output),
+            truncated: wasTruncated,
+          },
         });
       });
     });

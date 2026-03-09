@@ -84,6 +84,10 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `git_diff`     | inspect working tree or staged diffs                |
 | `patch_apply`  | validate or apply unified diff patches              |
 | `bash`         | run shell commands                                  |
+| `lint_runner`  | run lint/typecheck with structured summaries        |
+| `test_runner`  | run tests with structured failure highlights        |
+| `build_runner` | run builds with structured output and summaries     |
+| `verify_changes` | run the harness verification loop over current changes |
 | `grep`         | search file contents                                |
 | `glob`         | match paths by pattern                              |
 | `repo_map`     | render a compact repository tree                    |
@@ -94,6 +98,7 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `changed_files` | list git-changed files for active-context retrieval |
 | `file_importance` | rank likely relevant files for the current request |
 | `codebase_search` | score files and lines against a natural-language query |
+| `docs_lookup`  | search local repo docs, instructions, and knowledge files |
 | `web_search`   | search the web with concise ranked results          |
 | `web_fetch`    | fetch and summarize remote pages                    |
 | `task`         | delegate work to a sub-agent                        |

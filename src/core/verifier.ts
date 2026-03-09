@@ -1,23 +1,24 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
-import { promisify } from 'node:util';
 
 import { ChecksRunner } from './checks.js';
 import { GitCheckpoint } from './git-checkpoint.js';
-
-const execFileAsync = promisify(execFile);
+import { readPackageScripts, runStructuredVerifierCommand } from './structured-runners.js';
 
 export type VerificationMode = 'none' | 'checks' | 'full';
 export type VerificationStatus = 'passed' | 'failed' | 'skipped';
 
 export interface VerificationCommandResult {
+  kind: 'lint' | 'test' | 'build' | 'script';
   command: string;
   ok: boolean;
   exitCode: number | null;
   output: string;
+  summary?: string;
+  highlights?: string[];
+  truncated?: boolean;
 }
 
 export interface VerificationSummary {
@@ -28,10 +29,6 @@ export interface VerificationSummary {
   summary: string;
   report: string;
   commands: VerificationCommandResult[];
-}
-
-interface PackageJsonLike {
-  scripts?: Record<string, unknown>;
 }
 
 const FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
@@ -77,49 +74,19 @@ const countFailedChecks = (report: Awaited<ReturnType<ChecksRunner['runAllChecks
   return report.checks.filter((check) => !check.passed).length;
 };
 
-const readPackageScripts = async (cwd: string): Promise<string[]> => {
-  const packageJsonPath = resolve(cwd, 'package.json');
-  if (!(await exists(packageJsonPath))) {
-    return [];
-  }
-
-  try {
-    const raw = await readFile(packageJsonPath, 'utf8');
-    const parsed = JSON.parse(raw) as PackageJsonLike;
-    const scripts = parsed.scripts ?? {};
-
-    return COMMAND_PRIORITIES.filter((name) => typeof scripts[name] === 'string' && scripts[name]?.trim());
-  } catch {
-    return [];
-  }
-};
-
-const runScript = async (cwd: string, script: string): Promise<VerificationCommandResult> => {
-  try {
-    const result = await execFileAsync('npm', ['run', '--silent', script], {
-      cwd,
-      encoding: 'utf8',
-      timeout: 120_000,
-      maxBuffer: 8 * 1024 * 1024,
-    });
-    const output = [result.stdout, result.stderr].filter(Boolean).join('\n');
-    return {
-      command: `npm run --silent ${script}`,
-      ok: true,
-      exitCode: 0,
-      output: preview(output || `${script} passed`),
-    };
-  } catch (error: unknown) {
-    const err = error as { stdout?: string; stderr?: string; code?: number | null; message?: string };
-    const output = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n');
-    return {
-      command: `npm run --silent ${script}`,
-      ok: false,
-      exitCode: typeof err.code === 'number' ? err.code : null,
-      output: preview(output || `${script} failed`),
-    };
-  }
-};
+const toVerificationCommandResult = (
+  kind: 'lint' | 'test' | 'build' | 'script',
+  result: Awaited<ReturnType<typeof runStructuredVerifierCommand>>,
+): VerificationCommandResult => ({
+  kind,
+  command: result.command,
+  ok: result.ok,
+  exitCode: result.exitCode,
+  output: preview(result.output || result.summary),
+  summary: result.summary,
+  highlights: result.highlights,
+  truncated: result.truncated,
+});
 
 export class VerificationRunner {
   private readonly cwd: string;
@@ -163,9 +130,19 @@ export class VerificationRunner {
     const commands: VerificationCommandResult[] = [];
 
     if (mode === 'full') {
-      const scriptNames = (await readPackageScripts(this.cwd)).slice(0, 3);
-      for (const script of scriptNames) {
-        commands.push(await runScript(this.cwd, script));
+      const scripts = await readPackageScripts(this.cwd);
+      const selected = COMMAND_PRIORITIES.filter((name) => typeof scripts[name] === 'string').slice(0, 3);
+      for (const script of selected) {
+        const kind = script === 'test' ? 'test' : script === 'build' ? 'build' : 'lint';
+        commands.push(
+          toVerificationCommandResult(
+            kind,
+            await runStructuredVerifierCommand(this.cwd, {
+              kind,
+              script,
+            }),
+          ),
+        );
       }
     }
 
@@ -205,8 +182,16 @@ export class VerificationRunner {
       reportLines.push('', '## Commands');
       for (const command of commands) {
         reportLines.push(
-          `- ${command.ok ? 'pass' : 'fail'} · ${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`,
+          `- ${command.ok ? 'pass' : 'fail'} · ${command.kind} · ${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`,
         );
+        if (command.summary) {
+          reportLines.push(`  summary: ${command.summary}`);
+        }
+        if (command.highlights && command.highlights.length > 0) {
+          for (const highlight of command.highlights.slice(0, 3)) {
+            reportLines.push(`  highlight: ${highlight}`);
+          }
+        }
         if (command.output) {
           reportLines.push(`  ${command.output}`);
         }

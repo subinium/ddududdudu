@@ -17,6 +17,7 @@ export interface BackgroundJobAgentActivity {
   label: string;
   mode: NamedMode | null;
   purpose: string | null;
+  checklistId?: string | null;
   status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
   detail: string | null;
   workspacePath: string | null;
@@ -122,6 +123,7 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
           label: typeof item.label === 'string' ? item.label : 'agent',
           mode: isNamedMode(item.mode) ? item.mode : null,
           purpose: typeof item.purpose === 'string' ? item.purpose : null,
+          checklistId: typeof item.checklistId === 'string' ? item.checklistId : null,
           status: isAgentStatus(item.status) ? item.status : 'running',
           detail: typeof item.detail === 'string' ? item.detail : null,
           workspacePath: typeof item.workspacePath === 'string' ? item.workspacePath : null,

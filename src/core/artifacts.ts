@@ -74,6 +74,10 @@ const buildVerificationPayload = (
         .map((command) => `${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`),
       4,
     ),
+    highlights: cleanItems(
+      verification.commands.flatMap((command) => command.highlights ?? []),
+      6,
+    ),
   };
 };
 
@@ -193,6 +197,9 @@ const payloadLines = (payload: WorkflowArtifactPayload | undefined): string[] =>
     }
     if (payload.verification.commands?.length) {
       lines.push(...payload.verification.commands.map((command) => `verification_command: ${command}`));
+    }
+    if (payload.verification.highlights?.length) {
+      lines.push(...payload.verification.highlights.map((item) => `verification_highlight: ${item}`));
     }
   }
   if (payload.workspaceApply) {

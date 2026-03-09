@@ -22,6 +22,7 @@ export interface WorkflowArtifactPayload {
     summary: string;
     changedFiles?: string[];
     commands?: string[];
+    highlights?: string[];
   };
   workspaceApply?: {
     applied: boolean;

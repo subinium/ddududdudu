@@ -101,17 +101,31 @@ export const analyzeToolRisk = (
     name === 'grep' ||
     name === 'glob' ||
     name === 'web_fetch' ||
+    name === 'web_search' ||
+    name === 'docs_lookup' ||
     name === 'repo_map' ||
     name === 'symbol_search' ||
     name === 'definition_search' ||
     name === 'reference_search' ||
     name === 'reference_hotspots' ||
     name === 'changed_files' ||
+    name === 'file_importance' ||
     name === 'codebase_search' ||
+    name === 'git_status' ||
+    name === 'git_diff' ||
     name === 'ask_question' ||
-    name === 'oracle'
+    name === 'oracle' ||
+    name === 'lint_runner' ||
+    name === 'test_runner' ||
+    name === 'build_runner' ||
+    name === 'verify_changes'
   ) {
     return { level: 'read', concerns: [] };
+  }
+
+  if (name === 'patch_apply') {
+    const checkOnly = input.check === true;
+    return { level: checkOnly ? 'read' : 'write', concerns: [] };
   }
 
   if (name === 'memory') {

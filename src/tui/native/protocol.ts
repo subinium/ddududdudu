@@ -79,6 +79,7 @@ export interface NativeAgentActivityState {
   label: string;
   mode: NamedMode | null;
   purpose: string | null;
+  checklistId?: string | null;
   status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
   detail: string | null;
   workspacePath: string | null;

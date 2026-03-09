@@ -4764,6 +4764,7 @@ export class NativeBridgeController {
     assistantOutput: string;
     verification: VerificationSummary;
   }): string {
+    const verificationCommandSummary = this.formatVerificationCommandSummary(input.verification);
     return [
       `A ${input.purpose} run produced verification failures.`,
       '',
@@ -4775,6 +4776,9 @@ export class NativeBridgeController {
       '',
       'Verification summary:',
       input.verification.summary,
+      verificationCommandSummary
+        ? `\nStructured command failures:\n${verificationCommandSummary}`
+        : '',
       '',
       'Verification report:',
       input.verification.report,
@@ -4792,6 +4796,7 @@ export class NativeBridgeController {
     assistantOutput: string;
     verification: VerificationSummary;
   }): string {
+    const verificationCommandSummary = this.formatVerificationCommandSummary(input.verification);
     return [
       `A previous ${input.purpose} attempt failed verification.`,
       '',
@@ -4806,6 +4811,9 @@ export class NativeBridgeController {
       '',
       'Verification summary:',
       input.verification.summary,
+      verificationCommandSummary
+        ? `\nStructured command failures:\n${verificationCommandSummary}`
+        : '',
       '',
       'Verification report:',
       input.verification.report,
@@ -4823,6 +4831,7 @@ export class NativeBridgeController {
     assistantOutput: string;
     verification: VerificationSummary;
   }): string {
+    const verificationCommandSummary = this.formatVerificationCommandSummary(input.verification);
     return [
       `Escalate this failing ${input.purpose} request as a coordinated team repair.`,
       '',
@@ -4834,6 +4843,9 @@ export class NativeBridgeController {
       '',
       'Verification summary:',
       input.verification.summary,
+      verificationCommandSummary
+        ? `\nStructured command failures:\n${verificationCommandSummary}`
+        : '',
       '',
       'Verification report:',
       input.verification.report,
@@ -4859,6 +4871,27 @@ export class NativeBridgeController {
     }
 
     return this.getTeamEligibleModes().includes('lisa') ? 'lisa' : this.currentMode;
+  }
+
+  private formatVerificationCommandSummary(verification: VerificationSummary): string | null {
+    const failedCommands = verification.commands.filter((command) => !command.ok);
+    if (failedCommands.length === 0) {
+      return null;
+    }
+
+    return failedCommands
+      .slice(0, 3)
+      .map((command) => {
+        const parts = [
+          `${command.kind}: ${command.command}${command.exitCode === null ? '' : ` (exit ${command.exitCode})`}`,
+          command.summary ? `summary: ${command.summary}` : null,
+          command.highlights && command.highlights.length > 0
+            ? `highlights: ${command.highlights.slice(0, 2).join(' | ')}`
+            : null,
+        ].filter((part): part is string => Boolean(part));
+        return `- ${parts.join(' · ')}`;
+      })
+      .join('\n');
   }
 
   private async maybeScheduleVerificationFollowup(input: {
