@@ -59,7 +59,7 @@ const preview = (value: string, maxLength: number = 80): string => {
 };
 
 const oracleActivityLabel = (mode?: NamedMode): string =>
-  mode ? (HARNESS_MODES[mode]?.label ?? mode) : 'Oracle';
+  mode ? `${HARNESS_MODES[mode]?.label ?? mode} · oracle` : 'Oracle';
 
 const buildDeliverableQuestion = (
   question: string,

@@ -40,26 +40,30 @@ const preview = (value: string, maxLength: number = 80): string => {
 };
 
 const activityLabel = (mode?: NamedMode, purpose?: DelegationPurpose): string => {
+  const role = (() => {
+    switch (purpose) {
+      case 'planning':
+        return 'planner';
+      case 'research':
+        return 'research';
+      case 'review':
+        return 'review';
+      case 'design':
+        return 'design';
+      case 'execution':
+        return 'executor';
+      case 'oracle':
+        return 'oracle';
+      default:
+        return 'delegate';
+    }
+  })();
+
   if (mode) {
-    return HARNESS_MODES[mode]?.label ?? mode;
+    return `${HARNESS_MODES[mode]?.label ?? mode} · ${role}`;
   }
 
-  switch (purpose) {
-    case 'planning':
-      return 'Planner';
-    case 'research':
-      return 'Research';
-    case 'review':
-      return 'Reviewer';
-    case 'design':
-      return 'Design';
-    case 'execution':
-      return 'Worker';
-    case 'oracle':
-      return 'Oracle';
-    default:
-      return 'Delegate';
-  }
+  return role.charAt(0).toUpperCase() + role.slice(1);
 };
 
 const buildDeliverablePrompt = (
