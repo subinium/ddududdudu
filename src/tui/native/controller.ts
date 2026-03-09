@@ -2246,17 +2246,10 @@ export class NativeBridgeController {
     decision: AutoRouteDecision,
   ): Promise<void> {
     const backgroundJobId = randomUUID();
-    const routeNotice = `${this.formatAutoRouteNotice(decision)} · background`;
     const label = decision.preferredMode
       ? `${HARNESS_MODES[decision.preferredMode].label} · ${decision.purpose ?? 'general'}`
       : `delegate · ${decision.purpose ?? 'general'}`;
 
-    this.state.messages.push({
-      id: randomUUID(),
-      role: 'system',
-      content: routeNotice,
-      timestamp: Date.now(),
-    });
     if (!this.backgroundJobStore) {
       this.appendSystemMessage('[jobs] Background worker unavailable.');
       return;
@@ -2343,13 +2336,6 @@ export class NativeBridgeController {
       timestamp: Date.now(),
       isStreaming: true,
     };
-    const routeNotice = this.formatAutoRouteNotice(decision);
-    this.state.messages.push({
-      id: randomUUID(),
-      role: 'system',
-      content: routeNotice,
-      timestamp: Date.now(),
-    });
     this.state.messages.push(assistantMessage);
     this.state.loading = true;
     this.state.loadingLabel = `route · ${decision.purpose ?? 'general'}`;
@@ -6767,15 +6753,6 @@ export class NativeBridgeController {
     }
 
     const assistantMessageId = randomUUID();
-    const notice = options.routeNote
-      ? `${options.routeNote} · ${previewText(task, 96)}`
-      : `Team run started · ${strategy} · ${previewText(task, 96)}`;
-    this.state.messages.push({
-      id: randomUUID(),
-      role: 'system',
-      content: notice,
-      timestamp: Date.now(),
-    });
     this.state.messages.push({
       id: assistantMessageId,
       role: 'assistant',
@@ -6892,15 +6869,6 @@ export class NativeBridgeController {
     }
 
     const backgroundJobId = randomUUID();
-    const notice = options.routeNote
-      ? `${options.routeNote} · ${previewText(task, 96)}`
-      : `Team run background · ${strategy} · ${previewText(task, 96)}`;
-    this.state.messages.push({
-      id: randomUUID(),
-      role: 'system',
-      content: notice,
-      timestamp: Date.now(),
-    });
     const contextSnapshot = await this.buildPromptContextSnapshot(task, 'planning');
     const planArtifact = this.rememberTeamPlanArtifact(strategy, task, teamPlan.allocation);
     const artifacts = [planArtifact, ...this.getArtifactsForPurpose('planning', 4).filter((item) => item.id !== planArtifact.id)];
