@@ -44,9 +44,22 @@ import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
-import { analyzeToolRisk, shouldPromptForRisk, type ToolRiskAssessment } from '../../core/trust.js';
+import {
+  analyzeToolRisk,
+  analyzeTrustBoundary,
+  shouldPromptForRisk,
+  type ToolRiskAssessment,
+} from '../../core/trust.js';
 import { getDduduPaths } from '../../core/dirs.js';
-import type { DduduConfig, LoadedSession, NamedMode, SessionEntry, SessionListItem, ToolPolicy } from '../../core/types.js';
+import type {
+  DduduConfig,
+  LoadedSession,
+  NamedMode,
+  SessionEntry,
+  SessionListItem,
+  ToolPolicy,
+  TrustTier,
+} from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
 import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
 import type {
@@ -305,6 +318,10 @@ const normalizePermissionProfile = (value: unknown): PermissionProfile => {
 
 const isToolPolicy = (value: unknown): value is ToolPolicy => {
   return value === 'inherit' || value === 'allow' || value === 'ask' || value === 'deny';
+};
+
+const isTrustTier = (value: unknown): value is TrustTier => {
+  return value === 'trusted' || value === 'ask' || value === 'deny';
 };
 
 const toCompactionMessages = (messages: NativeMessageState[]): CompactionMessage[] => {
@@ -2271,12 +2288,96 @@ export class NativeBridgeController {
     this.scheduleStatePush();
   }
 
+  private async setStringListConfigValue(
+    keyPath: string,
+    nextValues: string[],
+  ): Promise<void> {
+    await setDduduConfigValue(process.cwd(), keyPath, nextValues);
+    this.config = await loadConfig();
+    this.scheduleStatePush();
+  }
+
+  private async addStringListConfigValue(
+    keyPath: string,
+    rawValue: string,
+  ): Promise<void> {
+    const value = rawValue.trim();
+    if (!value) {
+      return;
+    }
+
+    const current = keyPath === 'tools.network.allowed_hosts'
+      ? this.config?.tools.network.allowed_hosts ?? []
+      : keyPath === 'tools.network.denied_hosts'
+        ? this.config?.tools.network.denied_hosts ?? []
+        : keyPath === 'tools.secrets.protected_paths'
+          ? this.config?.tools.secrets.protected_paths ?? []
+          : this.config?.tools.secrets.protected_env ?? [];
+
+    if (current.includes(value)) {
+      return;
+    }
+
+    await this.setStringListConfigValue(keyPath, [...current, value]);
+  }
+
+  private async removeStringListConfigValue(
+    keyPath: string,
+    rawValue: string,
+  ): Promise<void> {
+    const value = rawValue.trim();
+    const current = keyPath === 'tools.network.allowed_hosts'
+      ? this.config?.tools.network.allowed_hosts ?? []
+      : keyPath === 'tools.network.denied_hosts'
+        ? this.config?.tools.network.denied_hosts ?? []
+        : keyPath === 'tools.secrets.protected_paths'
+          ? this.config?.tools.secrets.protected_paths ?? []
+          : this.config?.tools.secrets.protected_env ?? [];
+
+    await this.setStringListConfigValue(
+      keyPath,
+      current.filter((entry) => entry !== value),
+    );
+  }
+
+  private async setMcpServerTrust(name: string, trust: TrustTier): Promise<void> {
+    await setDduduConfigValue(process.cwd(), `mcp.servers.${name}.trust`, trust);
+    await this.reloadMcpRuntime();
+  }
+
   private async authorizeToolExecution(
     block: ToolUseBlock,
     toolContext: ToolContext,
   ): Promise<{ allowed: boolean; reason?: string }> {
     const input = typeof block.input === 'object' && block.input !== null ? block.input as Record<string, unknown> : {};
-    const risk = this.classifyToolRisk(block.name, input);
+    const toolsConfig = this.config?.tools ?? {
+      permission: 'auto',
+      toolbox_dirs: [],
+      policies: {},
+      network: {
+        allowed_hosts: [],
+        denied_hosts: [],
+        ask_on_new_host: false,
+      },
+      secrets: {
+        protected_paths: [],
+        protected_env: [],
+      },
+    };
+    const mcpConfig = this.config?.mcp ?? { servers: {} };
+    const baseRisk = this.classifyToolRisk(block.name, input);
+    const trustBoundary = analyzeTrustBoundary(
+      process.cwd(),
+      block.name,
+      input,
+      toolsConfig,
+      mcpConfig,
+    );
+    const risk: ToolRiskAssessment = {
+      level: baseRisk.level,
+      concerns: Array.from(new Set([...baseRisk.concerns, ...trustBoundary.concerns])),
+      hardBlockReason: baseRisk.hardBlockReason ?? trustBoundary.hardBlockReason,
+    };
     const policy = this.getConfiguredToolPolicy(block.name);
 
     if (risk.hardBlockReason) {
@@ -2287,26 +2388,43 @@ export class NativeBridgeController {
       return { allowed: false, reason: `Blocked ${block.name}: tool policy is deny.` };
     }
 
-    if (this.permissionProfile === 'permissionless' && policy !== 'ask') {
-      return { allowed: true };
-    }
-
     if (this.permissionProfile === 'plan') {
       if (risk.level === 'read') {
-        return { allowed: true };
+        if (!trustBoundary.requiresApproval && policy !== 'ask') {
+          return { allowed: true };
+        }
+      } else {
+        return { allowed: false, reason: `Blocked ${block.name}: current permission profile is plan (read-only).` };
       }
-      return { allowed: false, reason: `Blocked ${block.name}: current permission profile is plan (read-only).` };
     }
 
-    if (policy === 'allow') {
+    if (policy === 'allow' && !trustBoundary.requiresApproval) {
       return { allowed: true };
     }
 
-    if (policy === 'ask') {
+    const needsApproval =
+      policy === 'ask'
+      || trustBoundary.requiresApproval
+      || shouldPromptForRisk(this.permissionProfile, risk);
+
+    if (this.permissionProfile === 'permissionless' && !needsApproval) {
+      return { allowed: true };
+    }
+
+    if (this.permissionProfile === 'ask' && risk.level === 'read' && !needsApproval) {
+      return { allowed: true };
+    }
+
+    if (!needsApproval) {
+      return { allowed: true };
+    }
+
+    if (policy === 'ask' || trustBoundary.requiresApproval || shouldPromptForRisk(this.permissionProfile, risk)) {
       const summary = summarizeToolInput(block.name, input);
+      const detail = trustBoundary.detail ? ` · ${trustBoundary.detail}` : '';
       const answer = toolContext.askUser
         ? await toolContext.askUser(
-          `Allow ${summary}? (${formatRiskConcerns(risk)})`,
+          `Allow ${summary}? (${formatRiskConcerns(risk)}${detail})`,
           ['Allow once', `Deny (${this.permissionProfile})`],
         )
         : 'Deny';
@@ -2317,25 +2435,8 @@ export class NativeBridgeController {
       };
     }
 
-    if (this.permissionProfile === 'ask' && risk.level === 'read') {
-      return { allowed: true };
-    }
-
-    if (!shouldPromptForRisk(this.permissionProfile, risk)) {
-      return { allowed: true };
-    }
-
-    const summary = summarizeToolInput(block.name, input);
-    const answer = toolContext.askUser
-      ? await toolContext.askUser(
-        `Allow ${summary}? (${formatRiskConcerns(risk)})`,
-        ['Allow once', `Deny (${this.permissionProfile})`],
-      )
-      : 'Deny';
-
     return {
-      allowed: answer.toLowerCase().includes('allow'),
-      reason: `Denied ${block.name}: approval was not granted.`,
+      allowed: true,
     };
   }
 
@@ -3120,7 +3221,8 @@ export class NativeBridgeController {
 
     const manager = new McpManager();
     for (const [name, config] of entries) {
-      manager.addServer(name, config as McpServerConfig);
+      const { trust: _trust, ...serverConfig } = config;
+      manager.addServer(name, serverConfig as McpServerConfig);
     }
 
     await manager.connectAll();
@@ -5045,6 +5147,29 @@ export class NativeBridgeController {
     ].join('\n');
   }
 
+  private formatNetworkTrustSummary(): string {
+    const network = this.config?.tools.network;
+    const allowed = network?.allowed_hosts ?? [];
+    const denied = network?.denied_hosts ?? [];
+    return [
+      'Network trust',
+      `ask on new host: ${network?.ask_on_new_host ? 'on' : 'off'}`,
+      `allowed: ${allowed.length > 0 ? allowed.join(', ') : 'none'}`,
+      `denied: ${denied.length > 0 ? denied.join(', ') : 'none'}`,
+    ].join('\n');
+  }
+
+  private formatSecretTrustSummary(): string {
+    const secrets = this.config?.tools.secrets;
+    const paths = secrets?.protected_paths ?? [];
+    const env = secrets?.protected_env ?? [];
+    return [
+      'Secret trust',
+      `protected paths: ${paths.length > 0 ? paths.join(', ') : 'none'}`,
+      `protected env: ${env.length > 0 ? env.join(', ') : 'none'}`,
+    ].join('\n');
+  }
+
   private async runPermissionsCommand(args: string[]): Promise<string> {
     const requested = args[0]?.trim().toLowerCase();
     if (!requested) {
@@ -5057,12 +5182,126 @@ export class NativeBridgeController {
         '- workspace-write · auto-allow local edits, prompt for network/secrets/delegation',
         '- permissionless · allow all except hard-blocked shell patterns',
         '',
+        'commands:',
+        '- /permissions tool <tool|prefix*> <inherit|allow|ask|deny>',
+        '- /permissions network ...',
+        '- /permissions secrets ...',
+        '',
         this.formatToolPolicySummary(),
+        '',
+        this.formatNetworkTrustSummary(),
+        '',
+        this.formatSecretTrustSummary(),
       ].join('\n');
     }
 
     if (requested === 'tools') {
       return this.formatToolPolicySummary();
+    }
+
+    if (requested === 'network') {
+      const action = args[1]?.trim().toLowerCase() ?? '';
+      const value = args[2]?.trim() ?? '';
+      if (!action || action === 'status') {
+        return this.formatNetworkTrustSummary();
+      }
+      if (action === 'allow') {
+        if (!value) {
+          return 'Usage: /permissions network allow <host>';
+        }
+        await this.addStringListConfigValue('tools.network.allowed_hosts', value);
+        return this.formatNetworkTrustSummary();
+      }
+      if (action === 'deny') {
+        if (!value) {
+          return 'Usage: /permissions network deny <host>';
+        }
+        await this.addStringListConfigValue('tools.network.denied_hosts', value);
+        return this.formatNetworkTrustSummary();
+      }
+      if (action === 'remove') {
+        const target = args[2]?.trim().toLowerCase();
+        const entry = args[3]?.trim() ?? '';
+        if (target === 'allow') {
+          if (!entry) {
+            return 'Usage: /permissions network remove allow <host>';
+          }
+          await this.removeStringListConfigValue('tools.network.allowed_hosts', entry);
+          return this.formatNetworkTrustSummary();
+        }
+        if (target === 'deny') {
+          if (!entry) {
+            return 'Usage: /permissions network remove deny <host>';
+          }
+          await this.removeStringListConfigValue('tools.network.denied_hosts', entry);
+          return this.formatNetworkTrustSummary();
+        }
+        return 'Usage: /permissions network remove <allow|deny> <host>';
+      }
+      if (action === 'clear') {
+        await this.setStringListConfigValue('tools.network.allowed_hosts', []);
+        await this.setStringListConfigValue('tools.network.denied_hosts', []);
+        return this.formatNetworkTrustSummary();
+      }
+      if (action === 'ask-on-new-host') {
+        const enabled = value.toLowerCase();
+        if (!['on', 'off', 'true', 'false'].includes(enabled)) {
+          return 'Usage: /permissions network ask-on-new-host <on|off>';
+        }
+        await setDduduConfigValue(
+          process.cwd(),
+          'tools.network.ask_on_new_host',
+          enabled === 'on' || enabled === 'true',
+        );
+        this.config = await loadConfig();
+        this.scheduleStatePush();
+        return this.formatNetworkTrustSummary();
+      }
+      return 'Usage: /permissions network [status|allow <host>|deny <host>|remove <allow|deny> <host>|clear|ask-on-new-host <on|off>]';
+    }
+
+    if (requested === 'secrets') {
+      const action = args[1]?.trim().toLowerCase() ?? '';
+      const target = args[2]?.trim().toLowerCase() ?? '';
+      const value = args[3]?.trim() ?? '';
+      if (!action || action === 'status') {
+        return this.formatSecretTrustSummary();
+      }
+      if (action === 'add') {
+        if (target === 'path') {
+          if (!value) {
+            return 'Usage: /permissions secrets add path <pattern>';
+          }
+          await this.addStringListConfigValue('tools.secrets.protected_paths', value);
+          return this.formatSecretTrustSummary();
+        }
+        if (target === 'env') {
+          if (!value) {
+            return 'Usage: /permissions secrets add env <NAME>';
+          }
+          await this.addStringListConfigValue('tools.secrets.protected_env', value);
+          return this.formatSecretTrustSummary();
+        }
+        return 'Usage: /permissions secrets add <path|env> <value>';
+      }
+      if (action === 'remove') {
+        if (target === 'path') {
+          if (!value) {
+            return 'Usage: /permissions secrets remove path <pattern>';
+          }
+          await this.removeStringListConfigValue('tools.secrets.protected_paths', value);
+          return this.formatSecretTrustSummary();
+        }
+        if (target === 'env') {
+          if (!value) {
+            return 'Usage: /permissions secrets remove env <NAME>';
+          }
+          await this.removeStringListConfigValue('tools.secrets.protected_env', value);
+          return this.formatSecretTrustSummary();
+        }
+        return 'Usage: /permissions secrets remove <path|env> <value>';
+      }
+      return 'Usage: /permissions secrets [status|add <path|env> <value>|remove <path|env> <value>]';
     }
 
     if (requested === 'tool') {
@@ -5810,7 +6049,8 @@ export class NativeBridgeController {
       `tools: ${toolCount}`,
       ...entries.map(([name, config]) => {
         const enabled = config.enabled === false ? 'disabled' : connected.has(name) ? 'connected' : 'disconnected';
-        return `${name} · ${config.command} · ${enabled}`;
+        const trust = isTrustTier(config.trust) ? config.trust : 'trusted';
+        return `${name} · ${config.command} · ${enabled} · trust=${trust}`;
       }),
     ].join('\n');
   }
@@ -5879,7 +6119,20 @@ export class NativeBridgeController {
       return `Removed MCP server ${name}.\n\n${this.formatMcpSummary()}`;
     }
 
-    return 'Usage: /mcp [status|list|path|reload|add <name> <command> [args...]|enable <name>|disable <name>|remove <name>]';
+    if (command === 'trust') {
+      const name = args[1]?.trim();
+      const trust = args[2]?.trim().toLowerCase();
+      if (!name || !trust || !isTrustTier(trust)) {
+        return 'Usage: /mcp trust <name> <trusted|ask|deny>';
+      }
+      if (!this.config?.mcp.servers[name]) {
+        return `Unknown MCP server: ${name}`;
+      }
+      await this.setMcpServerTrust(name, trust);
+      return `Updated MCP trust for ${name} -> ${trust}.\n\n${this.formatMcpSummary()}`;
+    }
+
+    return 'Usage: /mcp [status|list|path|reload|add <name> <command> [args...]|enable <name>|disable <name>|remove <name>|trust <name> <trusted|ask|deny>]';
   }
 
   private async runHookCommand(args: string[]): Promise<string> {

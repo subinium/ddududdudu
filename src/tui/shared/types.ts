@@ -11,7 +11,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/model', description: 'Change model within current provider', value: '/model' },
   { label: '/plan', description: 'Show current execution plan', value: '/plan' },
   { label: '/todo', description: 'Manage plan items', value: '/todo' },
-  { label: '/permissions', description: 'Set permission profile or per-tool policy', value: '/permissions' },
+  { label: '/permissions', description: 'Set permission profile, tool policy, network, or secret trust', value: '/permissions' },
   { label: '/memory', description: 'Read, write, append, or clear scoped memory', value: '/memory' },
   { label: '/session', description: 'Inspect or resume saved sessions', value: '/session' },
   { label: '/config', description: 'Show current configuration', value: '/config' },
@@ -34,6 +34,6 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/init', description: 'Initialize project config', value: '/init' },
   { label: '/skill', description: 'List loaded skills', value: '/skill' },
   { label: '/hook', description: 'Inspect or reload file-based hooks', value: '/hook' },
-  { label: '/mcp', description: 'Inspect, add, enable, disable, or reload MCP servers', value: '/mcp' },
+  { label: '/mcp', description: 'Inspect, add, trust, enable, disable, or reload MCP servers', value: '/mcp' },
   { label: '/team', description: 'Team agent management', value: '/team' },
 ];

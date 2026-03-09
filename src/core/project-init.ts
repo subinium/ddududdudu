@@ -49,11 +49,31 @@ openclaw:
 tools:
   permission: auto
   policies: {}
+  network:
+    allowed_hosts: []
+    denied_hosts: []
+    ask_on_new_host: false
+  secrets:
+    protected_paths:
+      - .env
+      - .env.*
+      - ~/.ssh
+      - ~/.aws
+      - ~/.ddudu/auth.yaml
+    protected_env:
+      - OPENAI_API_KEY
+      - ANTHROPIC_API_KEY
+      - GEMINI_API_KEY
 # Example:
 # tools:
 #   policies:
 #     bash: ask
 #     mcp__*: deny
+#   network:
+#     allowed_hosts:
+#       - docs.anthropic.com
+#       - platform.openai.com
+#     ask_on_new_host: true
 mcp:
   servers: {}
 # Example:
@@ -65,6 +85,7 @@ mcp:
 #         - -y
 #         - "@modelcontextprotocol/server-memory"
 #       enabled: true
+#       trust: ask
 `;
 
 export const buildProjectInstructionsTemplate = (

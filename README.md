@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <em>AI coding harness</em>
+  <em>AI coding harness / BL4CKP1NK 1N Y0UR AREA</em>
 </p>
 
 ---
@@ -27,35 +27,27 @@
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 
-## Harness Anatomy
+## Design Notes
 
-Across Claude Code, Codex, OpenCode, Cursor, Windsurf, Devin, and related systems, a harness tends to converge on the same shape: not a prompt wrapper, but a small operating layer around a model.
+ddudu treats a coding harness as a small operating layer around provider runtimes rather than as a prompt wrapper.
 
-### Core Layers
+The core system is organized around:
 
-| Layer | What it owns |
-| ----- | ------------ |
-| `execution kernel` | provider runtime, permissions, tool execution, model sessions |
-| `context engine` | retrieval, compaction, handoff, memory loading, context budgeting |
-| `session/state layer` | canonical transcript, plans, checkpoints, queued work, background jobs |
-| `orchestration layer` | routing, delegation, subagents, verification, recovery |
-| `operator surface` | the interface for inspecting progress, context, jobs, and decisions |
+- an execution kernel for provider runtimes, tools, and permissions
+- a context engine for retrieval, compaction, memory selection, and handoff
+- a session/state layer for canonical transcripts, artifacts, jobs, and checkpoints
+- an orchestration layer for routing, delegation, verification, and recovery
+- an operator surface for making progress, ownership, and risk legible
 
-### Supporting Utilities
+The deeper technical notes live in [`docs/`](./docs/):
 
-| Utility | Why it matters |
-| ------- | -------------- |
-| `rules and prompts` | shape behavior with project instructions, role constraints, and request scaffolding |
-| `tools and MCP` | connect the model to the repo, shell, web, and external systems |
-| `git and worktrees` | isolate risky edits, parallelize tasks, and make undo/review cheap |
-| `memory and skills` | persist working, episodic, semantic, and procedural knowledge |
-| `hooks and briefings` | keep context fresh and compress long sessions into stable signals |
-| `verifiers` | close the loop with lint, test, review, repair, and apply flows |
-| `background workers` | keep delegated jobs running without blocking the foreground session |
-
-ddudu is built around that model: one harness owning state, context, and orchestration, with provider runtimes acting as workers underneath it.
-
-A practical harness is less about adding more prompt text and more about balancing a few infrastructure concerns well: context quality, session continuity, isolated delegation, verification, trust boundaries, and extensibility through tools, hooks, skills, and MCP.
+- [Design Principles](./docs/design-principles.md)
+- [Harness Anatomy](./docs/harness-anatomy.md)
+- [Context Engine](./docs/context-engine.md)
+- [Session And State](./docs/session-and-state.md)
+- [Delegation And Artifacts](./docs/delegation-and-artifacts.md)
+- [Trust And Sandbox](./docs/trust-and-sandbox.md)
+- [Operator Surface](./docs/operator-surface.md)
 
 ## Modes
 
@@ -74,38 +66,38 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 
 ## Built-In Tools
 
-| Tool           | Purpose                                             |
-| -------------- | --------------------------------------------------- |
-| `read_file`    | read files into the working context                 |
-| `write_file`   | create or overwrite files                           |
-| `edit_file`    | patch existing files                                |
-| `list_dir`     | inspect directory contents                          |
-| `git_status`   | inspect repository status                           |
-| `git_diff`     | inspect working tree or staged diffs                |
-| `patch_apply`  | validate or apply unified diff patches              |
-| `bash`         | run shell commands                                  |
-| `lint_runner`  | run lint/typecheck with structured summaries        |
-| `test_runner`  | run tests with structured failure highlights        |
-| `build_runner` | run builds with structured output and summaries     |
-| `verify_changes` | run the harness verification loop over current changes |
-| `grep`         | search file contents                                |
-| `glob`         | match paths by pattern                              |
-| `repo_map`     | render a compact repository tree                    |
-| `symbol_search` | find likely symbol definitions                     |
-| `definition_search` | resolve likely symbol definitions with LSP/heuristics |
-| `reference_search` | find likely cross-file references and usages       |
-| `reference_hotspots` | group likely implementation hotspots by file       |
-| `changed_files` | list git-changed files for active-context retrieval |
-| `file_importance` | rank likely relevant files for the current request |
-| `codebase_search` | score files and lines against a natural-language query |
-| `docs_lookup`  | search local repo docs, instructions, and knowledge files |
-| `web_search`   | search the web with concise ranked results          |
-| `web_fetch`    | fetch and summarize remote pages                    |
-| `task`         | delegate work to a sub-agent                        |
-| `oracle`       | ask a stronger secondary model for a focused answer |
-| `ask_question` | pause and request user input inside a run           |
-| `memory`       | read or write persistent memory                     |
-| `update_plan`  | manage the shared execution plan / todo list        |
+| Tool                 | Purpose                                                   |
+| -------------------- | --------------------------------------------------------- |
+| `read_file`          | read files into the working context                       |
+| `write_file`         | create or overwrite files                                 |
+| `edit_file`          | patch existing files                                      |
+| `list_dir`           | inspect directory contents                                |
+| `git_status`         | inspect repository status                                 |
+| `git_diff`           | inspect working tree or staged diffs                      |
+| `patch_apply`        | validate or apply unified diff patches                    |
+| `bash`               | run shell commands                                        |
+| `lint_runner`        | run lint/typecheck with structured summaries              |
+| `test_runner`        | run tests with structured failure highlights              |
+| `build_runner`       | run builds with structured output and summaries           |
+| `verify_changes`     | run the harness verification loop over current changes    |
+| `grep`               | search file contents                                      |
+| `glob`               | match paths by pattern                                    |
+| `repo_map`           | render a compact repository tree                          |
+| `symbol_search`      | find likely symbol definitions                            |
+| `definition_search`  | resolve likely symbol definitions with LSP/heuristics     |
+| `reference_search`   | find likely cross-file references and usages              |
+| `reference_hotspots` | group likely implementation hotspots by file              |
+| `changed_files`      | list git-changed files for active-context retrieval       |
+| `file_importance`    | rank likely relevant files for the current request        |
+| `codebase_search`    | score files and lines against a natural-language query    |
+| `docs_lookup`        | search local repo docs, instructions, and knowledge files |
+| `web_search`         | search the web with concise ranked results                |
+| `web_fetch`          | fetch and summarize remote pages                          |
+| `task`               | delegate work to a sub-agent                              |
+| `oracle`             | ask a stronger secondary model for a focused answer       |
+| `ask_question`       | pause and request user input inside a run                 |
+| `memory`             | read or write persistent memory                           |
+| `update_plan`        | manage the shared execution plan / todo list              |
 
 ## Installation
 
@@ -174,7 +166,7 @@ ddudu keeps one canonical session and layers provider-specific sessions on top o
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
 - background runs can continue as detached workers, keep inspectable job state, and can be retried, promoted, cancelled, or reopened later
 - `/plan` and `/todo` manage the shared execution plan
-- `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`, and can pin per-tool policies such as `allow`, `ask`, or `deny`
+- `/permissions` switches between `plan`, `ask`, `workspace-write`, and `permissionless`, and can pin per-tool, network, and secret trust policies
 - direct and delegated execution paths can auto-run review checks, repair retries, and verification summaries
 - successful verified runs can promote compact semantic and procedural memory entries automatically
 - `/handoff`, `/fork`, `/briefing`, and `/drift` help carry long-running work forward without losing context
@@ -201,50 +193,50 @@ The current repository includes early benchmark scaffolding, but the task packs 
 
 ## TUI Shortcuts
 
-| Key             | Action                                     |
-| --------------- | ------------------------------------------ |
-| `Shift+Tab`     | cycle mode                                 |
-| `Shift+Enter` / `Ctrl+J` | newline in composer               |
-| `Enter`         | submit                                     |
-| `Esc`           | interrupt running request / clear composer |
-| `Up` / `Down`   | scroll transcript when composer is empty   |
-| `PgUp` / `PgDn` | jump scroll                                |
-| `End`           | follow latest output                       |
+| Key                      | Action                                     |
+| ------------------------ | ------------------------------------------ |
+| `Shift+Tab`              | cycle mode                                 |
+| `Shift+Enter` / `Ctrl+J` | newline in composer                        |
+| `Enter`                  | submit                                     |
+| `Esc`                    | interrupt running request / clear composer |
+| `Up` / `Down`            | scroll transcript when composer is empty   |
+| `PgUp` / `PgDn`          | jump scroll                                |
+| `End`                    | follow latest output                       |
 
 ## Slash Commands
 
-| Command | Purpose |
-| ------- | ------- |
-| `/clear` | clear the current transcript |
-| `/compact` | compact canonical context |
-| `/mode` | switch active mode |
-| `/model` | switch the current mode's model |
-| `/plan` | show the shared execution plan |
-| `/todo` | add, update, or clear plan items |
-| `/permissions` | change the active permission profile or configure per-tool policies |
-| `/memory` | read, write, append, or clear scoped memory |
-| `/session` | list sessions or resume a saved session |
-| `/config` | show runtime config summary |
-| `/help` | show available commands |
-| `/doctor` | show runtime health and context info |
-| `/context` | inspect the active prompt context snapshot |
-| `/queue` | inspect, run, promote, drop, or clear queued prompts |
-| `/jobs` | inspect, logs, result, retry, promote, or cancel detached background jobs |
-| `/artifacts` | inspect recent typed artifacts |
-| `/review` | run review checks against the current diff |
-| `/checkpoint` | create a git checkpoint commit |
-| `/undo` | revert the last ddudu checkpoint |
-| `/handoff` | compact context into a new handoff session |
-| `/fork` | fork the current session |
-| `/briefing` | generate and save a session briefing |
-| `/drift` | compare current repo state with the latest briefing |
-| `/fire` | fast toggle permissionless mode |
-| `/init` | initialize `.ddudu/` files |
-| `/skill` | inspect or load skills |
-| `/hook` | inspect or reload file-based hooks |
-| `/mcp` | inspect, add, enable, disable, remove, or reload MCP servers |
-| `/team` | run multi-agent orchestration |
-| `/quit` / `/exit` | exit ddudu |
+| Command           | Purpose                                                                                        |
+| ----------------- | ---------------------------------------------------------------------------------------------- |
+| `/clear`          | clear the current transcript                                                                   |
+| `/compact`        | compact canonical context                                                                      |
+| `/mode`           | switch active mode                                                                             |
+| `/model`          | switch the current mode's model                                                                |
+| `/plan`           | show the shared execution plan                                                                 |
+| `/todo`           | add, update, or clear plan items                                                               |
+| `/permissions`    | change the active permission profile or configure per-tool, network, and secret trust policies |
+| `/memory`         | read, write, append, or clear scoped memory                                                    |
+| `/session`        | list sessions or resume a saved session                                                        |
+| `/config`         | show runtime config summary                                                                    |
+| `/help`           | show available commands                                                                        |
+| `/doctor`         | show runtime health and context info                                                           |
+| `/context`        | inspect the active prompt context snapshot                                                     |
+| `/queue`          | inspect, run, promote, drop, or clear queued prompts                                           |
+| `/jobs`           | inspect, logs, result, retry, promote, or cancel detached background jobs                      |
+| `/artifacts`      | inspect recent typed artifacts                                                                 |
+| `/review`         | run review checks against the current diff                                                     |
+| `/checkpoint`     | create a git checkpoint commit                                                                 |
+| `/undo`           | revert the last ddudu checkpoint                                                               |
+| `/handoff`        | compact context into a new handoff session                                                     |
+| `/fork`           | fork the current session                                                                       |
+| `/briefing`       | generate and save a session briefing                                                           |
+| `/drift`          | compare current repo state with the latest briefing                                            |
+| `/fire`           | fast toggle permissionless mode                                                                |
+| `/init`           | initialize `.ddudu/` files                                                                     |
+| `/skill`          | inspect or load skills                                                                         |
+| `/hook`           | inspect or reload file-based hooks                                                             |
+| `/mcp`            | inspect, add, trust, enable, disable, remove, or reload MCP servers                            |
+| `/team`           | run multi-agent orchestration                                                                  |
+| `/quit` / `/exit` | exit ddudu                                                                                     |
 
 ## Project Layout
 

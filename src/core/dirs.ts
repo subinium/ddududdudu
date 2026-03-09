@@ -39,7 +39,7 @@ export const getDduduPaths = (cwd?: string): DduduPaths => {
     globalSkills: resolve(globalDir, 'skills'),
     globalSessions: resolve(globalDir, 'sessions'),
     globalJobs: resolve(globalDir, 'jobs'),
-    globalAuth: resolve(globalDir, 'auth.json'),
+    globalAuth: resolve(globalDir, 'auth.yaml'),
     globalInstructions: resolve(globalDir, 'DDUDU.md'),
     projectDir,
     projectConfig: resolve(projectDir, 'config.yaml'),

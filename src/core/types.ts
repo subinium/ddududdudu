@@ -10,6 +10,7 @@ export type SessionRecordType =
   | 'compaction';
 export type RoutingPriority = 'cheap' | 'balanced' | 'quality';
 export type ToolPolicy = 'inherit' | 'allow' | 'ask' | 'deny';
+export type TrustTier = 'trusted' | 'ask' | 'deny';
 
 export interface ModelConfig {
   id: string;
@@ -230,10 +231,23 @@ export interface ProviderRoute {
 export type NamedMode = 'jennie' | 'lisa' | 'rosé' | 'jisoo';
 export type ToolPermission = 'auto' | 'ask' | 'deny';
 
+export interface NetworkTrustConfig {
+  allowed_hosts: string[];
+  denied_hosts: string[];
+  ask_on_new_host: boolean;
+}
+
+export interface SecretTrustConfig {
+  protected_paths: string[];
+  protected_env: string[];
+}
+
 export interface ToolsConfig {
   permission: ToolPermission;
   toolbox_dirs: string[];
   policies?: Record<string, ToolPolicy>;
+  network: NetworkTrustConfig;
+  secrets: SecretTrustConfig;
 }
 
 export interface McpConfig {
@@ -242,6 +256,7 @@ export interface McpConfig {
     args?: string[];
     env?: Record<string, string>;
     enabled?: boolean;
+    trust?: TrustTier;
   }>;
 }
 
@@ -267,6 +282,8 @@ export interface ToolsConfigOverride {
   permission?: ToolPermission;
   toolbox_dirs?: string[];
   policies?: Record<string, ToolPolicy>;
+  network?: Partial<NetworkTrustConfig>;
+  secrets?: Partial<SecretTrustConfig>;
 }
 
 export interface McpConfigOverride {
@@ -275,6 +292,7 @@ export interface McpConfigOverride {
     args?: string[];
     env?: Record<string, string>;
     enabled?: boolean;
+    trust?: TrustTier;
   }>;
 }
 
