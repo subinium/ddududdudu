@@ -13,6 +13,10 @@
   <em>AI coding harness / BL4CKP1NK 1N Y0UR AREA</em>
 </p>
 
+<p align="center">
+  <img src="assets/readme-screenshot.png" alt="ddudu screenshot" width="1200" />
+</p>
+
 ---
 
 ## Current Capabilities
@@ -237,48 +241,6 @@ The current repository includes early benchmark scaffolding, but the task packs 
 | `/mcp`            | inspect, add, trust, enable, disable, remove, or reload MCP servers                            |
 | `/team`           | run multi-agent orchestration                                                                  |
 | `/quit` / `/exit` | exit ddudu                                                                                     |
-
-## Project Layout
-
-Runtime state is global-first by default.
-
-- `~/.ddudu/` is the default home for sessions, detached jobs, and user-level defaults
-- project `.ddudu/` is for repository-specific instructions, overrides, and working memory
-
-Common project-local files:
-
-```text
-.ddudu/
-├── config.yaml
-├── DDUDU.md
-├── memory.md
-├── memory/
-│   ├── working.md
-│   ├── episodic.md
-│   ├── semantic.md
-│   └── procedural.md
-├── hooks/
-├── rules/
-├── prompts/
-├── checks/      # optional
-├── skills/      # optional
-└── tools/       # optional
-```
-
-Common global state:
-
-```text
-~/.ddudu/
-├── config.yaml
-├── DDUDU.md     # optional
-├── memory.md    # optional
-├── sessions/
-├── jobs/
-├── prompts/
-├── rules/
-├── hooks/
-└── skills/
-```
 
 ## License
 
