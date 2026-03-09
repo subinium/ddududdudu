@@ -300,6 +300,7 @@ enum BridgeEvent {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BridgeCommand {
     Submit { content: String },
+    PrefetchContext { content: String },
     Abort,
     ClearMessages,
     RunSlash { command: String },
@@ -608,6 +609,10 @@ struct App {
     pending_paste: Option<String>,
     fatal_error: Option<String>,
     last_tick: Instant,
+    next_prefetch_at: Option<Instant>,
+    pending_prefetch_input: Option<String>,
+    last_prefetched_input: Option<String>,
+    dirty: bool,
     should_quit: bool,
     notices: Vec<TransientNotice>,
 }
@@ -674,6 +679,10 @@ impl App {
             pending_paste: None,
             fatal_error: None,
             last_tick: Instant::now(),
+            next_prefetch_at: None,
+            pending_prefetch_input: None,
+            last_prefetched_input: None,
+            dirty: true,
             should_quit: false,
             notices: Vec::new(),
         }
@@ -746,9 +755,12 @@ impl App {
                 self.prune_notices();
                 self.clamp_sidebar_selection();
                 self.refresh_open_inspector();
+                self.last_prefetched_input = None;
+                self.dirty = true;
             }
             BridgeEvent::Fatal { message } => {
                 self.fatal_error = Some(message);
+                self.dirty = true;
             }
         }
     }
@@ -772,11 +784,16 @@ impl App {
             let overflow = self.notices.len().saturating_sub(4);
             self.notices.drain(0..overflow);
         }
+        self.dirty = true;
     }
 
     fn prune_notices(&mut self) {
+        let before = self.notices.len();
         self.notices
             .retain(|notice| notice.created_at.elapsed() <= Duration::from_secs(4));
+        if self.notices.len() != before {
+            self.dirty = true;
+        }
     }
 
     fn sync_bridge(&mut self) {
@@ -791,22 +808,99 @@ impl App {
         }
     }
 
+    fn should_animate(&self) -> bool {
+        self.state.loading
+            || self.state.messages.is_empty()
+            || !self.notices.is_empty()
+            || self.pending_paste.is_some()
+    }
+
+    fn animation_interval(&self) -> Duration {
+        if self.state.loading {
+            Duration::from_millis(90)
+        } else if self.should_animate() {
+            Duration::from_millis(140)
+        } else {
+            Duration::from_millis(450)
+        }
+    }
+
+    fn clear_context_prefetch(&mut self) {
+        self.next_prefetch_at = None;
+        self.pending_prefetch_input = None;
+    }
+
+    fn refresh_context_prefetch(&mut self) {
+        let trimmed = self.composer.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('/')
+            || self.pending_paste.is_some()
+            || self.state.ask_user.is_some()
+        {
+            self.clear_context_prefetch();
+            return;
+        }
+
+        self.pending_prefetch_input = Some(trimmed);
+        self.next_prefetch_at = Some(Instant::now() + Duration::from_millis(220));
+    }
+
+    fn dispatch_context_prefetch(&mut self) -> Result<()> {
+        let Some(deadline) = self.next_prefetch_at else {
+            return Ok(());
+        };
+        if Instant::now() < deadline {
+            return Ok(());
+        }
+
+        self.next_prefetch_at = None;
+        let Some(content) = self.pending_prefetch_input.take() else {
+            return Ok(());
+        };
+        if self.last_prefetched_input.as_deref() == Some(content.as_str()) {
+            return Ok(());
+        }
+
+        self.bridge
+            .send(BridgeCommand::PrefetchContext { content: content.clone() })?;
+        self.last_prefetched_input = Some(content);
+        Ok(())
+    }
+
     fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.should_quit {
             self.sync_bridge();
             self.prune_notices();
-            terminal.draw(|frame| self.render(frame))?;
+            self.dispatch_context_prefetch()?;
 
-            let timeout = Duration::from_millis(50);
-            if event::poll(timeout)? {
-                let ev = event::read()?;
-                self.handle_event(ev)?;
-            }
-
-            if self.last_tick.elapsed() >= Duration::from_millis(90) {
+            let animation_interval = self.animation_interval();
+            if self.last_tick.elapsed() >= animation_interval {
                 self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
                 self.splash_phase = self.splash_phase.wrapping_add(1);
                 self.last_tick = Instant::now();
+                self.dirty = true;
+            }
+
+            if self.dirty {
+                terminal.draw(|frame| self.render(frame))?;
+                self.dirty = false;
+            }
+
+            let mut timeout = animation_interval.saturating_sub(self.last_tick.elapsed());
+            if timeout > Duration::from_millis(300) {
+                timeout = Duration::from_millis(300);
+            }
+            if let Some(deadline) = self.next_prefetch_at {
+                timeout = min(timeout, deadline.saturating_duration_since(Instant::now()));
+            }
+            if timeout.is_zero() {
+                timeout = Duration::from_millis(10);
+            }
+
+            if event::poll(timeout)? {
+                let ev = event::read()?;
+                self.handle_event(ev)?;
+                self.dirty = true;
             }
         }
 
@@ -2051,7 +2145,11 @@ impl App {
 
     fn handle_event(&mut self, event: Event) -> Result<()> {
         match event {
-            Event::Key(key) => self.handle_key(key),
+            Event::Key(key) => {
+                let result = self.handle_key(key);
+                self.refresh_context_prefetch();
+                result
+            }
             Event::Mouse(mouse) => {
                 match mouse.kind {
                     MouseEventKind::ScrollUp => {
@@ -2081,6 +2179,7 @@ impl App {
                 } else {
                     self.composer.insert_text(&text);
                 }
+                self.refresh_context_prefetch();
                 Ok(())
             }
             _ => Ok(()),
@@ -2328,6 +2427,7 @@ impl App {
                 }
             }
             self.composer.clear();
+            self.clear_context_prefetch();
             return Ok(());
         }
 
@@ -2336,12 +2436,14 @@ impl App {
                 answer: trimmed.clone(),
             })?;
             self.composer.clear();
+            self.clear_context_prefetch();
             return Ok(());
         }
 
         if trimmed.starts_with('/') {
             self.execute_slash_command(&trimmed)?;
             self.composer.clear();
+            self.clear_context_prefetch();
             return Ok(());
         }
 
@@ -2349,6 +2451,7 @@ impl App {
             content: trimmed.clone(),
         })?;
         self.composer.clear();
+        self.clear_context_prefetch();
         self.auto_scroll = true;
         Ok(())
     }

@@ -124,6 +124,11 @@ interface ContextSnapshotOptions {
   maxArtifacts?: number;
 }
 
+interface TimedCacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
 interface AutoRouteDecision {
   kind: 'direct' | 'delegate' | 'team';
   reason: string;
@@ -181,7 +186,7 @@ const execFileAsync = promisify(execFile);
 const MAX_TOOL_TURNS_FALLBACK = 25;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.3.0';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.3.1';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
@@ -822,6 +827,7 @@ export class NativeBridgeController {
   private pendingAskUser: AskUserResolver | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private backgroundJobPollTimer: NodeJS.Timeout | null = null;
+  private idleWarmupTimer: NodeJS.Timeout | null = null;
   private teamRunSince: number | null = null;
   private teamRunStrategy: 'parallel' | 'sequential' | 'delegate' | null = null;
   private teamRunTask: string | null = null;
@@ -835,6 +841,14 @@ export class NativeBridgeController {
   private readonly memoryPromotionFingerprints = new Set<string>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly teamRunIsolatedNotes: string[] = [];
+  private readonly selectedMemoryCache = new Map<string, TimedCacheEntry<string>>();
+  private readonly promptContextCache = new Map<string, TimedCacheEntry<string>>();
+  private changedFilesCache: TimedCacheEntry<string[]> | null = null;
+  private briefingCache: TimedCacheEntry<{
+    artifactDir: string | null;
+    briefing: { summary: string; nextSteps: string[] } | null;
+  }> | null = null;
+  private lastEmittedStateSerialized: string | null = null;
 
   public constructor(emit: EmitFn) {
     this.emit = emit;
@@ -919,6 +933,7 @@ export class NativeBridgeController {
     await this.restoreEpistemicState();
     await this.pollBackgroundJobs();
     this.startBackgroundJobPolling();
+    this.scheduleIdleWarmup();
     this.state.ready = true;
     this.emitStateNow();
   }
@@ -927,6 +942,10 @@ export class NativeBridgeController {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = null;
+    }
+    if (this.idleWarmupTimer) {
+      clearTimeout(this.idleWarmupTimer);
+      this.idleWarmupTimer = null;
     }
 
     if (this.state.sessionId) {
@@ -937,7 +956,7 @@ export class NativeBridgeController {
       });
     }
     if (this.backgroundJobPollTimer) {
-      clearInterval(this.backgroundJobPollTimer);
+      clearTimeout(this.backgroundJobPollTimer);
       this.backgroundJobPollTimer = null;
     }
     this.mcpManager?.disconnectAll();
@@ -947,12 +966,36 @@ export class NativeBridgeController {
 
   private startBackgroundJobPolling(): void {
     if (this.backgroundJobPollTimer) {
-      clearInterval(this.backgroundJobPollTimer);
+      clearTimeout(this.backgroundJobPollTimer);
+    }
+    this.scheduleBackgroundJobPoll();
+  }
+
+  private scheduleBackgroundJobPoll(delayMs?: number): void {
+    if (this.backgroundJobPollTimer) {
+      clearTimeout(this.backgroundJobPollTimer);
     }
 
-    this.backgroundJobPollTimer = setInterval(() => {
-      void this.pollBackgroundJobs();
-    }, 1500);
+    const delay = delayMs ?? (this.hasLiveBackgroundWork() ? 750 : 2400);
+    this.backgroundJobPollTimer = setTimeout(() => {
+      this.backgroundJobPollTimer = null;
+      void this.pollBackgroundJobs().finally(() => {
+        this.scheduleBackgroundJobPoll();
+      });
+    }, delay);
+  }
+
+  private hasLiveBackgroundWork(): boolean {
+    return (
+      this.state.loading ||
+      this.backgroundJobs.some((job) => job.status === 'running') ||
+      this.agentActivities.some(
+        (activity) =>
+          activity.status === 'running' ||
+          activity.status === 'verifying' ||
+          activity.status === 'queued',
+      )
+    );
   }
 
   private mapStoredJobToState(job: BackgroundJobRecord): BackgroundJobState {
@@ -1054,6 +1097,197 @@ export class NativeBridgeController {
       this.state.error = `[jobs] ${serializeError(error)}`;
       this.scheduleStatePush();
     }
+  }
+
+  private readTimedCache<T>(entry: TimedCacheEntry<T> | null): T | null {
+    if (!entry) {
+      return null;
+    }
+
+    if (entry.expiresAt <= Date.now()) {
+      return null;
+    }
+
+    return entry.value;
+  }
+
+  private writeTimedCache<T>(value: T, ttlMs: number): TimedCacheEntry<T> {
+    return {
+      value,
+      expiresAt: Date.now() + ttlMs,
+    };
+  }
+
+  private trimTimedMap<T>(map: Map<string, TimedCacheEntry<T>>, maxSize: number): void {
+    if (map.size <= maxSize) {
+      return;
+    }
+
+    const now = Date.now();
+    for (const [key, entry] of map.entries()) {
+      if (entry.expiresAt <= now) {
+        map.delete(key);
+      }
+      if (map.size <= maxSize) {
+        return;
+      }
+    }
+
+    while (map.size > maxSize) {
+      const oldest = map.keys().next().value;
+      if (!oldest) {
+        break;
+      }
+      map.delete(oldest);
+    }
+  }
+
+  private invalidateDerivedCaches(options: {
+    changedFiles?: boolean;
+    briefing?: boolean;
+    memory?: boolean;
+    promptContext?: boolean;
+  } = {}): void {
+    if (options.changedFiles) {
+      this.changedFilesCache = null;
+    }
+    if (options.briefing) {
+      this.briefingCache = null;
+    }
+    if (options.memory) {
+      this.selectedMemoryCache.clear();
+    }
+    if (options.promptContext || options.changedFiles || options.briefing || options.memory) {
+      this.promptContextCache.clear();
+    }
+  }
+
+  private buildPromptContextCacheKey(
+    prompt: string | undefined,
+    purpose: DelegationPurpose | 'general',
+    options: Required<ContextSnapshotOptions>,
+  ): string {
+    const activeAgents = this.agentActivities
+      .filter((item) => item.status === 'running' || item.status === 'verifying' || item.status === 'queued')
+      .slice(0, 4)
+      .map((item) => `${item.id}:${item.status}:${item.updatedAt}`)
+      .join('|');
+    const activeJobs = this.backgroundJobs
+      .filter((job) => job.status === 'running')
+      .slice(0, 4)
+      .map((job) => `${job.id}:${job.updatedAt}`)
+      .join('|');
+    const todoSignature = this.todos
+      .slice(0, 8)
+      .map((item) => `${item.id}:${item.status}`)
+      .join('|');
+    const artifactSignature = this.artifacts
+      .slice(0, 6)
+      .map((artifact) => `${artifact.id}:${artifact.kind}`)
+      .join('|');
+
+    return JSON.stringify({
+      prompt,
+      purpose,
+      options,
+      mode: this.currentMode,
+      provider: this.getCurrentProvider(),
+      model: this.getCurrentModel(),
+      permission: this.permissionProfile,
+      workspace: this.state.workspace?.path ?? null,
+      sessionId: this.state.sessionId,
+      todoSignature,
+      artifactSignature,
+      activeAgents,
+      activeJobs,
+      uncertaintyCount: this.epistemicState.getStats().uncertainties,
+    });
+  }
+
+  private async getBriefingSummary(): Promise<{ summary: string; nextSteps: string[] } | null> {
+    const artifactDir = this.getSessionArtifactDirectory();
+    const cached = this.readTimedCache(this.briefingCache);
+    if (cached && cached.artifactDir === artifactDir) {
+      return cached.briefing;
+    }
+
+    if (!artifactDir) {
+      this.briefingCache = this.writeTimedCache({ artifactDir: null, briefing: null }, 1200);
+      return null;
+    }
+
+    try {
+      const briefing = await loadBriefing(artifactDir);
+      const normalized = briefing
+        ? {
+            summary: previewText(briefing.summary, 220),
+            nextSteps: briefing.nextSteps.slice(0, 5),
+          }
+        : null;
+      this.briefingCache = this.writeTimedCache({ artifactDir, briefing: normalized }, 1200);
+      return normalized;
+    } catch {
+      this.briefingCache = this.writeTimedCache({ artifactDir, briefing: null }, 600);
+      return null;
+    }
+  }
+
+  private async getCachedSelectedMemory(scopes: MemoryScope[], maxChars: number): Promise<string> {
+    const key = `${scopes.join(',')}::${maxChars}`;
+    const cached = this.selectedMemoryCache.get(key);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
+
+    const value = await loadSelectedMemory(process.cwd(), scopes, maxChars);
+    this.selectedMemoryCache.set(key, this.writeTimedCache(value, 2000));
+    this.trimTimedMap(this.selectedMemoryCache, 12);
+    return value;
+  }
+
+  private scheduleIdleWarmup(prompt?: string, purpose?: DelegationPurpose | 'general'): void {
+    if (this.idleWarmupTimer) {
+      clearTimeout(this.idleWarmupTimer);
+    }
+
+    this.idleWarmupTimer = setTimeout(() => {
+      this.idleWarmupTimer = null;
+      void this.warmIdleCaches(prompt, purpose);
+    }, prompt ? 220 : 500);
+  }
+
+  private async warmIdleCaches(prompt?: string, purpose?: DelegationPurpose | 'general'): Promise<void> {
+    if (this.state.loading || this.abortController) {
+      return;
+    }
+
+    try {
+      const tasks: Array<Promise<unknown>> = [
+        this.getChangedFiles(10),
+        this.getBriefingSummary(),
+        this.getCachedSelectedMemory(this.getSystemMemoryScopes(this.currentMode), 360),
+      ];
+
+      const trimmedPrompt = prompt?.trim();
+      if (trimmedPrompt && !trimmedPrompt.startsWith('/')) {
+        const inferredPurpose = purpose ?? this.inferPromptPurpose(trimmedPrompt);
+        tasks.push(
+          this.buildPromptContextSnapshot(trimmedPrompt, inferredPurpose).catch(() => ''),
+        );
+      }
+
+      await Promise.all(tasks);
+    } catch {
+      // Warmup is best-effort only.
+    }
+  }
+
+  public prefetchContext(content: string): void {
+    const trimmed = content.trim();
+    if (!trimmed || trimmed.startsWith('/')) {
+      return;
+    }
+    this.scheduleIdleWarmup(trimmed);
   }
 
   private resolveCliEntrypoint(): string {
@@ -1342,6 +1576,7 @@ export class NativeBridgeController {
     }
 
     this.resetEphemeralAgentActivities();
+    this.scheduleIdleWarmup(trimmedContent);
 
     const mode = this.currentMode;
     const model = this.getCurrentModel();
@@ -2665,7 +2900,7 @@ export class NativeBridgeController {
       }
 
       try {
-        const memory = await loadSelectedMemory(cwd, this.getSystemMemoryScopes(mode), 360);
+        const memory = await this.getCachedSelectedMemory(this.getSystemMemoryScopes(mode), 360);
         if (hasMeaningfulMemory(memory)) {
           prompt += `\n\n<stable_memory>\n${memory}\n</stable_memory>`;
         }
@@ -3647,6 +3882,7 @@ export class NativeBridgeController {
 
     const loaded = await this.sessionManager.load(sessionId);
     this.restoreSession(loaded);
+    this.invalidateDerivedCaches({ briefing: true, promptContext: true });
     await this.refreshSystemPrompt();
     this.reconfigureClient();
     await this.pollBackgroundJobs();
@@ -3750,6 +3986,7 @@ export class NativeBridgeController {
       } else {
         await appendMemory(process.cwd(), content, scope);
       }
+      this.invalidateDerivedCaches({ memory: true });
       await this.refreshSystemPrompt();
       this.scheduleStatePush();
       return `Memory ${command === 'write' ? 'written' : 'appended'} in ${scope}.`;
@@ -3761,6 +3998,7 @@ export class NativeBridgeController {
         return 'Usage: /memory clear <global|project|working|episodic|semantic|procedural>';
       }
       await clearMemory(process.cwd(), scope);
+      this.invalidateDerivedCaches({ memory: true });
       await this.refreshSystemPrompt();
       this.scheduleStatePush();
       return `Memory cleared in ${scope}.`;
@@ -3770,6 +4008,11 @@ export class NativeBridgeController {
   }
 
   private async getChangedFiles(limit: number = 8): Promise<string[]> {
+    const cached = this.readTimedCache(this.changedFilesCache);
+    if (cached) {
+      return cached.slice(0, limit);
+    }
+
     try {
       const { stdout } = await execFileAsync('git', ['status', '--short'], {
         cwd: process.cwd(),
@@ -3777,13 +4020,15 @@ export class NativeBridgeController {
         maxBuffer: 4 * 1024 * 1024,
       });
 
-      return stdout
+      const files = stdout
         .split('\n')
         .map((line) => line.replace(/\r/g, ''))
         .map((line) => STATUS_FILE_PATTERN.exec(line)?.[1]?.trim() ?? '')
         .filter((line) => line.length > 0)
         .map((line) => line.replace(/^.* -> /, ''))
-        .slice(0, limit);
+        .slice(0, 16);
+      this.changedFilesCache = this.writeTimedCache(files, 900);
+      return files.slice(0, limit);
     } catch {
       try {
         const git = new GitCheckpoint(process.cwd());
@@ -3798,7 +4043,9 @@ export class NativeBridgeController {
           match = DIFF_FILE_PATTERN.exec(diff);
         }
         DIFF_FILE_PATTERN.lastIndex = 0;
-        return Array.from(files.values()).slice(0, limit);
+        const resolved = Array.from(files.values()).slice(0, 16);
+        this.changedFilesCache = this.writeTimedCache(resolved, 900);
+        return resolved.slice(0, limit);
       } catch {
         return [];
       }
@@ -4065,6 +4312,11 @@ export class NativeBridgeController {
       memoryScopes: options.memoryScopes ?? this.getRequestMemoryScopes(effectivePurpose),
       maxArtifacts: options.maxArtifacts ?? (effectivePurpose === 'planning' || effectivePurpose === 'review' ? 4 : 3),
     };
+    const cacheKey = this.buildPromptContextCacheKey(prompt, effectivePurpose, snapshotOptions);
+    const cached = this.promptContextCache.get(cacheKey);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.value;
+    }
     if (prompt) {
       parts.push(`request_focus: ${effectivePurpose}`);
       const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
@@ -4086,7 +4338,7 @@ export class NativeBridgeController {
     }
     if (snapshotOptions.includeMemory) {
       try {
-        const selectedMemory = await loadSelectedMemory(process.cwd(), snapshotOptions.memoryScopes, 320);
+        const selectedMemory = await this.getCachedSelectedMemory(snapshotOptions.memoryScopes, 320);
         if (hasMeaningfulMemory(selectedMemory)) {
           parts.push('<memory_selection>', selectedMemory, '</memory_selection>');
         }
@@ -4106,19 +4358,12 @@ export class NativeBridgeController {
     }
 
     if (snapshotOptions.includeBriefing) {
-      const artifactDir = this.getSessionArtifactDirectory();
-      if (artifactDir) {
-        try {
-          const briefing = await loadBriefing(artifactDir);
-          if (briefing) {
-            parts.push(
-              `briefing_summary: ${previewText(briefing.summary, 220)}`,
-              ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
-            );
-          }
-        } catch {
-          // Briefing is optional.
-        }
+      const briefing = await this.getBriefingSummary();
+      if (briefing) {
+        parts.push(
+          `briefing_summary: ${briefing.summary}`,
+          ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
+        );
       }
     }
 
@@ -4178,24 +4423,24 @@ export class NativeBridgeController {
       return '';
     }
 
-    return `<context_snapshot>\n${parts.join('\n')}\n</context_snapshot>`;
+    const snapshot = `<context_snapshot>\n${parts.join('\n')}\n</context_snapshot>`;
+    this.promptContextCache.set(cacheKey, this.writeTimedCache(snapshot, 1200));
+    this.trimTimedMap(this.promptContextCache, 48);
+    return snapshot;
   }
 
   private async formatContextSummary(): Promise<string> {
     const changedFiles = await this.getChangedFiles(12);
-    const artifactDir = this.getSessionArtifactDirectory();
     let briefingSummary = 'none';
     let briefingSteps: string[] = [];
-    if (artifactDir) {
-      try {
-        const briefing = await loadBriefing(artifactDir);
-        if (briefing) {
-          briefingSummary = previewText(briefing.summary, 220);
-          briefingSteps = briefing.nextSteps.slice(0, 5);
-        }
-      } catch {
-        briefingSummary = 'unavailable';
+    try {
+      const briefing = await this.getBriefingSummary();
+      if (briefing) {
+        briefingSummary = briefing.summary;
+        briefingSteps = briefing.nextSteps.slice(0, 5);
       }
+    } catch {
+      briefingSummary = 'unavailable';
     }
 
     const activeAgents = this.agentActivities
@@ -4811,6 +5056,7 @@ export class NativeBridgeController {
       ].join('\n'),
       'semantic',
     );
+    this.invalidateDerivedCaches({ memory: true });
 
     if (input.reason === 'verification auto-retry' || input.reason?.startsWith('Verification escalation') === true) {
       await appendMemory(
@@ -4824,6 +5070,7 @@ export class NativeBridgeController {
         ].join('\n'),
         'procedural',
       );
+      this.invalidateDerivedCaches({ memory: true });
     }
 
     await this.refreshSystemPrompt();
@@ -6010,6 +6257,7 @@ export class NativeBridgeController {
 
     const briefing = generateBriefing(toCompactionMessages(this.state.messages), this.epistemicState.getState());
     await saveBriefing(briefing, artifactDir);
+    this.invalidateDerivedCaches({ briefing: true });
     await this.epistemicState.save(artifactDir);
     return formatBriefing(briefing);
   }
@@ -6969,38 +7217,46 @@ export class NativeBridgeController {
       this.flushTimer = null;
     }
 
+    const nextState = {
+      ...this.state,
+      requestEstimate: this.state.requestEstimate ? { ...this.state.requestEstimate } : null,
+      queuedPrompts: [...this.state.queuedPrompts],
+      messages: this.state.messages.map((message) => ({
+        ...message,
+        toolCalls: message.toolCalls ? [...message.toolCalls] : undefined,
+      })),
+      providers: this.state.providers.map((provider) => ({ ...provider })),
+      mcp: this.state.mcp
+        ? {
+            ...this.state.mcp,
+            serverNames: [...this.state.mcp.serverNames],
+            connectedNames: [...this.state.mcp.connectedNames],
+          }
+        : null,
+      lsp: this.state.lsp
+        ? {
+            ...this.state.lsp,
+            serverLabels: [...this.state.lsp.serverLabels],
+            connectedLabels: [...this.state.lsp.connectedLabels],
+          }
+        : null,
+      modes: this.state.modes.map((mode) => ({ ...mode })),
+      slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
+      todos: this.state.todos.map((item) => ({ ...item })),
+      backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
+      artifacts: this.state.artifacts.map((artifact) => ({ ...artifact })),
+      askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
+    };
+
+    const serialized = JSON.stringify(nextState);
+    if (serialized === this.lastEmittedStateSerialized) {
+      return;
+    }
+    this.lastEmittedStateSerialized = serialized;
+
     this.emit({
       type: 'state',
-      state: {
-        ...this.state,
-        requestEstimate: this.state.requestEstimate ? { ...this.state.requestEstimate } : null,
-        queuedPrompts: [...this.state.queuedPrompts],
-        messages: this.state.messages.map((message) => ({
-          ...message,
-          toolCalls: message.toolCalls ? [...message.toolCalls] : undefined,
-        })),
-        providers: this.state.providers.map((provider) => ({ ...provider })),
-        mcp: this.state.mcp
-          ? {
-              ...this.state.mcp,
-              serverNames: [...this.state.mcp.serverNames],
-              connectedNames: [...this.state.mcp.connectedNames],
-            }
-          : null,
-        lsp: this.state.lsp
-          ? {
-              ...this.state.lsp,
-              serverLabels: [...this.state.lsp.serverLabels],
-              connectedLabels: [...this.state.lsp.connectedLabels],
-            }
-          : null,
-        modes: this.state.modes.map((mode) => ({ ...mode })),
-        slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
-        todos: this.state.todos.map((item) => ({ ...item })),
-        backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
-        artifacts: this.state.artifacts.map((artifact) => ({ ...artifact })),
-        askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
-      },
+      state: nextState,
     });
   }
 

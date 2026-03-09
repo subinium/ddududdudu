@@ -188,6 +188,7 @@ export type NativeBridgeEvent =
 
 export type NativeBridgeCommand =
   | { type: 'submit'; content: string }
+  | { type: 'prefetch_context'; content: string }
   | { type: 'abort' }
   | { type: 'clear_messages' }
   | { type: 'run_slash'; command: string }
