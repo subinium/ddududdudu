@@ -17,6 +17,7 @@ test('config editor persists nested tool and MCP settings in project config', as
 
   try {
     await setDduduConfigValue(root, 'tools.policies.bash', 'deny');
+    await setDduduConfigValue(root, 'memory.backend', 'file');
     await setDduduConfigValue(root, 'tools.network.allowed_hosts', ['docs.anthropic.com']);
     await setDduduConfigValue(root, 'tools.secrets.protected_env', ['OPENAI_API_KEY']);
     await setDduduConfigValue(root, 'mcp.servers.demo', {
@@ -27,6 +28,7 @@ test('config editor persists nested tool and MCP settings in project config', as
     });
 
     const config = await readDduduConfigOverride(root);
+    assert.equal(config.memory?.backend, 'file');
     assert.equal(config.tools?.policies?.bash, 'deny');
     assert.deepEqual(config.tools?.network?.allowed_hosts, ['docs.anthropic.com']);
     assert.deepEqual(config.tools?.secrets?.protected_env, ['OPENAI_API_KEY']);

@@ -9,6 +9,7 @@ import {
   type ContextBudgetConfig,
   type DduduConfig,
   type DduduConfigOverride,
+  type MemoryConfig,
   type McpConfig,
   type ModelConfig,
   type OracleConfig,
@@ -87,6 +88,9 @@ const DEFAULT_CONFIG: DduduConfig = {
     directory: DDUDU_PATHS.globalSessions,
     auto_save: true,
   },
+  memory: {
+    backend: 'file',
+  } as MemoryConfig,
   openclaw: {
     enabled: true,
   },
@@ -248,11 +252,12 @@ const normalizeProviders = (config: DduduConfig): DduduConfig => {
   };
 };
 
-export const loadConfig = async (
-  cliOverrides: DduduConfigOverride = {}
+export const loadConfigForCwd = async (
+  cwd: string,
+  cliOverrides: DduduConfigOverride = {},
 ): Promise<DduduConfig> => {
   const userConfigPath = resolve(homedir(), '.ddudu/config.yaml');
-  const localConfigPath = resolve(process.cwd(), '.ddudu/config.yaml');
+  const localConfigPath = resolve(cwd, '.ddudu/config.yaml');
 
   const [userConfig, localConfig] = await Promise.all([
     loadYamlIfExists(userConfigPath),
@@ -265,6 +270,12 @@ export const loadConfig = async (
   );
 
   return normalizeProviders(merged);
+};
+
+export const loadConfig = async (
+  cliOverrides: DduduConfigOverride = {},
+): Promise<DduduConfig> => {
+  return loadConfigForCwd(process.cwd(), cliOverrides);
 };
 
 export const resolvePreset = async (

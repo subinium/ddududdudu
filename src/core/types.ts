@@ -67,6 +67,10 @@ export interface SessionConfig {
   auto_save: boolean;
 }
 
+export interface MemoryConfig {
+  backend: string;
+}
+
 export interface OpenclawConfig {
   enabled: boolean;
 }
@@ -81,6 +85,7 @@ export interface PresetConfig {
   tabs?: TabConfigOverride;
   compaction?: CompactionConfigOverride;
   session?: SessionConfigOverride;
+  memory?: MemoryConfigOverride;
   openclaw?: OpenclawConfigOverride;
   mode?: NamedMode;
   git_checkpoint?: boolean;
@@ -99,6 +104,7 @@ export interface DduduConfig {
   tabs: TabConfig;
   compaction: CompactionConfig;
   session: SessionConfig;
+  memory: MemoryConfig;
   openclaw: OpenclawConfig;
   mode: NamedMode;
   git_checkpoint: boolean;
@@ -140,6 +146,10 @@ export interface SessionConfigOverride {
   auto_save?: boolean;
 }
 
+export interface MemoryConfigOverride {
+  backend?: string;
+}
+
 export interface OpenclawConfigOverride {
   enabled?: boolean;
 }
@@ -150,6 +160,7 @@ export interface DduduConfigOverride {
   tabs?: TabConfigOverride;
   compaction?: CompactionConfigOverride;
   session?: SessionConfigOverride;
+  memory?: MemoryConfigOverride;
   openclaw?: OpenclawConfigOverride;
   mode?: NamedMode;
   git_checkpoint?: boolean;

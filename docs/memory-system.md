@@ -62,6 +62,44 @@ Current file layout:
 This layout is intentionally simple and durable.
 The complexity lives in selection and promotion, not in storage format.
 
+## Backend Modularity
+
+The storage format should not be the same thing as the memory contract.
+
+`ddudu` should therefore treat memory as a backend interface with swappable implementations.
+
+That means callers should depend on operations such as:
+
+- load scopes
+- save scope
+- append entry
+- clear scope
+
+They should not depend directly on path layout or file mutation details.
+
+### Why this matters
+
+A file backend is a good default because it is transparent and durable.
+
+But future backends may want to provide:
+
+- vector-backed semantic retrieval
+- QMD-backed knowledge lookup
+- remote team memory stores
+- encrypted local stores
+
+If memory is hard-coded to one storage method, each of those experiments becomes a core refactor instead of a backend swap.
+
+### ddudu direction
+
+`ddudu` should keep:
+
+- a stable memory API
+- a configurable backend selection point
+- file storage as the default baseline
+
+That keeps the system simple today while leaving room for optional higher-level memory engines later.
+
 ## Retrieval Policy
 
 Memory retrieval should be purpose-aware.
