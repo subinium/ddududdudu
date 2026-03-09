@@ -17,6 +17,10 @@ export interface AgentRole {
   deliverable?: WorkflowArtifactKind;
   successCriteria?: string[];
   readOnly?: boolean;
+  dependencyLabels?: string[];
+  dependencyUnitIds?: string[];
+  handoffTo?: string;
+  workUnitId?: string;
 }
 
 export interface TeamMessage {
@@ -61,6 +65,7 @@ export class TeamOrchestrator {
   private readonly workerIds: string[];
   private readonly reviewerIds: string[];
   private readonly leadId: string;
+  private readonly workUnitToAgentId: Map<string, string>;
 
   private readonly messageQueues = new Map<string, TeamMessage[]>();
   private readonly messages: TeamMessage[] = [];
@@ -104,6 +109,11 @@ export class TeamOrchestrator {
     this.reviewerIds = this.config.agents
       .filter((agent) => agent.role === 'reviewer')
       .map((agent) => agent.id);
+    this.workUnitToAgentId = new Map(
+      this.config.agents
+        .filter((agent) => typeof agent.workUnitId === 'string' && agent.workUnitId.length > 0)
+        .map((agent) => [agent.workUnitId as string, agent.id]),
+    );
 
     for (const agent of this.config.agents) {
       this.messageQueues.set(agent.id, []);
@@ -210,40 +220,78 @@ export class TeamOrchestrator {
   }
 
   private async executeParallelRound(round: number): Promise<void> {
-    const workerTasks = this.workerIds.map((workerId) => {
-      const taskText = this.buildWorkerSubtask(workerId, round, undefined);
-      this.routeMessage({
-        from: this.leadId,
-        to: workerId,
-        type: 'task',
-        content: taskText,
-        metadata: { strategy: 'parallel', round },
-        timestamp: Date.now(),
-      });
-      return this.runWorkerFromQueue(workerId, round, undefined);
-    });
+    const pending = new Set(this.workerIds);
+    const completed = new Set<string>();
 
-    await Promise.all(workerTasks);
+    while (pending.size > 0) {
+      const ready = this.selectReadyWorkers(pending, completed);
+      const wave = ready.length > 0 ? ready : [this.nextPendingWorker(pending)];
+      const workerTasks = wave.map((workerId) => {
+        const dependencyContext = this.collectDependencyOutputs(workerId, completed);
+        const taskText = this.buildWorkerSubtask(workerId, round, dependencyContext);
+        this.routeMessage({
+          from: this.leadId,
+          to: workerId,
+          type: 'task',
+          content: taskText,
+          metadata: {
+            strategy: 'parallel',
+            round,
+            dependencyCount: this.getWorkerDependencies(workerId).length,
+            waveSize: wave.length,
+          },
+          timestamp: Date.now(),
+        });
+        return this.runWorkerFromQueue(workerId, round, dependencyContext);
+      });
+
+      await Promise.all(workerTasks);
+      for (const workerId of wave) {
+        pending.delete(workerId);
+        completed.add(workerId);
+      }
+    }
+
     await this.synthesizeLeadOutput(round);
     await this.runReviewers(round);
   }
 
   private async executeSequentialRound(round: number): Promise<void> {
+    const pending = new Set(this.workerIds);
+    const completed = new Set<string>();
     let accumulated = '';
 
-    for (const workerId of this.workerIds) {
-      const taskText = this.buildWorkerSubtask(workerId, round, accumulated || undefined);
+    while (pending.size > 0) {
+      const ready = this.selectReadyWorkers(pending, completed);
+      const workerId = ready.length > 0 ? ready[0] : this.nextPendingWorker(pending);
+      const dependencyContext = this.collectDependencyOutputs(workerId, completed);
+      const taskText = this.buildWorkerSubtask(
+        workerId,
+        round,
+        [accumulated, dependencyContext].filter((part) => part.length > 0).join('\n\n') || undefined,
+      );
       this.routeMessage({
         from: this.leadId,
         to: workerId,
         type: 'task',
         content: taskText,
-        metadata: { strategy: 'sequential', round, dependsOnPrior: Boolean(accumulated) },
+        metadata: {
+          strategy: 'sequential',
+          round,
+          dependsOnPrior: Boolean(accumulated),
+          dependencyCount: this.getWorkerDependencies(workerId).length,
+        },
         timestamp: Date.now(),
       });
 
-      const workerOutput = await this.runWorkerFromQueue(workerId, round, accumulated || undefined);
+      const workerOutput = await this.runWorkerFromQueue(
+        workerId,
+        round,
+        [accumulated, dependencyContext].filter((part) => part.length > 0).join('\n\n') || undefined,
+      );
       accumulated = accumulated ? `${accumulated}\n${workerOutput}` : workerOutput;
+      pending.delete(workerId);
+      completed.add(workerId);
     }
 
     await this.synthesizeLeadOutput(round);
@@ -261,19 +309,32 @@ export class TeamOrchestrator {
     });
 
     const workerOutputs: string[] = [];
-    for (const workerId of this.workerIds) {
-      const subtask = this.buildWorkerSubtask(workerId, round, undefined);
+    const pending = new Set(this.workerIds);
+    const completed = new Set<string>();
+
+    while (pending.size > 0) {
+      const ready = this.selectReadyWorkers(pending, completed);
+      const workerId = ready.length > 0 ? ready[0] : this.nextPendingWorker(pending);
+      const dependencyContext = this.collectDependencyOutputs(workerId, completed);
+      const subtask = this.buildWorkerSubtask(workerId, round, dependencyContext);
       this.routeMessage({
         from: this.leadId,
         to: workerId,
         type: 'task',
         content: subtask,
-        metadata: { strategy: 'delegate', delegatedBy: this.leadId, round },
+        metadata: {
+          strategy: 'delegate',
+          delegatedBy: this.leadId,
+          round,
+          dependencyCount: this.getWorkerDependencies(workerId).length,
+        },
         timestamp: Date.now(),
       });
 
-      const output = await this.runWorkerFromQueue(workerId, round, undefined);
+      const output = await this.runWorkerFromQueue(workerId, round, dependencyContext);
       workerOutputs.push(output);
+      pending.delete(workerId);
+      completed.add(workerId);
       this.routeMessage({
         from: this.leadId,
         to: workerId,
@@ -286,6 +347,56 @@ export class TeamOrchestrator {
 
     await this.synthesizeLeadOutput(round, workerOutputs.join('\n'));
     await this.runReviewers(round);
+  }
+
+  private getWorkerDependencies(workerId: string): string[] {
+    const agent = this.agentsById.get(workerId);
+    if (!agent) {
+      return [];
+    }
+
+    return (agent.dependencyUnitIds ?? [])
+      .map((workUnitId) => this.workUnitToAgentId.get(workUnitId))
+      .filter((dependencyId): dependencyId is string => typeof dependencyId === 'string');
+  }
+
+  private selectReadyWorkers(pending: Set<string>, completed: Set<string>): string[] {
+    return this.workerIds.filter((workerId) => {
+      if (!pending.has(workerId)) {
+        return false;
+      }
+
+      const dependencies = this.getWorkerDependencies(workerId);
+      return dependencies.every((dependencyId) => completed.has(dependencyId));
+    });
+  }
+
+  private nextPendingWorker(pending: Set<string>): string {
+    const workerId = this.workerIds.find((candidate) => pending.has(candidate));
+    if (!workerId) {
+      throw new Error('No pending worker available.');
+    }
+    return workerId;
+  }
+
+  private collectDependencyOutputs(workerId: string, completed: Set<string>): string | undefined {
+    const dependencyOutputs = this.getWorkerDependencies(workerId)
+      .filter((dependencyId) => completed.has(dependencyId))
+      .map((dependencyId) => {
+        const agent = this.agentsById.get(dependencyId);
+        const output = this.agentOutputs.get(dependencyId);
+        if (!agent || !output) {
+          return null;
+        }
+        return `${agent.name}:\n${output}`;
+      })
+      .filter((fragment): fragment is string => typeof fragment === 'string' && fragment.length > 0);
+
+    if (dependencyOutputs.length === 0) {
+      return undefined;
+    }
+
+    return `Dependency outputs:\n${dependencyOutputs.join('\n\n')}`;
   }
 
   private async runWorkerFromQueue(

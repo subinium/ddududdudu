@@ -21,6 +21,8 @@ export interface WorkUnit {
   readOnly: boolean;
   verificationMode: VerificationMode;
   successCriteria: string[];
+  dependsOn: string[];
+  handoffTo?: SpecialistRole;
 }
 
 export interface WorkAllocationPlan {
@@ -66,6 +68,7 @@ const createUnit = (
     readOnly: profile.readOnly,
     verificationMode: profile.verificationMode,
     successCriteria,
+    dependsOn: [],
   };
 };
 
@@ -164,6 +167,49 @@ export const planWorkAllocation = (
       ['List the highest-risk regressions or gaps.', 'State whether the result is ready to land.'],
       availableModes,
     );
+  }
+
+  const planner = units.find((unit) => unit.role === 'planner');
+  const explorer = units.find((unit) => unit.role === 'explorer');
+  const librarian = units.find((unit) => unit.role === 'librarian');
+  const designer = units.find((unit) => unit.role === 'designer');
+  const executor = units.find((unit) => unit.role === 'executor');
+  const reviewer = units.find((unit) => unit.role === 'reviewer');
+
+  for (const unit of units) {
+    if (planner && unit.id !== planner.id && !unit.dependsOn.includes(planner.label)) {
+      unit.dependsOn.push(planner.label);
+    }
+  }
+
+  if (executor) {
+    for (const dependency of [explorer, librarian, designer]) {
+      if (dependency && !executor.dependsOn.includes(dependency.label)) {
+        executor.dependsOn.push(dependency.label);
+      }
+    }
+    executor.handoffTo = reviewer ? 'reviewer' : 'coordinator';
+  }
+
+  if (designer) {
+    designer.handoffTo = executor ? 'executor' : reviewer ? 'reviewer' : 'coordinator';
+  }
+
+  if (explorer) {
+    explorer.handoffTo = executor ? 'executor' : reviewer ? 'reviewer' : 'coordinator';
+  }
+
+  if (librarian) {
+    librarian.handoffTo = executor ? 'executor' : reviewer ? 'reviewer' : 'coordinator';
+  }
+
+  if (reviewer) {
+    for (const dependency of [executor, designer]) {
+      if (dependency && !reviewer.dependsOn.includes(dependency.label)) {
+        reviewer.dependsOn.push(dependency.label);
+      }
+    }
+    reviewer.handoffTo = 'coordinator';
   }
 
   const suggestedStrategy =

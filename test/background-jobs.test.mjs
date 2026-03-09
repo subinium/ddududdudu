@@ -114,3 +114,68 @@ test('BackgroundJobStore supports global job visibility across sessions', async 
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('BackgroundJobStore normalizes blocked checklist items from dependency state', async () => {
+  const root = await mkdtemp(resolve(tmpdir(), 'ddudu-job-store-checklist-'));
+  try {
+    const store = new BackgroundJobStore(resolve(root, 'jobs'));
+    const record = await store.create({
+      sessionId: 'session-checklist',
+      kind: 'team',
+      label: 'team plan',
+      cwd: root,
+      prompt: 'ship the feature',
+      purpose: 'execution',
+      preferredMode: 'jennie',
+      preferredModel: 'claude-opus-4-6',
+      reason: 'team run',
+      attempt: 0,
+      verificationMode: 'checks',
+      contextSnapshot: null,
+      artifacts: [],
+      teamAgents: [],
+      teamSharedContext: null,
+      checklist: [
+        {
+          id: 'agent:planner',
+          label: 'Define scope',
+          owner: 'Rosé · planner',
+          status: 'completed',
+          detail: null,
+          updatedAt: Date.now(),
+        },
+        {
+          id: 'agent:executor',
+          label: 'Implement change',
+          owner: 'Lisa · executor',
+          status: 'pending',
+          detail: 'blocked by Rosé · planner',
+          dependsOn: ['agent:planner'],
+          updatedAt: Date.now(),
+        },
+      ],
+      agentActivities: [],
+      result: null,
+      artifact: null,
+    });
+
+    let loaded = await store.load(record.id);
+    assert.equal(loaded.checklist[1]?.status, 'pending');
+
+    await store.update(record.id, {
+      checklist: loaded.checklist.map((item) =>
+        item.id === 'agent:planner'
+          ? {
+              ...item,
+              status: 'blocked',
+            }
+          : item,
+      ),
+    });
+
+    loaded = await store.load(record.id);
+    assert.equal(loaded.checklist[1]?.status, 'blocked');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

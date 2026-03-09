@@ -2,7 +2,7 @@ import { access, readFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
-import YAML from 'yaml';
+import { parseYaml } from '../utils/yaml.js';
 
 import {
   type ChecksConfig,
@@ -221,7 +221,7 @@ const loadYamlIfExists = async (filePath: string): Promise<DduduConfigOverride> 
     return {};
   }
 
-  const parsed = YAML.parse(content) as unknown;
+  const parsed = parseYaml(content) as unknown;
   if (!isObject(parsed)) {
     return {};
   }

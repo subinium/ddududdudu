@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { readdir, readFile } from 'node:fs/promises';
 import { basename, resolve } from 'node:path';
-import YAML from 'yaml';
+import { parseYaml } from '../utils/yaml.js';
 
 import { DEFAULT_ANTHROPIC_BASE_URL } from '../api/anthropic-base-url.js';
-import { SubAgentPool, type TaskResult } from './sub-agent.js';
+import type { SubAgentPool, TaskResult } from './sub-agent.js';
 
 export interface CheckDefinition {
   name: string;
@@ -85,7 +85,7 @@ const parseMarkdownFrontmatter = (content: string): ParsedMarkdown => {
 
   let frontmatter: Record<string, unknown> = {};
   try {
-    const parsed = YAML.parse(match[1] ?? '') as unknown;
+    const parsed = parseYaml(match[1] ?? '') as unknown;
     if (isObject(parsed)) {
       frontmatter = parsed;
     }
@@ -179,7 +179,11 @@ const sourcePriority = (path: string): number => {
 
 export class ChecksRunner {
   private readonly cwd: string;
-  private readonly pool?: SubAgentPool;
+  private readonly reviewToken?: string;
+  private readonly reviewBaseUrl?: string;
+  private readonly reviewModel?: string;
+  private pool?: SubAgentPool;
+  private poolPromise: Promise<SubAgentPool | undefined> | null = null;
 
   public constructor(cwd: string) {
     this.cwd = cwd;
@@ -189,13 +193,9 @@ export class ChecksRunner {
       return;
     }
 
-    this.pool = new SubAgentPool({
-      token,
-      baseUrl: process.env.DDUDU_ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL,
-      defaultModel: process.env.DDUDU_REVIEW_MODEL ?? 'claude-sonnet-4-6',
-      defaultSystemPrompt: 'You are a strict code review checker. Return only valid JSON.',
-      maxConcurrent: 5,
-    });
+    this.reviewToken = token;
+    this.reviewBaseUrl = process.env.DDUDU_ANTHROPIC_BASE_URL ?? DEFAULT_ANTHROPIC_BASE_URL;
+    this.reviewModel = process.env.DDUDU_REVIEW_MODEL ?? 'claude-sonnet-4-6';
   }
 
   public async scan(): Promise<CheckDefinition[]> {
@@ -414,7 +414,8 @@ export class ChecksRunner {
   }
 
   private async runWithSubAgent(check: CheckDefinition, diff: string): Promise<ParsedSubAgentResponse> {
-    if (!this.pool) {
+    const pool = await this.getPool();
+    if (!pool) {
       return {
         passed: true,
         findings: [],
@@ -439,7 +440,7 @@ export class ChecksRunner {
 
     let result: TaskResult;
     try {
-      result = await this.pool.runTask({
+      result = await pool.runTask({
         id: `review-check-${check.name}-${randomUUID()}`,
         prompt,
         role: 'reviewer',
@@ -494,5 +495,37 @@ export class ChecksRunner {
     }
 
     return findings;
+  }
+
+  private async getPool(): Promise<SubAgentPool | undefined> {
+    if (this.pool) {
+      return this.pool;
+    }
+
+    if (this.poolPromise) {
+      return this.poolPromise;
+    }
+
+    if (!this.reviewToken) {
+      return undefined;
+    }
+
+    this.poolPromise = (async () => {
+      const { SubAgentPool } = await import('./sub-agent.js');
+      this.pool = new SubAgentPool({
+        token: this.reviewToken as string,
+        baseUrl: this.reviewBaseUrl ?? DEFAULT_ANTHROPIC_BASE_URL,
+        defaultModel: this.reviewModel ?? 'claude-sonnet-4-6',
+        defaultSystemPrompt: 'You are a strict code review checker. Return only valid JSON.',
+        maxConcurrent: 5,
+      });
+      return this.pool;
+    })();
+
+    try {
+      return await this.poolPromise;
+    } finally {
+      this.poolPromise = null;
+    }
   }
 }

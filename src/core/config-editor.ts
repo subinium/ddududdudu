@@ -2,7 +2,7 @@ import { constants } from 'node:fs';
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-import YAML from 'yaml';
+import { parseYaml, stringifyYaml } from '../utils/yaml.js';
 
 import { getDduduPaths } from './dirs.js';
 
@@ -34,7 +34,7 @@ export const readDduduConfigOverride = async (
     return {};
   }
 
-  return ensureRecord(YAML.parse(raw));
+  return ensureRecord(parseYaml(raw));
 };
 
 export const writeDduduConfigOverride = async (
@@ -44,7 +44,7 @@ export const writeDduduConfigOverride = async (
 ): Promise<string> => {
   const configPath = getConfigPath(cwd, scope);
   await mkdir(dirname(configPath), { recursive: true });
-  await writeFile(configPath, YAML.stringify(value), 'utf8');
+  await writeFile(configPath, stringifyYaml(value), 'utf8');
   return configPath;
 };
 

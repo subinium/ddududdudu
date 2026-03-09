@@ -2,7 +2,7 @@ import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
 
-import YAML from 'yaml';
+import { parseYaml, stringifyYaml } from '../utils/yaml.js';
 
 import type { AuthProviderName } from './login.js';
 
@@ -58,7 +58,7 @@ export const readAuthStore = async (): Promise<AuthStoreShape> => {
   const filePath = resolveAuthStorePath();
   try {
     const raw = await readFile(filePath, 'utf8');
-    const parsed = YAML.parse(raw) as unknown;
+    const parsed = parseYaml(raw) as unknown;
     if (!isRecord(parsed)) {
       return {};
     }
@@ -94,7 +94,7 @@ export const setStoredProviderAuth = async (
     updatedAt: new Date().toISOString(),
   };
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, YAML.stringify(store), 'utf8');
+  await writeFile(filePath, stringifyYaml(store), 'utf8');
   return filePath;
 };
 
@@ -103,7 +103,7 @@ export const deleteStoredProviderAuth = async (provider: AuthProviderName): Prom
   const store = await readAuthStore();
   delete store[provider];
   await mkdir(dirname(filePath), { recursive: true });
-  await writeFile(filePath, YAML.stringify(store), 'utf8');
+  await writeFile(filePath, stringifyYaml(store), 'utf8');
   return filePath;
 };
 

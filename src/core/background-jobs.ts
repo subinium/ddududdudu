@@ -10,7 +10,7 @@ import type { WorkflowArtifact } from './workflow-state.js';
 
 export type BackgroundJobKind = 'delegate' | 'team';
 export type BackgroundJobStatus = 'queued' | 'running' | 'done' | 'error';
-export type BackgroundJobChecklistStatus = 'pending' | 'in_progress' | 'completed' | 'error';
+export type BackgroundJobChecklistStatus = 'pending' | 'blocked' | 'in_progress' | 'completed' | 'error';
 
 export interface BackgroundJobAgentActivity {
   id: string;
@@ -30,6 +30,8 @@ export interface BackgroundJobChecklistItem {
   owner: string | null;
   status: BackgroundJobChecklistStatus;
   detail: string | null;
+  dependsOn?: string[];
+  handoffTo?: string | null;
   updatedAt: number;
 }
 
@@ -97,7 +99,52 @@ const isNamedMode = (value: unknown): value is NamedMode =>
 const isAgentStatus = (value: unknown): value is BackgroundJobAgentActivity['status'] =>
   value === 'queued' || value === 'running' || value === 'verifying' || value === 'done' || value === 'error';
 const isChecklistStatus = (value: unknown): value is BackgroundJobChecklistStatus =>
-  value === 'pending' || value === 'in_progress' || value === 'completed' || value === 'error';
+  value === 'pending' || value === 'blocked' || value === 'in_progress' || value === 'completed' || value === 'error';
+
+const normalizeChecklistDependencies = (value: unknown): string[] =>
+  Array.isArray(value)
+    ? Array.from(
+        new Set(
+          value
+            .filter((item): item is string => typeof item === 'string')
+            .map((item) => item.trim())
+            .filter(Boolean),
+        ),
+      )
+    : [];
+
+export const normalizeBackgroundJobChecklist = (
+  checklist: BackgroundJobChecklistItem[] | undefined | null,
+): BackgroundJobChecklistItem[] => {
+  if (!Array.isArray(checklist) || checklist.length === 0) {
+    return [];
+  }
+
+  const completed = new Set(
+    checklist
+      .filter((item) => item.status === 'completed')
+      .map((item) => item.id),
+  );
+
+  return checklist.map((item) => {
+    const dependsOn = normalizeChecklistDependencies(item.dependsOn);
+    const hasPendingDependency =
+      dependsOn.length > 0 && dependsOn.some((dependencyId) => !completed.has(dependencyId));
+    const normalizedStatus =
+      item.status === 'pending' || item.status === 'blocked'
+        ? hasPendingDependency
+          ? 'blocked'
+          : 'pending'
+        : item.status;
+
+    return {
+      ...item,
+      status: normalizedStatus,
+      dependsOn: dependsOn.length > 0 ? dependsOn : undefined,
+      handoffTo: typeof item.handoffTo === 'string' && item.handoffTo.trim() ? item.handoffTo : null,
+    };
+  });
+};
 
 const parseJob = (raw: string): BackgroundJobRecord | null => {
   const parsed = JSON.parse(raw) as unknown;
@@ -140,6 +187,8 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
           owner: typeof item.owner === 'string' ? item.owner : null,
           status: isChecklistStatus(item.status) ? item.status : 'pending',
           detail: typeof item.detail === 'string' ? item.detail : null,
+          dependsOn: normalizeChecklistDependencies(item.dependsOn),
+          handoffTo: typeof item.handoffTo === 'string' ? item.handoffTo : null,
           updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.now(),
         }))
     : [];
@@ -187,7 +236,7 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
     artifacts: Array.isArray(parsed.artifacts) ? (parsed.artifacts as WorkflowArtifact[]) : [],
     teamAgents: Array.isArray(parsed.teamAgents) ? (parsed.teamAgents as AgentRole[]) : [],
     teamSharedContext: typeof parsed.teamSharedContext === 'string' ? parsed.teamSharedContext : null,
-    checklist,
+    checklist: normalizeBackgroundJobChecklist(checklist),
     agentActivities,
     result: isRecord(parsed.result) ? (parsed.result as unknown as BackgroundJobResult) : null,
     artifact: isRecord(parsed.artifact) ? (parsed.artifact as unknown as WorkflowArtifact) : null,
@@ -234,6 +283,7 @@ export class BackgroundJobStore {
       finishedAt: input.finishedAt ?? null,
       updatedAt: now,
     };
+    record.checklist = normalizeBackgroundJobChecklist(record.checklist);
     await this.save(record);
     return record;
   }
@@ -252,6 +302,7 @@ export class BackgroundJobStore {
     await mkdir(this.jobDirectory, { recursive: true });
     const normalized: BackgroundJobRecord = {
       ...record,
+      checklist: normalizeBackgroundJobChecklist(record.checklist),
       updatedAt: Date.now(),
     };
     await writeFile(this.getJobPath(record.id), `${JSON.stringify(normalized, null, 2)}\n`, 'utf8');

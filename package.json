@@ -10,11 +10,11 @@
     "ddudu": "./dist/index.js"
   },
   "scripts": {
-    "build": "tsc && cargo build --manifest-path tui/Cargo.toml --release && mkdir -p dist/tui && cp tui/target/release/ddudu-tui dist/tui/ddudu-tui && chmod +x dist/tui/ddudu-tui && (command -v codesign >/dev/null 2>&1 && codesign --force --deep --sign - dist/tui/ddudu-tui || true) && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
-    "dev": "tsc --watch",
+    "build": "node scripts/transpile-runner.cjs && cargo build --manifest-path tui/Cargo.toml --release && mkdir -p dist/tui && cp tui/target/release/ddudu-tui dist/tui/ddudu-tui && chmod +x dist/tui/ddudu-tui && (command -v codesign >/dev/null 2>&1 && codesign --force --deep --sign - dist/tui/ddudu-tui || true) && node -e \"require('node:fs').chmodSync('dist/index.js', 0o755)\"",
+    "dev": "node --watch scripts/transpile-runner.cjs",
     "start": "node dist/index.js",
-    "lint": "tsc --noEmit",
-    "test": "npm run build && node --test test/*.test.mjs",
+    "lint": "node scripts/transpile-runner.cjs --noEmit",
+    "test": "npm run build && node scripts/run-node-tests.cjs",
     "bench:run": "node bench/run.mjs",
     "bench:report": "node bench/report.mjs",
     "clean": "rm -rf dist",

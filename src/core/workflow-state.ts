@@ -86,8 +86,10 @@ export interface WorkflowBackgroundJobSnapshot {
     id: string;
     label: string;
     owner: string | null;
-    status: 'pending' | 'in_progress' | 'completed' | 'error';
+    status: 'pending' | 'blocked' | 'in_progress' | 'completed' | 'error';
     detail: string | null;
+    dependsOn?: string[];
+    handoffTo?: string | null;
     updatedAt: number;
   }[];
 }

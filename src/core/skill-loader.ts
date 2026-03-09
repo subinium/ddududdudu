@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, resolve } from 'node:path';
-import YAML from 'yaml';
+import { parseYaml } from '../utils/yaml.js';
 
 import { getDduduPaths } from './dirs.js';
 
@@ -51,7 +51,7 @@ const parseMarkdownFrontmatter = (content: string): ParsedMarkdown => {
 
   let frontmatter: Record<string, unknown> = {};
   try {
-    const parsed = YAML.parse(match[1] ?? '') as unknown;
+    const parsed = parseYaml(match[1] ?? '') as unknown;
     if (isObject(parsed)) {
       frontmatter = parsed;
     }

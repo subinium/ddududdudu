@@ -461,13 +461,21 @@ const createChecklistItem = (
   id: string,
   label: string,
   status: BackgroundJobChecklistItem['status'],
-  options: { owner?: string | null; detail?: string | null } = {},
+  options: {
+    owner?: string | null;
+    detail?: string | null;
+    dependsOn?: string[];
+    handoffTo?: string | null;
+  } = {},
 ): BackgroundJobChecklistItem => ({
   id,
   label,
   owner: options.owner ?? null,
   status,
   detail: options.detail ?? null,
+  dependsOn:
+    options.dependsOn && options.dependsOn.length > 0 ? Array.from(new Set(options.dependsOn)) : undefined,
+  handoffTo: options.handoffTo ?? null,
   updatedAt: Date.now(),
 });
 
@@ -504,11 +512,21 @@ const buildDelegateJobChecklist = (
   ];
 
   if (verificationMode && verificationMode !== 'none') {
-    items.push(createChecklistItem('verify', 'Run verification checks', 'pending', { owner }));
+    items.push(
+      createChecklistItem('verify', 'Run verification checks', 'blocked', {
+        owner,
+        dependsOn: ['execute'],
+      }),
+    );
   }
 
   if (purpose === 'execution' || purpose === 'design') {
-    items.push(createChecklistItem('apply', 'Land workspace changes', 'pending', { owner: 'ddudu' }));
+    items.push(
+      createChecklistItem('apply', 'Land workspace changes', 'blocked', {
+        owner: 'ddudu',
+        dependsOn: verificationMode && verificationMode !== 'none' ? ['verify'] : ['execute'],
+      }),
+    );
   }
   return items;
 };
@@ -516,18 +534,53 @@ const buildDelegateJobChecklist = (
 const buildTeamJobChecklist = (
   teamAgents: TeamAgentRole[],
   strategy: 'parallel' | 'sequential' | 'delegate',
-): BackgroundJobChecklistItem[] => [
-  ...teamAgents
+): BackgroundJobChecklistItem[] => {
+  const workerItems = teamAgents
     .filter((agent) => isRunnableTeamAgent(agent))
     .map((agent) =>
-    createChecklistItem(`agent:${agent.id}`, agent.taskLabel ?? `Run ${agent.name}`, 'pending', {
-      owner: formatTeamAgentLabel(agent),
-      detail: agent.readOnly ? 'read-only' : null,
-    })),
-  createChecklistItem('synthesize', `Merge ${strategy} worker output`, 'pending', {
-    owner: teamAgents.find((agent) => agent.role === 'lead')?.name ?? 'lead',
-  }),
-];
+      createChecklistItem(
+        `agent:${agent.id}`,
+        agent.taskLabel ?? `Run ${agent.name}`,
+        agent.dependencyLabels && agent.dependencyLabels.length > 0 ? 'blocked' : 'pending',
+        {
+          owner: formatTeamAgentLabel(agent),
+          dependsOn:
+            agent.dependencyUnitIds && agent.dependencyUnitIds.length > 0
+              ? teamAgents
+                  .filter(
+                    (candidate) =>
+                      typeof candidate.workUnitId === 'string' &&
+                      agent.dependencyUnitIds?.includes(candidate.workUnitId),
+                  )
+                  .map((candidate) => `agent:${candidate.id}`)
+              : undefined,
+          handoffTo: agent.handoffTo ?? null,
+          detail: [
+            agent.readOnly ? 'read-only' : 'write',
+            agent.dependencyLabels && agent.dependencyLabels.length > 0
+              ? `blocked by ${agent.dependencyLabels.slice(0, 2).join(', ')}`
+              : null,
+            agent.handoffTo ? `handoff ${agent.handoffTo}` : null,
+          ]
+            .filter((part): part is string => Boolean(part))
+            .join(' · ') || null,
+        },
+      ),
+    );
+
+  return [
+    ...workerItems,
+    createChecklistItem(
+      'synthesize',
+      `Merge ${strategy} worker output`,
+      workerItems.length > 0 ? 'blocked' : 'pending',
+      {
+        owner: teamAgents.find((agent) => agent.role === 'lead')?.name ?? 'lead',
+        dependsOn: workerItems.map((item) => item.id),
+      },
+    ),
+  ];
+};
 
 const summarizeChecklistProgress = (checklist: BackgroundJobChecklistItem[]): string | null => {
   if (checklist.length === 0) {
@@ -536,12 +589,14 @@ const summarizeChecklistProgress = (checklist: BackgroundJobChecklistItem[]): st
 
   const completed = checklist.filter((item) => item.status === 'completed').length;
   const inProgress = checklist.filter((item) => item.status === 'in_progress').length;
+  const blocked = checklist.filter((item) => item.status === 'blocked').length;
   const failed = checklist.filter((item) => item.status === 'error').length;
   const total = checklist.length;
   const detail = [
     `${completed}/${total} done`,
     inProgress > 0 ? `${inProgress} active` : null,
-    failed > 0 ? `${failed} blocked` : null,
+    blocked > 0 ? `${blocked} blocked` : null,
+    failed > 0 ? `${failed} failed` : null,
   ]
     .filter((part): part is string => Boolean(part))
     .join(' · ');
@@ -5065,7 +5120,16 @@ export class NativeBridgeController {
     const assignments = allocation.units.map((unit) => {
       const modeLabel = unit.preferredMode ? HARNESS_MODES[unit.preferredMode]?.label ?? unit.preferredMode : 'Auto';
       const access = unit.readOnly ? 'read-only' : 'write';
-      return `${modeLabel} · ${unit.role} · ${unit.label} · ${access}`;
+      return [
+        modeLabel,
+        unit.role,
+        unit.label,
+        access,
+        unit.dependsOn.length > 0 ? `after ${unit.dependsOn.join(', ')}` : null,
+        unit.handoffTo ? `handoff ${getSpecialistRoleProfile(unit.handoffTo).label}` : null,
+      ]
+        .filter((part): part is string => Boolean(part))
+        .join(' · ');
     });
 
     return this.rememberArtifact({
@@ -6933,6 +6997,7 @@ export class NativeBridgeController {
     ];
 
     let counter = 0;
+    const unitsByLabel = new Map(allocation.units.map((unit) => [unit.label, unit]));
     for (const unit of allocation.units) {
       const mode = unit.preferredMode ?? leadMode;
       agents.push(
@@ -6948,6 +7013,12 @@ export class NativeBridgeController {
             deliverable: unit.deliverable,
             successCriteria: unit.successCriteria,
             readOnly: unit.readOnly,
+            dependencyLabels: [...unit.dependsOn],
+            dependencyUnitIds: unit.dependsOn
+              .map((label) => unitsByLabel.get(label)?.id ?? null)
+              .filter((id): id is string => typeof id === 'string'),
+            handoffTo: unit.handoffTo ? getSpecialistRoleProfile(unit.handoffTo).label : undefined,
+            workUnitId: unit.id,
           },
         ),
       );
@@ -7121,7 +7192,17 @@ export class NativeBridgeController {
       .map((message) => `- ${message.from} -> ${message.to} [${message.type}] ${previewText(message.content, 92)}`);
     const assignments = agents
       .filter((agent) => isRunnableTeamAgent(agent))
-      .map((agent) => `- ${formatTeamAgentLabel(agent)}: ${agent.taskLabel ?? agent.role}`);
+      .map((agent) =>
+        [
+          `- ${formatTeamAgentLabel(agent)}: ${agent.taskLabel ?? agent.role}`,
+          agent.dependencyLabels && agent.dependencyLabels.length > 0
+            ? `after ${agent.dependencyLabels.join(', ')}`
+            : null,
+          agent.handoffTo ? `handoff ${agent.handoffTo}` : null,
+        ]
+          .filter((part): part is string => Boolean(part))
+          .join(' · '),
+      );
 
     return [
       '# Team Run',

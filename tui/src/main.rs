@@ -194,6 +194,8 @@ struct NativeJobChecklistItem {
     owner: Option<String>,
     status: String,
     detail: Option<String>,
+    depends_on: Option<Vec<String>>,
+    handoff_to: Option<String>,
     updated_at: u64,
 }
 
@@ -1361,6 +1363,7 @@ impl App {
                     let marker = match status {
                         "completed" => "[x]",
                         "in_progress" => SPINNER_FRAMES[self.spinner_index],
+                        "blocked" => "[-]",
                         "error" => "[!]",
                         _ => "[ ]",
                     };
@@ -3194,12 +3197,14 @@ fn checklist_progress(checklist: &[NativeJobChecklistItem]) -> Option<String> {
     let total = checklist.len();
     let completed = checklist.iter().filter(|item| item.status == "completed").count();
     let active = checklist.iter().filter(|item| item.status == "in_progress").count();
-    let blocked = checklist.iter().filter(|item| item.status == "error").count();
+    let blocked = checklist.iter().filter(|item| item.status == "blocked").count();
+    let failed = checklist.iter().filter(|item| item.status == "error").count();
 
     let summary = [
         Some(format!("{completed}/{total} done")),
         (active > 0).then(|| format!("{active} active")),
         (blocked > 0).then(|| format!("{blocked} blocked")),
+        (failed > 0).then(|| format!("{failed} failed")),
     ]
     .into_iter()
     .flatten()
@@ -3213,6 +3218,7 @@ fn checklist_status_marker(status: &str, spinner_index: usize) -> (&'static str,
     match status {
         "completed" => ("[x]", SUCCESS),
         "in_progress" => (SPINNER_FRAMES[spinner_index], ACCENT),
+        "blocked" => ("[-]", ACCENT_DIM),
         "error" => ("[!]", ERROR),
         _ => ("[ ]", ACCENT_DIM),
     }

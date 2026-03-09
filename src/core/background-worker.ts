@@ -750,7 +750,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               updatedAt: Date.now(),
             };
           }
-          if (item.id.startsWith('agent:') && item.status === 'pending') {
+          if (item.id.startsWith('agent:') && (item.status === 'pending' || item.status === 'blocked')) {
             return {
               ...item,
               status: result.success ? 'completed' : item.status,
