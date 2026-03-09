@@ -41,14 +41,20 @@ const compilerOptions = {
   declarationMap: false,
 };
 
-const diagnostics = [];
-
 if (!noEmit) {
   fs.rmSync(distRoot, { recursive: true, force: true });
 }
 
+const diagnostics = [];
+const sourceFiles = new Map();
+
 for (const fileName of parsedConfig.fileNames) {
   const source = fs.readFileSync(fileName, 'utf8');
+  sourceFiles.set(fileName, source);
+  if (fileName.endsWith('.d.ts') || fileName.endsWith('.d.mts') || fileName.endsWith('.d.cts')) {
+    continue;
+  }
+
   const transpileFileName = fileName.replace(/\.ts$/, '.mts');
   const output = ts.transpileModule(source, {
     compilerOptions,
@@ -74,7 +80,11 @@ for (const fileName of parsedConfig.fileNames) {
   }
 }
 
-copyStaticFiles(srcRoot, distRoot);
+diagnostics.push(...validateLocalModuleContracts(sourceFiles));
+
+if (!noEmit) {
+  copyStaticFiles(srcRoot, distRoot);
+}
 
 const filteredDiagnostics = diagnostics.filter(
   (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
@@ -110,4 +120,148 @@ function copyStaticFiles(fromDir, toDir) {
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.copyFileSync(sourcePath, targetPath);
   }
+}
+
+function validateLocalModuleContracts(sourceFiles) {
+  const diagnostics = [];
+  const exportMap = new Map();
+  const normalizedFiles = Array.from(sourceFiles.keys());
+
+  for (const [fileName, source] of sourceFiles.entries()) {
+    const sourceFile = ts.createSourceFile(fileName, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+    exportMap.set(fileName, collectExports(sourceFile));
+  }
+
+  for (const [fileName, source] of sourceFiles.entries()) {
+    const sourceFile = ts.createSourceFile(fileName, source, ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS);
+    for (const statement of sourceFile.statements) {
+      if (!ts.isImportDeclaration(statement) || !ts.isStringLiteral(statement.moduleSpecifier)) {
+        continue;
+      }
+
+      const specifier = statement.moduleSpecifier.text;
+      if (!specifier.startsWith('.')) {
+        continue;
+      }
+
+      const resolved = resolveLocalModule(fileName, specifier, normalizedFiles);
+      if (!resolved) {
+        diagnostics.push(makeDiagnostic(fileName, statement.moduleSpecifier, `Cannot resolve local module '${specifier}'.`));
+        continue;
+      }
+
+      const exports = exportMap.get(resolved);
+      if (!exports) {
+        diagnostics.push(makeDiagnostic(fileName, statement.moduleSpecifier, `No export metadata available for '${specifier}'.`));
+        continue;
+      }
+
+      const clause = statement.importClause;
+      if (!clause) {
+        continue;
+      }
+
+      if (clause.name && !exports.default) {
+        diagnostics.push(makeDiagnostic(fileName, clause.name, `Module '${specifier}' has no default export.`));
+      }
+
+      if (clause.namedBindings && ts.isNamedImports(clause.namedBindings)) {
+        for (const element of clause.namedBindings.elements) {
+          const importedName = (element.propertyName ?? element.name).text;
+          if (!exports.named.has(importedName)) {
+            diagnostics.push(
+              makeDiagnostic(
+                fileName,
+                element,
+                `Module '${specifier}' has no exported member '${importedName}'.`,
+              ),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  return diagnostics;
+}
+
+function collectExports(sourceFile) {
+  const named = new Set();
+  let defaultExport = false;
+
+  for (const statement of sourceFile.statements) {
+    if (hasExportModifier(statement)) {
+      if (statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DefaultKeyword)) {
+        defaultExport = true;
+      }
+
+      if (statement.name && ts.isIdentifier(statement.name)) {
+        named.add(statement.name.text);
+      }
+
+      if (ts.isVariableStatement(statement)) {
+        for (const declaration of statement.declarationList.declarations) {
+          if (ts.isIdentifier(declaration.name)) {
+            named.add(declaration.name.text);
+          }
+        }
+      }
+    }
+
+    if (ts.isExportAssignment(statement)) {
+      defaultExport = true;
+      continue;
+    }
+
+    if (ts.isExportDeclaration(statement) && statement.exportClause && ts.isNamedExports(statement.exportClause)) {
+      for (const element of statement.exportClause.elements) {
+        named.add(element.name.text);
+      }
+    }
+  }
+
+  return {
+    named,
+    default: defaultExport,
+  };
+}
+
+function hasExportModifier(statement) {
+  return Boolean(statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword));
+}
+
+function resolveLocalModule(fromFile, specifier, fileNames) {
+  const base = path.resolve(path.dirname(fromFile), specifier);
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.d.ts`,
+    `${base}.d.mts`,
+    `${base}.d.cts`,
+    base.replace(/\.js$/i, '.ts'),
+    base.replace(/\.js$/i, '.tsx'),
+    base.replace(/\.mjs$/i, '.d.mts'),
+    base.replace(/\.cjs$/i, '.d.cts'),
+    base.replace(/\.js$/i, '.d.ts'),
+    path.join(base, 'index.ts'),
+    path.join(base, 'index.tsx'),
+    path.join(base, 'index.d.ts'),
+    path.join(base.replace(/\.js$/i, ''), 'index.ts'),
+    path.join(base.replace(/\.js$/i, ''), 'index.tsx'),
+    path.join(base.replace(/\.js$/i, ''), 'index.d.ts'),
+  ];
+
+  return candidates.find((candidate) => fileNames.includes(candidate)) ?? null;
+}
+
+function makeDiagnostic(fileName, node, messageText) {
+  return {
+    category: ts.DiagnosticCategory.Error,
+    code: 9001,
+    file: ts.createSourceFile(fileName, fs.readFileSync(fileName, 'utf8'), ts.ScriptTarget.ES2022, true, ts.ScriptKind.TS),
+    start: node.getStart(),
+    length: node.getWidth(),
+    messageText,
+  };
 }

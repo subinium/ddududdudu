@@ -65,3 +65,49 @@ test('TeamOrchestrator respects worker dependencies during parallel execution', 
   assert.ok(events.indexOf('planner:done') < events.indexOf('executor:start'));
   assert.ok(executorStartedAt >= plannerDoneAt);
 });
+
+test('TeamOrchestrator fails fast when worker dependencies cannot be satisfied', async () => {
+  const orchestrator = new TeamOrchestrator({
+    name: 'blocked-team',
+    strategy: 'parallel',
+    maxRounds: 1,
+    agents: [
+      {
+        id: 'lead',
+        name: 'Jennie',
+        role: 'lead',
+        provider: 'anthropic',
+        model: 'claude-opus-4-6',
+        systemPrompt: 'coordinate',
+      },
+      {
+        id: 'planner',
+        name: 'Rosé',
+        role: 'worker',
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-6',
+        systemPrompt: 'plan',
+        taskLabel: 'Define scope',
+        workUnitId: 'unit-planner',
+        dependencyUnitIds: ['unit-executor'],
+      },
+      {
+        id: 'executor',
+        name: 'Lisa',
+        role: 'worker',
+        provider: 'openai',
+        model: 'gpt-5.4',
+        systemPrompt: 'execute',
+        taskLabel: 'Implement the change',
+        workUnitId: 'unit-executor',
+        dependencyUnitIds: ['unit-planner'],
+      },
+    ],
+    runAgent: async () => 'ok',
+  });
+
+  await assert.rejects(
+    orchestrator.run('deadlocked team run'),
+    /unresolved dependencies/i,
+  );
+});

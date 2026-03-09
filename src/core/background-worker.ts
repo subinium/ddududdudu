@@ -209,7 +209,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
   const sessionManager = new SessionManager(config.session.directory);
   const job = await store.load(jobId);
 
-  if (job.status === 'done' || job.status === 'error') {
+  if (job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
     return;
   }
 
@@ -258,7 +258,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
   const handleTerminate = (signal: NodeJS.Signals): void => {
     abortController.abort();
     queuePersist({
-      status: 'error',
+      status: 'cancelled',
       detail: `cancelled by ${signal.toLowerCase()}`,
       finishedAt: Date.now(),
       pid: null,
@@ -767,7 +767,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
   } catch (error: unknown) {
     const detail = abortController.signal.aborted ? current.detail ?? 'background job aborted' : serializeError(error);
     current = await store.update(current.id, {
-      status: 'error',
+      status: abortController.signal.aborted ? 'cancelled' : 'error',
       detail,
       finishedAt: Date.now(),
       pid: null,

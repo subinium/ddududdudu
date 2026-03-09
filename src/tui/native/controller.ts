@@ -161,7 +161,7 @@ interface BackgroundJobState {
   id: string;
   kind: 'delegate' | 'team';
   label: string;
-  status: 'running' | 'done' | 'error';
+  status: 'running' | 'done' | 'error' | 'cancelled';
   detail: string | null;
   startedAt: number;
   updatedAt: number;
@@ -1195,10 +1195,12 @@ export class NativeBridgeController {
           continue;
         }
 
-        if (previous === 'running' && (job.status === 'done' || job.status === 'error')) {
+        if (previous === 'running' && (job.status === 'done' || job.status === 'error' || job.status === 'cancelled')) {
           const jobRef = job.id.slice(0, 8);
           this.appendSystemMessage(
-            `[background] ${job.label} ${job.status === 'done' ? 'finished' : 'failed'} · /jobs result ${jobRef}`,
+            `[background] ${job.label} ${
+              job.status === 'done' ? 'finished' : job.status === 'cancelled' ? 'cancelled' : 'failed'
+            } · /jobs result ${jobRef}`,
           );
           if (job.status === 'done' && job.result?.verification?.status === 'passed') {
             const mode = job.result.mode === 'jennie' || job.result.mode === 'lisa' || job.result.mode === 'rosé' || job.result.mode === 'jisoo'
@@ -4826,10 +4828,13 @@ export class NativeBridgeController {
           if (job.status === 'running') {
             return 0;
           }
-          if (job.status === 'error') {
+          if (job.status === 'cancelled') {
             return 1;
           }
-          return 2;
+          if (job.status === 'error') {
+            return 2;
+          }
+          return 3;
         };
 
         return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
@@ -6011,11 +6016,12 @@ export class NativeBridgeController {
 
     const running = jobs.filter((job) => job.status === 'running').length;
     const done = jobs.filter((job) => job.status === 'done').length;
+    const cancelled = jobs.filter((job) => job.status === 'cancelled').length;
     const error = jobs.filter((job) => job.status === 'error').length;
 
     return [
       'Jobs',
-      `summary: ${running} running · ${done} done · ${error} error`,
+      `summary: ${running} running · ${done} done · ${cancelled} cancelled · ${error} error`,
       ...jobs.map((job, index) => {
         const detail = job.status === 'done'
           ? job.resultPreview ?? job.workspacePath ?? job.detail ?? null
@@ -6148,7 +6154,7 @@ export class NativeBridgeController {
       if (!stored) {
         return false;
       }
-      if (stored.status === 'done' || stored.status === 'error') {
+      if (stored.status === 'done' || stored.status === 'error' || stored.status === 'cancelled') {
         return true;
       }
       await new Promise((resolve) => {
@@ -6167,10 +6173,13 @@ export class NativeBridgeController {
           if (job.status === 'running') {
             return 0;
           }
-          if (job.status === 'error') {
+          if (job.status === 'cancelled') {
             return 1;
           }
-          return 2;
+          if (job.status === 'error') {
+            return 2;
+          }
+          return 3;
         };
         return priority(a) - priority(b) || b.updatedAt - a.updatedAt;
       });
@@ -6210,7 +6219,7 @@ export class NativeBridgeController {
         process.kill(stored.pid, 'SIGTERM');
       } catch {
         await this.backgroundJobStore?.update(job.id, {
-          status: 'error',
+          status: 'cancelled',
           detail: 'cancelled by user',
           finishedAt: Date.now(),
           pid: null,

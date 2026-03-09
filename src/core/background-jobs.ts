@@ -9,7 +9,7 @@ import type { VerificationMode, VerificationSummary } from './verifier.js';
 import type { WorkflowArtifact } from './workflow-state.js';
 
 export type BackgroundJobKind = 'delegate' | 'team';
-export type BackgroundJobStatus = 'queued' | 'running' | 'done' | 'error';
+export type BackgroundJobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 export type BackgroundJobChecklistStatus = 'pending' | 'blocked' | 'in_progress' | 'completed' | 'error';
 
 export interface BackgroundJobAgentActivity {
@@ -154,7 +154,11 @@ const parseJob = (raw: string): BackgroundJobRecord | null => {
 
   const kind = parsed.kind === 'delegate' || parsed.kind === 'team' ? parsed.kind : null;
   const status =
-    parsed.status === 'queued' || parsed.status === 'running' || parsed.status === 'done' || parsed.status === 'error'
+    parsed.status === 'queued' ||
+    parsed.status === 'running' ||
+    parsed.status === 'done' ||
+    parsed.status === 'error' ||
+    parsed.status === 'cancelled'
       ? parsed.status
       : null;
 

@@ -225,7 +225,7 @@ export class TeamOrchestrator {
 
     while (pending.size > 0) {
       const ready = this.selectReadyWorkers(pending, completed);
-      const wave = ready.length > 0 ? ready : [this.nextPendingWorker(pending)];
+      const wave = this.ensureReadyWorkers(ready, pending, completed);
       const workerTasks = wave.map((workerId) => {
         const dependencyContext = this.collectDependencyOutputs(workerId, completed);
         const taskText = this.buildWorkerSubtask(workerId, round, dependencyContext);
@@ -263,7 +263,7 @@ export class TeamOrchestrator {
 
     while (pending.size > 0) {
       const ready = this.selectReadyWorkers(pending, completed);
-      const workerId = ready.length > 0 ? ready[0] : this.nextPendingWorker(pending);
+      const workerId = this.ensureReadyWorkers(ready, pending, completed)[0]!;
       const dependencyContext = this.collectDependencyOutputs(workerId, completed);
       const taskText = this.buildWorkerSubtask(
         workerId,
@@ -314,7 +314,7 @@ export class TeamOrchestrator {
 
     while (pending.size > 0) {
       const ready = this.selectReadyWorkers(pending, completed);
-      const workerId = ready.length > 0 ? ready[0] : this.nextPendingWorker(pending);
+      const workerId = this.ensureReadyWorkers(ready, pending, completed)[0]!;
       const dependencyContext = this.collectDependencyOutputs(workerId, completed);
       const subtask = this.buildWorkerSubtask(workerId, round, dependencyContext);
       this.routeMessage({
@@ -377,6 +377,49 @@ export class TeamOrchestrator {
       throw new Error('No pending worker available.');
     }
     return workerId;
+  }
+
+  private ensureReadyWorkers(
+    ready: string[],
+    pending: Set<string>,
+    completed: Set<string>,
+  ): string[] {
+    if (ready.length > 0) {
+      return ready;
+    }
+
+    const unresolved = Array.from(pending).map((workerId) => {
+      const agent = this.agentsById.get(workerId);
+      const dependencies = this.getWorkerDependencies(workerId)
+        .filter((dependencyId) => !completed.has(dependencyId))
+        .map((dependencyId) => this.agentsById.get(dependencyId)?.name ?? dependencyId);
+
+      return {
+        label: agent?.name ?? workerId,
+        dependencies,
+      };
+    });
+
+    const detail = unresolved
+      .map(({ label, dependencies }) =>
+        dependencies.length > 0
+          ? `${label} waiting on ${dependencies.join(', ')}`
+          : `${label} has unresolved dependencies`,
+      )
+      .join('; ');
+
+    this.routeMessage({
+      from: this.leadId,
+      to: 'broadcast',
+      type: 'status',
+      content: `Team run blocked by unresolved dependencies: ${detail}`,
+      metadata: {
+        unresolved,
+      },
+      timestamp: Date.now(),
+    });
+
+    throw new Error(`Team run blocked by unresolved dependencies: ${detail}`);
   }
 
   private collectDependencyOutputs(workerId: string, completed: Set<string>): string | undefined {

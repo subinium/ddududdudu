@@ -65,7 +65,7 @@ export interface WorkflowBackgroundJobSnapshot {
   id: string;
   kind: 'delegate' | 'team';
   label: string;
-  status: 'running' | 'done' | 'error';
+  status: 'running' | 'done' | 'error' | 'cancelled';
   detail: string | null;
   startedAt: number;
   updatedAt: number;

@@ -727,6 +727,10 @@ impl App {
                     {
                         pending_notices.push((format!("{} finished", job.label), NoticeTone::Success));
                     } else if matches!(previous.map(|value| value.as_str()), Some("running" | "done"))
+                        && job.status == "cancelled"
+                    {
+                        pending_notices.push((format!("{} cancelled", job.label), NoticeTone::Info));
+                    } else if matches!(previous.map(|value| value.as_str()), Some("running" | "done"))
                         && job.status == "error"
                     {
                         pending_notices.push((format!("{} failed", job.label), NoticeTone::Error));
@@ -1139,6 +1143,7 @@ impl App {
                 "verifying" => ("◌", ACCENT),
                 "done" => ("✓", SUCCESS),
                 "error" => ("!", ERROR),
+                "cancelled" => ("×", ACCENT_DIM),
                 "queued" => ("•", ACCENT_DIM),
                 _ => ("·", ACCENT_DIM),
             };
@@ -1202,6 +1207,7 @@ impl App {
                 "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
                 "done" => ("✓", SUCCESS),
                 "error" => ("!", ERROR),
+                "cancelled" => ("×", ACCENT_DIM),
                 _ => ("·", ACCENT_DIM),
             };
             let elapsed = format_elapsed(Some(job.started_at));
@@ -3429,6 +3435,7 @@ fn current_run_summary(state: &NativeTuiState) -> (String, Option<String>) {
         let status = match job.status.as_str() {
             "running" => "running",
             "done" => "done",
+            "cancelled" => "cancelled",
             "error" => "blocked",
             _ => job.status.as_str(),
         };

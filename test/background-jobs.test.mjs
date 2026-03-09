@@ -179,3 +179,40 @@ test('BackgroundJobStore normalizes blocked checklist items from dependency stat
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('BackgroundJobStore persists cancelled jobs separately from failed jobs', async () => {
+  const root = await mkdtemp(resolve(tmpdir(), 'ddudu-job-store-cancelled-'));
+  try {
+    const store = new BackgroundJobStore(resolve(root, 'jobs'));
+    const record = await store.create({
+      sessionId: 'session-cancelled',
+      kind: 'delegate',
+      label: 'cancelled delegate',
+      cwd: root,
+      prompt: 'do work',
+      purpose: 'execution',
+      preferredMode: 'lisa',
+      preferredModel: 'gpt-5.4',
+      reason: 'manual cancel',
+      attempt: 0,
+      verificationMode: 'checks',
+      contextSnapshot: null,
+      artifacts: [],
+      teamAgents: [],
+      teamSharedContext: null,
+      agentActivities: [],
+      result: null,
+      artifact: null,
+      status: 'cancelled',
+      detail: 'cancelled by user',
+      startedAt: Date.now() - 500,
+      finishedAt: Date.now(),
+    });
+
+    const loaded = await store.load(record.id);
+    assert.equal(loaded.status, 'cancelled');
+    assert.match(loaded.detail ?? '', /cancelled by user/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
