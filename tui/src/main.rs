@@ -915,10 +915,19 @@ impl App {
             frame.area(),
         );
 
-        let root = if frame.area().width >= 100 {
+        let sidebar_width = if frame.area().width >= 124 {
+            44
+        } else if frame.area().width >= 104 {
+            40
+        } else if frame.area().width >= 88 {
+            34
+        } else {
+            0
+        };
+        let root = if sidebar_width > 0 {
             Layout::default()
                 .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(20), Constraint::Length(44)])
+                .constraints([Constraint::Min(20), Constraint::Length(sidebar_width)])
                 .split(frame.area())
         } else {
             Layout::default()
@@ -935,13 +944,25 @@ impl App {
         } else {
             0
         };
+        let ask_user_extra_rows = self
+            .state
+            .ask_user
+            .as_ref()
+            .map(|prompt| {
+                if prompt.options.is_empty() {
+                    0
+                } else {
+                    prompt.options.len().min(3) as u16 + 2
+                }
+            })
+            .unwrap_or(0);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Min(6),
                 Constraint::Length(1),
                 Constraint::Length(queue_height),
-                Constraint::Length(6),
+                Constraint::Length(6 + ask_user_extra_rows),
             ])
             .split(main);
 
@@ -1113,25 +1134,12 @@ impl App {
         if !self.state.agent_activities.is_empty() {
             has_activity = true;
             lines.push(sidebar_header("Workers"));
-            let runnable_workers = self.state.agent_activities.len();
-            let active_workers = self
-                .state
-                .agent_activities
-                .iter()
-                .filter(|item| item.status == "running" || item.status == "verifying" || item.status == "queued")
-                .count();
-            let strategy = active_job
-                .and_then(|job| job.strategy.as_ref().cloned())
-                .or_else(|| self.state.team_run_strategy.clone());
             push_sidebar_rail_item(
                 lines,
                 "·",
                 ACCENT_DIM,
-                format!("{} workers", format_count(runnable_workers as u64)),
-                Some(match strategy {
-                    Some(strategy) => format!("{} active · {strategy}", format_count(active_workers as u64)),
-                    None => format!("{} active", format_count(active_workers as u64)),
-                }),
+                "specialist workers".to_string(),
+                worker_pool_summary(&self.state, active_job),
                 FG,
                 ACCENT_DIM,
             );
@@ -1147,34 +1155,32 @@ impl App {
                 "queued" => ("•", ACCENT_DIM),
                 _ => ("·", ACCENT_DIM),
             };
-            let title = match (&item.mode, &item.purpose) {
-                (Some(mode), Some(purpose)) => {
-                    format!("{} · {}", title_case_label(mode), display_purpose_role(purpose))
-                }
-                (Some(mode), None) => title_case_label(mode),
-                (None, Some(purpose)) => {
-                    format!("{} · {}", item.label, display_purpose_role(purpose))
-                }
-                (None, None) => item.label.clone(),
-            };
-            let linked_detail = item
-                .checklist_id
-                .as_ref()
-                .and_then(|id| active_job.and_then(|job| checklist_todo_ref(&job.checklist, id)))
-                .map(|todo_ref| match item.detail.as_ref() {
-                    Some(detail) if !detail.trim().is_empty() => {
-                        format!("{todo_ref} · {}", preview_line(detail, 20))
+            let title = if !item.label.trim().is_empty() {
+                item.label.clone()
+            } else {
+                match (&item.mode, &item.purpose) {
+                    (Some(mode), Some(purpose)) => {
+                        format!("{} · {}", title_case_label(mode), display_purpose_role(purpose))
                     }
-                    _ => todo_ref,
-                });
-            let title = if let Some(todo_ref) = item
+                    (Some(mode), None) => title_case_label(mode),
+                    (None, Some(purpose)) => display_purpose_role(purpose),
+                    (None, None) => "worker".to_string(),
+                }
+            };
+            let todo_ref = item
                 .checklist_id
                 .as_ref()
-                .and_then(|id| active_job.and_then(|job| checklist_todo_ref(&job.checklist, id)))
-            {
+                .and_then(|id| active_job.and_then(|job| checklist_todo_ref(&job.checklist, id)));
+            let title = if let Some(todo_ref) = &todo_ref {
                 format!("{todo_ref} · {}", preview_line(&title, 18))
             } else {
                 title
+            };
+            let linked_detail = match item.detail.as_ref() {
+                Some(detail) if !detail.trim().is_empty() => {
+                    Some(format!("{} · {}", worker_status_word(&item.status), preview_line(detail, 18)))
+                }
+                _ => Some(worker_status_word(&item.status).to_string()),
             };
             push_sidebar_selectable_item(
                 lines,
@@ -1184,7 +1190,6 @@ impl App {
                 preview_line(&title, 28),
                 linked_detail
                     .map(|detail| preview_line(&detail, 28))
-                    .or_else(|| item.detail.as_ref().map(|detail| preview_line(detail, 28)))
                     .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 28))),
                 FG,
                 ACCENT_DIM,
@@ -1273,12 +1278,30 @@ impl App {
             preview_line(&self.state.cwd, 28)
         };
         let run_detail = if let Some(job) = active_sidebar_job(&self.state) {
-            checklist_progress(&job.checklist)
+            {
+                let blocked = job.checklist.iter().filter(|item| item.status == "blocked").count();
+                let mut parts = Vec::new();
+                if let Some(strategy) = &job.strategy {
+                    parts.push(strategy.clone());
+                }
+                if let Some(progress) = checklist_progress(&job.checklist) {
+                    parts.push(progress);
+                }
+                if blocked > 0 {
+                    parts.push(format!("{} blocked", format_count(blocked as u64)));
+                }
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(" · "))
+                }
+            }
                 .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
         } else if let Some(workspace) = &self.state.workspace {
             Some(preview_line(&workspace.label, 28))
         } else if self.state.loading {
-            Some("active foreground run".to_string())
+            worker_pool_summary(&self.state, None)
+                .or_else(|| Some("active foreground run".to_string()))
         } else {
             None
         };
@@ -1314,7 +1337,7 @@ impl App {
         }
         if let Some(active_job) = active_sidebar_job(&self.state) {
             lines.push(Line::from(Span::raw("")));
-            lines.push(sidebar_header("Todo Board"));
+            lines.push(sidebar_header("Run Checklist"));
             let worker_count = active_job
                 .checklist
                 .iter()
@@ -1364,7 +1387,7 @@ impl App {
             let synthetic = synthetic_foreground_checklist(&self.state);
             if !synthetic.is_empty() {
                 lines.push(Line::from(Span::raw("")));
-                lines.push(sidebar_header("Todo Board"));
+                lines.push(sidebar_header("Run Checklist"));
                 for (index, (label, status, color, detail)) in synthetic.into_iter().enumerate() {
                     let marker = match status {
                         "completed" => "[x]",
@@ -1388,7 +1411,37 @@ impl App {
 
         if !self.state.todos.is_empty() {
             lines.push(Line::from(Span::raw("")));
-            lines.push(sidebar_header("Plan"));
+            lines.push(sidebar_header("Todo Board"));
+            let completed = self
+                .state
+                .todos
+                .iter()
+                .filter(|item| item.status == "completed")
+                .count();
+            let in_progress = self
+                .state
+                .todos
+                .iter()
+                .filter(|item| item.status == "in_progress")
+                .count();
+            let total = self.state.todos.len();
+            let todo_summary = [
+                Some(format!("{}/{} done", format_count(completed as u64), format_count(total as u64))),
+                (in_progress > 0).then(|| format!("{} active", format_count(in_progress as u64))),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
+            push_sidebar_rail_item(
+                lines,
+                "·",
+                ACCENT_DIM,
+                "shared execution plan".to_string(),
+                Some(todo_summary),
+                FG,
+                ACCENT_DIM,
+            );
             for item in self.state.todos.iter().take(6) {
                 let (marker, color) = match item.status.as_str() {
                     "completed" => ("[x]", SUCCESS),
@@ -1411,11 +1464,13 @@ impl App {
                 *item_index += 1;
             }
         } else if active_sidebar_job(&self.state).is_none() {
+            lines.push(Line::from(Span::raw("")));
+            lines.push(sidebar_header("Todo Board"));
             push_sidebar_rail_item(
                 lines,
                 "·",
                 ACCENT_DIM,
-                "no active plan".to_string(),
+                "todo board empty".to_string(),
                 None,
                 FG,
                 ACCENT_DIM,
@@ -1457,19 +1512,6 @@ impl App {
             ACCENT_DIM,
         );
         *item_index += 1;
-        push_sidebar_rail_item(
-            lines,
-            "·",
-            ACCENT_DIM,
-            format!("{} · {}", self.current_mode_label(), display_model_name(&self.state.model)),
-            Some(if self.state.loading {
-                "active runtime".to_string()
-            } else {
-                "ready".to_string()
-            }),
-            FG,
-            ACCENT_DIM,
-        );
         if let Some(estimate) = &self.state.request_estimate {
             push_sidebar_selectable_item(
                 lines,
@@ -1929,7 +1971,19 @@ impl App {
         let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
         let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
         let paste_visible = self.pending_paste.is_some();
-        let footer_rows = 1usize;
+        let ask_option_rows = self
+            .state
+            .ask_user
+            .as_ref()
+            .map(|prompt| {
+                if prompt.options.is_empty() {
+                    0usize
+                } else {
+                    prompt.options.len().min(3) + 1
+                }
+            })
+            .unwrap_or(0);
+        let footer_rows = 1usize + ask_option_rows;
         let metrics = wrap_editor_text(
             &self.composer.text,
             self.composer.cursor,
@@ -1987,12 +2041,60 @@ impl App {
             }
         }
 
-        let mut footer_spans = build_mode_badge_spans(&self.state);
         if let Some(prompt) = &self.state.ask_user {
-            if let Some(selected) = prompt.options.get(self.ask_user_selection) {
-                footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-                footer_spans.push(Span::styled(selected.clone(), Style::default().fg(FG)));
+            if !prompt.options.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Options ",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        "↑/↓ choose · Enter accept · type custom answer",
+                        Style::default().fg(ACCENT_DIM),
+                    ),
+                ]));
+
+                let visible_count = prompt.options.len().min(3);
+                let start = self
+                    .ask_user_selection
+                    .saturating_add(1)
+                    .saturating_sub(visible_count)
+                    .min(prompt.options.len().saturating_sub(visible_count));
+
+                for (index, option) in prompt
+                    .options
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .take(visible_count)
+                {
+                    let selected = index == self.ask_user_selection;
+                    let marker = if selected { "› " } else { "  " };
+                    let marker_style = if selected {
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(ACCENT_DIM)
+                    };
+                    let option_style = if selected {
+                        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(FG)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, marker_style),
+                        Span::styled(option.clone(), option_style),
+                    ]));
+                }
             }
+        }
+
+        let mut footer_spans = build_mode_badge_spans(&self.state);
+        if self.state.ask_user.is_some() {
+            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+            footer_spans.push(Span::styled(
+                "Enter send",
+                Style::default().fg(ACCENT_DIM),
+            ));
         }
         lines.push(Line::from(footer_spans));
 
@@ -3275,6 +3377,62 @@ fn active_sidebar_job<'a>(state: &'a NativeTuiState) -> Option<&'a NativeBackgro
         .iter()
         .find(|job| job.status == "running" && !job.checklist.is_empty())
         .or_else(|| state.background_jobs.iter().find(|job| !job.checklist.is_empty()))
+}
+
+fn worker_status_word(status: &str) -> &'static str {
+    match status {
+        "running" => "running",
+        "verifying" => "verifying",
+        "done" => "done",
+        "error" => "failed",
+        "cancelled" => "cancelled",
+        "queued" => "queued",
+        _ => "pending",
+    }
+}
+
+fn worker_pool_summary(state: &NativeTuiState, active_job: Option<&NativeBackgroundJobState>) -> Option<String> {
+    if state.agent_activities.is_empty() {
+        return None;
+    }
+
+    let total = state.agent_activities.len();
+    let active = state
+        .agent_activities
+        .iter()
+        .filter(|item| item.status == "running" || item.status == "verifying")
+        .count();
+    let queued = state
+        .agent_activities
+        .iter()
+        .filter(|item| item.status == "queued")
+        .count();
+    let blocked = active_job
+        .map(|job| {
+            job.checklist
+                .iter()
+                .filter(|item| item.status == "blocked" && item.id.starts_with("agent:"))
+                .count()
+        })
+        .unwrap_or(0);
+    let strategy = active_job
+        .and_then(|job| job.strategy.clone())
+        .or_else(|| state.team_run_strategy.clone());
+
+    let mut parts = Vec::new();
+    if let Some(strategy) = strategy {
+        parts.push(strategy);
+    }
+    parts.push(format!("{} assigned", format_count(total as u64)));
+    parts.push(format!("{} active", format_count(active as u64)));
+    if queued > 0 {
+        parts.push(format!("{} queued", format_count(queued as u64)));
+    }
+    if blocked > 0 {
+        parts.push(format!("{} blocked", format_count(blocked as u64)));
+    }
+
+    Some(parts.join(" · "))
 }
 
 fn agent_task_status(status: &str) -> &'static str {

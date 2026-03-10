@@ -32,6 +32,16 @@ const readString = (value: unknown): string | undefined =>
 const isNamedMode = (value: unknown): value is SessionListItem['mode'] =>
   value === 'jennie' || value === 'lisa' || value === 'rosé' || value === 'jisoo';
 
+const readSessionHeaderMode = (header: SessionHeader): SessionListItem['mode'] | undefined => {
+  const metadata = header.metadata;
+  if (typeof metadata !== 'object' || metadata === null) {
+    return undefined;
+  }
+
+  const mode = (metadata as Record<string, unknown>).mode;
+  return isNamedMode(mode) ? mode : undefined;
+};
+
 const parseLine = (line: string): SessionEntry | null => {
   if (!line.trim()) {
     return null;
@@ -174,9 +184,10 @@ export class SessionManager {
         const model = readString(sessionHeader.model)
           ?? (latestMessage ? readString(latestMessage.data.model) : undefined);
         const mode =
-          latestMessage && isNamedMode(latestMessage.data.mode)
+          readSessionHeaderMode(sessionHeader)
+          ?? (latestMessage && isNamedMode(latestMessage.data.mode)
             ? latestMessage.data.mode
-            : undefined;
+            : undefined);
         const preview = previewText(latestUser ?? latestAssistant ?? '');
         const title = sessionHeader.title?.trim() || preview || undefined;
 

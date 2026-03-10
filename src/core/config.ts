@@ -72,6 +72,13 @@ const DEFAULT_CONFIG: DduduConfig = {
     default_model: 'claude-sonnet-4-6',
     max_turns: 50,
     timeout_minutes: 30,
+    provider_budgets: {
+      anthropic: 4,
+      openai: 4,
+      gemini: 2,
+    },
+    max_parallel_writes: 4,
+    scheduler_poll_ms: 125,
   },
   tabs: {
     max_tabs: 8,

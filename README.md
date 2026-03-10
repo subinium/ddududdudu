@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.3.1-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.4.2-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
@@ -119,12 +119,29 @@ Because the TUI is a native Rust binary, a portable `npm install -g ddududdudu` 
 
 ```bash
 npm install
-npm run build
-npm link
+npm run install:global
 ddudu
 ```
 
-If you do not want to link globally:
+`npm run install:global` packs the current checkout and installs that tarball globally, which avoids the live symlink behavior of `npm install -g .` on newer npm versions. This is the recommended source install path.
+
+If you want to run the equivalent steps manually:
+
+```bash
+TARBALL="$(npm pack --silent)"
+npm install -g "./$TARBALL"
+rm "./$TARBALL"
+```
+
+If you are developing ddudu itself and explicitly want a live symlink into the current repo, use:
+
+```bash
+npm install
+npm run build
+npm link
+```
+
+If you do not want a global install:
 
 ```bash
 npm install

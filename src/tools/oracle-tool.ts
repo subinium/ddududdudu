@@ -246,6 +246,16 @@ export const oracleTool: Tool = {
       maxTokens: 8192,
     });
 
+    const activityId = randomUUID();
+    ctx.onAgentActivity?.({
+      id: activityId,
+      label: oracleActivityLabel(preferredMode),
+      status: 'running',
+      mode: preferredMode,
+      purpose: 'oracle',
+      detail: preview(args.question),
+    });
+
     let output = '';
     let usage = { input: 0, output: 0 };
 
@@ -257,6 +267,16 @@ export const oracleTool: Tool = {
           onText: (text: string) => {
             output += text;
             ctx.onProgress?.(text);
+            if (text.trim()) {
+              ctx.onAgentActivity?.({
+                id: activityId,
+                label: oracleActivityLabel(preferredMode),
+                status: 'running',
+                mode: preferredMode,
+                purpose: 'oracle',
+                detail: preview(text, 64),
+              });
+            }
           },
           onError: () => {},
           onDone: (_text: string, finalUsage: { input: number; output: number }) => {
@@ -265,6 +285,15 @@ export const oracleTool: Tool = {
         },
         ctx.abortSignal,
       );
+
+      ctx.onAgentActivity?.({
+        id: activityId,
+        label: oracleActivityLabel(preferredMode),
+        status: 'done',
+        mode: preferredMode,
+        purpose: 'oracle',
+        detail: preview(output, 64),
+      });
 
       return {
         output,
@@ -277,6 +306,14 @@ export const oracleTool: Tool = {
         },
       };
     } catch (err: unknown) {
+      ctx.onAgentActivity?.({
+        id: activityId,
+        label: oracleActivityLabel(preferredMode),
+        status: 'error',
+        mode: preferredMode,
+        purpose: 'oracle',
+        detail: err instanceof Error ? err.message : String(err),
+      });
       return {
         output: err instanceof Error ? err.message : String(err),
         isError: true,

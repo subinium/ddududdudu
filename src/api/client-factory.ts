@@ -34,7 +34,15 @@ export interface StreamOptions {
   cwd?: string;
 }
 
+export interface ApiClientCapabilities {
+  executionMode: 'api' | 'cli';
+  supportsApiToolCalls: boolean;
+  supportsToolState: boolean;
+  supportsRemoteSession: boolean;
+}
+
 export interface ApiClient {
+  readonly capabilities: ApiClientCapabilities;
   stream(messages: ApiMessage[], options: StreamOptions): AsyncGenerator<StreamEvent>;
 }
 
@@ -134,11 +142,60 @@ const buildStreamAdapter = (
   return iterate();
 };
 
-export const createClient = (provider: string, token: string, tokenType: string): ApiClient => {
+const createCapabilities = (
+  executionMode: ApiClientCapabilities['executionMode'],
+  options: {
+    supportsApiToolCalls?: boolean;
+    supportsToolState?: boolean;
+    supportsRemoteSession?: boolean;
+  } = {},
+): ApiClientCapabilities => ({
+  executionMode,
+  supportsApiToolCalls: options.supportsApiToolCalls ?? false,
+  supportsToolState: options.supportsToolState ?? false,
+  supportsRemoteSession: options.supportsRemoteSession ?? false,
+});
+
+export const getClientCapabilities = (
+  provider: string,
+  tokenType: string,
+): ApiClientCapabilities => {
   const normalized = provider.trim().toLowerCase();
 
   if (normalized === 'claude' || normalized === 'anthropic') {
+    return tokenType === 'oauth'
+      ? createCapabilities('cli', {
+          supportsToolState: true,
+          supportsRemoteSession: true,
+        })
+      : createCapabilities('api', {
+          supportsApiToolCalls: true,
+        });
+  }
+
+  if (normalized === 'codex' || normalized === 'openai') {
+    return tokenType === 'bearer'
+      ? createCapabilities('cli', {
+          supportsToolState: true,
+          supportsRemoteSession: true,
+        })
+      : createCapabilities('api');
+  }
+
+  if (normalized === 'gemini' || normalized === 'google') {
+    return createCapabilities('api');
+  }
+
+  return createCapabilities('api');
+};
+
+export const createClient = (provider: string, token: string, tokenType: string): ApiClient => {
+  const normalized = provider.trim().toLowerCase();
+  const capabilities = getClientCapabilities(provider, tokenType);
+
+  if (normalized === 'claude' || normalized === 'anthropic') {
     return {
+      capabilities,
       stream(messages: ApiMessage[], options: StreamOptions): AsyncGenerator<StreamEvent> {
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {
@@ -196,6 +253,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
 
   if (normalized === 'codex' || normalized === 'openai') {
     return {
+      capabilities,
       stream(messages: ApiMessage[], options: StreamOptions): AsyncGenerator<StreamEvent> {
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {
@@ -258,6 +316,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
 
   if (normalized === 'gemini' || normalized === 'google') {
     return {
+      capabilities,
       stream(messages: ApiMessage[], options: StreamOptions): AsyncGenerator<StreamEvent> {
         return buildStreamAdapter(
           async (streamOptions, callbacks) => {

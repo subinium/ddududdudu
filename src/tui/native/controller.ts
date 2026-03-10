@@ -6,7 +6,13 @@ import { promisify } from 'node:util';
 
 import { DEFAULT_ANTHROPIC_BASE_URL } from '../../api/anthropic-base-url.js';
 import type { ApiMessage, ContentBlock, ToolUseContentBlock } from '../../api/anthropic-client.js';
-import { createClient, type ApiClient, type StreamEvent } from '../../api/client-factory.js';
+import {
+  createClient,
+  getClientCapabilities,
+  type ApiClient,
+  type ApiClientCapabilities,
+  type StreamEvent,
+} from '../../api/client-factory.js';
 import type { ToolResultBlock, ToolUseBlock } from '../../api/tool-executor.js';
 import { formatToolsForApi } from '../../api/tool-executor.js';
 import { discoverAllProviders, type ProviderAuth } from '../../auth/discovery.js';
@@ -39,16 +45,15 @@ import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
 import { appendMemory, clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
 import { resolveModeBinding, type HarnessProviderName } from '../../core/mode-resolution.js';
-import { loadSystemPrompt } from '../../core/prompts.js';
+import { loadOrchestratorPrompt, loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
 import { SkillLoader, type LoadedSkill } from '../../core/skill-loader.js';
 import {
-  buildSpecialistPrompt,
-  formatSpecialistLabel,
   getSpecialistRoleProfile,
   type SpecialistRole,
 } from '../../core/specialist-roles.js';
-import { TeamOrchestrator, type AgentRole as TeamAgentRole, type TeamMessage } from '../../core/team-agent.js';
+import { runTeamAgentDelegation } from '../../core/team-execution.js';
+import { type AgentRole as TeamAgentRole } from '../../core/team-agent.js';
 import { TokenCounter } from '../../core/token-counter.js';
 import {
   analyzeToolRisk,
@@ -59,26 +64,23 @@ import {
 import { getDduduPaths } from '../../core/dirs.js';
 import type {
   DduduConfig,
-  LoadedSession,
   NamedMode,
-  SessionEntry,
   SessionListItem,
   ToolPolicy,
   TrustTier,
 } from '../../core/types.js';
 import { type VerificationMode, type VerificationSummary, VerificationRunner } from '../../core/verifier.js';
 import { type IsolatedWorkspace, WorktreeManager } from '../../core/worktree-manager.js';
-import type {
-  PermissionProfile,
-  PlanItem,
-  PlanItemStatus,
-  WorkflowArtifact,
-  WorkflowArtifactKind,
-  WorkflowArtifactPayload,
-  WorkflowBackgroundJobSnapshot,
-  WorkflowStateSnapshot,
+import {
+  type PermissionProfile,
+  type PlanItem,
+  type PlanItemStatus,
+  type WorkflowArtifact,
+  type WorkflowArtifactKind,
+  type WorkflowArtifactPayload,
+  type WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
-import { planWorkAllocation, type WorkAllocationPlan } from '../../core/work-allocation.js';
+import type { WorkAllocationPlan } from '../../core/work-allocation.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
 import type { ToolContext } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
@@ -94,6 +96,31 @@ import {
   countApiMessageTokens,
   createRequestEstimate,
 } from './session-support.js';
+import {
+  BackgroundCoordinator,
+  type BackgroundUiJobState,
+  type DetachedAgentActivityState,
+} from './background-coordinator.js';
+import {
+  formatAgentActivityHeartbeat,
+  buildDelegationHookContext,
+} from './controller-support.js';
+import { RequestEngine } from './request-engine.js';
+import {
+  classifyJennieAutoRoute,
+  createTeamExecutionPlanDraft,
+  formatAutoRouteNotice,
+  shouldRunPlanningInterview,
+  type AutoRouteDecision,
+} from './routing-coordinator.js';
+import {
+  formatTeamAgentDetail,
+  formatTeamAgentLabel,
+  isRunnableTeamAgent,
+  teamAgentPurpose,
+  TeamExecutionCoordinator,
+} from './team-execution-coordinator.js';
+import { WorkflowStateStore, type WorkflowStateSource } from './workflow-state-store.js';
 import type {
   NativeBridgeEvent,
   NativeLspState,
@@ -121,6 +148,7 @@ interface RequestPlan {
 }
 
 interface ContextSnapshotOptions {
+  includeRelevantFiles?: boolean;
   includeChangedFiles?: boolean;
   includeBriefing?: boolean;
   includePlan?: boolean;
@@ -136,51 +164,8 @@ interface TimedCacheEntry<T> {
   expiresAt: number;
 }
 
-interface AutoRouteDecision {
-  kind: 'direct' | 'delegate' | 'team';
-  reason: string;
-  purpose?: DelegationPurpose;
-  preferredMode?: NamedMode;
-  strategy?: 'parallel' | 'sequential' | 'delegate';
-  repairAttempt?: number;
-}
-
-interface AgentActivityState {
-  id: string;
-  label: string;
-  mode: NamedMode | null;
-  purpose: string | null;
-  checklistId?: string | null;
-  status: 'queued' | 'running' | 'verifying' | 'done' | 'error';
-  detail: string | null;
-  workspacePath: string | null;
-  updatedAt: number;
-}
-
-interface BackgroundJobState {
-  id: string;
-  kind: 'delegate' | 'team';
-  label: string;
-  status: 'running' | 'done' | 'error' | 'cancelled';
-  detail: string | null;
-  startedAt: number;
-  updatedAt: number;
-  finishedAt?: number | null;
-  prompt?: string;
-  purpose?: DelegationPurpose | 'general';
-  preferredMode?: NamedMode | null;
-  strategy?: 'parallel' | 'sequential' | 'delegate';
-  reason?: string | null;
-  artifactId?: string | null;
-  artifactTitle?: string | null;
-  verificationSummary?: string | null;
-  attempt?: number;
-  hasResult?: boolean;
-  resultPreview?: string | null;
-  workspacePath?: string | null;
-  checklist: BackgroundJobChecklistItem[];
-  controller?: AbortController | null;
-}
+type AgentActivityState = DetachedAgentActivityState;
+type BackgroundJobState = BackgroundUiJobState;
 
 type EmitFn = (event: NativeBridgeEvent) => void;
 type AskUserResolver = {
@@ -193,11 +178,35 @@ const execFileAsync = promisify(execFile);
 const MAX_TOOL_TURNS_FALLBACK = 25;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.3.1';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.4.2';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
 const DIFF_FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
+const PARALLEL_SAFE_TOOL_NAMES = new Set([
+  'read_file',
+  'list_dir',
+  'git_status',
+  'git_diff',
+  'grep',
+  'glob',
+  'repo_map',
+  'symbol_search',
+  'definition_search',
+  'reference_search',
+  'reference_hotspots',
+  'changed_files',
+  'file_importance',
+  'codebase_search',
+  'docs_lookup',
+  'web_search',
+  'web_fetch',
+]);
+
+const normalizeToolName = (name: string): string => name.trim().toLowerCase();
+const isParallelSafeToolCall = (name: string): boolean => PARALLEL_SAFE_TOOL_NAMES.has(normalizeToolName(name));
+const buildSyntheticToolActivityId = (assistantMessageId: string, toolUseId: string): string =>
+  `tool:${assistantMessageId}:${toolUseId}`;
 
 const normalizeProviders = (
   providers: Map<string, ProviderAuth>,
@@ -265,14 +274,14 @@ const resolveProviderConfigName = (provider: string): string => {
   return provider;
 };
 
-const buildFallbackSystemPrompt = (mode: NamedMode, model?: string): string => {
+const buildFallbackSystemPrompt = (mode: NamedMode, model?: string, provider?: string): string => {
   const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
   const cwd = process.cwd();
   const projectName = basename(cwd) || 'unknown-project';
 
   return DEFAULT_SYSTEM_PROMPT
     .replace(/\$\{model\}/g, model ?? modeConfig.model)
-    .replace(/\$\{provider\}/g, modeConfig.provider)
+    .replace(/\$\{provider\}/g, provider ?? modeConfig.provider)
     .replace(/\$\{cwd\}/g, cwd)
     .replace(/\$\{projectName\}/g, projectName)
     .replace(/\$\{userInstructions\}/g, modeConfig.promptAddition.trim());
@@ -294,22 +303,8 @@ const serializeError = (error: unknown): string => {
   return String(error);
 };
 
-const isPlanStatus = (value: unknown): value is PlanItemStatus => {
-  return value === 'pending' || value === 'in_progress' || value === 'completed';
-};
-
 const isPermissionProfile = (value: unknown): value is PermissionProfile => {
   return value === 'plan' || value === 'ask' || value === 'workspace-write' || value === 'permissionless';
-};
-
-const isArtifactKind = (value: unknown): value is WorkflowArtifactKind => {
-  return value === 'answer'
-    || value === 'plan'
-    || value === 'review'
-    || value === 'design'
-    || value === 'patch'
-    || value === 'briefing'
-    || value === 'research';
 };
 
 const normalizePermissionProfile = (value: unknown): PermissionProfile => {
@@ -401,34 +396,6 @@ const formatModeWorkerLabel = (mode: NamedMode | null | undefined, purpose?: str
 
   return `${HARNESS_MODES[mode].label} · ${purposeWorkerRole(purpose)}`;
 };
-
-const formatTeamAgentLabel = (agent: {
-  name: string;
-  mode?: NamedMode;
-  role: 'lead' | 'worker' | 'reviewer';
-  roleProfile?: SpecialistRole;
-}): string => {
-  if (agent.roleProfile) {
-    return formatSpecialistLabel(agent.roleProfile, agent.mode);
-  }
-
-  return `${agent.name} · ${agent.role}`;
-};
-
-const formatTeamAgentDetail = (
-  agent: Pick<TeamAgentRole, 'taskLabel' | 'role' | 'roleProfile'>,
-  fallback: string,
-): string => agent.taskLabel?.trim() || fallback;
-
-const isRunnableTeamAgent = (agent: { role: 'lead' | 'worker' | 'reviewer' }): boolean =>
-  agent.role !== 'lead';
-
-const teamAgentPurpose = (agent: Pick<TeamAgentRole, 'role' | 'roleProfile'>): DelegationPurpose =>
-  agent.roleProfile
-    ? getSpecialistRoleProfile(agent.roleProfile).purpose
-    : agent.role === 'lead' || agent.role === 'reviewer'
-      ? 'review'
-      : 'execution';
 
 const buildDelegateTaskLabel = (purpose: DelegationPurpose | 'general'): string => {
   switch (purpose) {
@@ -681,14 +648,27 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
       const query = previewText(readString(input.query), 48);
       return query ? `search ${query}` : 'codebase search';
     }
+    case 'definition_search': {
+      const query = previewText(readString(input.query), 48);
+      return query ? `definition ${query}` : 'definition search';
+    }
+    case 'file_importance': {
+      const query = previewText(readString(input.query), 48);
+      return query ? `importance ${query}` : 'file importance';
+    }
+    case 'docs_lookup': {
+      const query = previewText(readString(input.query), 60);
+      return query ? `docs ${query}` : 'docs lookup';
+    }
+    case 'web_search':
+    case 'WebSearch': {
+      const query = previewText(readString(input.query), 60);
+      return query ? `search ${query}` : 'web search';
+    }
     case 'web_fetch':
     case 'WebFetch': {
       const url = previewText(readString(input.url), 72);
       return url ? `fetch ${url}` : 'fetch URL';
-    }
-    case 'WebSearch': {
-      const query = previewText(readString(input.query), 60);
-      return query ? `search ${query}` : 'web search';
     }
     case 'task': {
       const prompt =
@@ -742,44 +722,6 @@ const hasMeaningfulMemory = (memory: string): boolean => {
     .replace(/## Project Memory/gu, '')
     .trim()
     .length > 0;
-};
-
-const getEntryString = (entry: SessionEntry, key: string): string => {
-  const value = entry.data[key];
-  return typeof value === 'string' ? value : '';
-};
-
-const findModeForProviderModel = (
-  provider: string | undefined,
-  model: string | undefined,
-): NamedMode | null => {
-  if (!provider && !model) {
-    return null;
-  }
-
-  for (const mode of MODE_ORDER) {
-      const modeConfig = HARNESS_MODES[mode];
-    if (!modeConfig) {
-      continue;
-    }
-
-    if (provider && model) {
-      if (modeConfig.provider === provider && modeConfig.model === model) {
-        return mode;
-      }
-      continue;
-    }
-
-    if (provider && modeConfig.provider === provider) {
-      return mode;
-    }
-
-    if (model && modeConfig.model === model) {
-      return mode;
-    }
-  }
-
-  return null;
 };
 
 const isObject = (value: unknown): value is Record<string, unknown> => {
@@ -946,6 +888,7 @@ export class NativeBridgeController {
   private readonly loadedSkills = new Map<string, LoadedSkill>();
   private tokenCounter = new TokenCounter(HARNESS_MODES.jennie.model);
   private systemPrompt = buildFallbackSystemPrompt('jennie');
+  private orchestratorPrompt: string | null = null;
   private permissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private lastSafePermissionProfile: PermissionProfile = DEFAULT_PERMISSION_PROFILE;
   private todos: PlanItem[] = [];
@@ -969,10 +912,16 @@ export class NativeBridgeController {
   private readonly hookRegistry = new HookRegistry();
   private readonly lspManager = new LspManager(process.cwd());
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
-  private readonly backgroundJobStatusCache = new Map<string, BackgroundJobState['status']>();
+  private readonly backgroundCoordinator = new BackgroundCoordinator({
+    previewText,
+    formatChecklistLinkedDetail,
+  });
   private readonly verificationRepairFingerprints = new Map<string, number>();
   private readonly memoryPromotionFingerprints = new Set<string>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
+  private readonly requestEngine = new RequestEngine();
+  private readonly teamExecutionCoordinator = new TeamExecutionCoordinator();
+  private readonly workflowStateStore = new WorkflowStateStore();
   private readonly teamRunIsolatedNotes: string[] = [];
   private readonly selectedMemoryCache = new Map<string, TimedCacheEntry<string>>();
   private readonly promptContextCache = new Map<string, TimedCacheEntry<string>>();
@@ -1032,15 +981,20 @@ export class NativeBridgeController {
     }
 
     this.sessionManager = new SessionManager(this.config.session.directory);
+    this.workflowStateStore.setSessionManager(this.sessionManager);
     this.backgroundJobStore = new BackgroundJobStore(
       resolveBackgroundJobDirectory(this.config.session.directory),
     );
+    this.backgroundCoordinator.setStore(this.backgroundJobStore);
     try {
       const resumed = await this.resumeRequestedSession();
       if (!resumed) {
         const session = await this.sessionManager.create({
           provider: this.getCurrentProvider(),
           model: this.getCurrentModel(),
+          metadata: {
+            mode: this.currentMode,
+          },
         });
         this.state.sessionId = session.id;
       }
@@ -1123,63 +1077,11 @@ export class NativeBridgeController {
   }
 
   private hasLiveBackgroundWork(): boolean {
-    return (
-      this.state.loading ||
-      this.backgroundJobs.some((job) => job.status === 'running') ||
-      this.agentActivities.some(
-        (activity) =>
-          activity.status === 'running' ||
-          activity.status === 'verifying' ||
-          activity.status === 'queued',
-      )
-    );
-  }
-
-  private mapStoredJobToState(job: BackgroundJobRecord): BackgroundJobState {
-    return {
-      id: job.id,
-      kind: job.kind,
-      label: job.label,
-      status: job.status === 'queued' ? 'running' : job.status,
-      detail: job.detail,
-      startedAt: job.startedAt ?? job.createdAt,
-      updatedAt: job.updatedAt,
-      finishedAt: job.finishedAt ?? null,
-      prompt: job.prompt,
-      purpose: job.purpose,
-      preferredMode: job.preferredMode ?? null,
-      strategy: job.strategy,
-      reason: job.reason ?? null,
-      artifactId: job.artifact?.id ?? null,
-      artifactTitle: job.artifact?.title ?? null,
-      verificationSummary: job.result?.verification?.summary ?? null,
-      attempt: job.attempt ?? 0,
-      hasResult: Boolean(job.result?.text || job.artifact),
-      resultPreview: job.result?.text ? previewText(job.result.text, 160) : job.artifact?.summary ?? null,
-      workspacePath: job.result?.workspacePath ?? null,
-      checklist: job.checklist.map((item) => ({ ...item })),
-      controller: null,
-    };
-  }
-
-  private syncDetachedAgentActivities(jobs: BackgroundJobRecord[]): void {
-    const detached = jobs.flatMap((job) =>
-      job.agentActivities.map((activity) => ({
-        id: activity.id,
-        label: activity.label,
-        mode: activity.mode,
-        purpose: activity.purpose,
-        checklistId: activity.checklistId ?? null,
-        status: activity.status,
-        detail: formatChecklistLinkedDetail(job.checklist, activity.checklistId, activity.detail),
-        workspacePath: activity.workspacePath,
-        updatedAt: activity.updatedAt,
-      })),
-    );
-
-    const live = this.agentActivities.filter((activity) => !activity.id.startsWith('job:'));
-    this.agentActivities = [...live, ...detached];
-    this.syncAgentActivities();
+    return this.backgroundCoordinator.hasLiveBackgroundWork({
+      foregroundLoading: this.state.loading,
+      jobs: this.backgroundJobs,
+      agentActivities: this.agentActivities,
+    });
   }
 
   private async pollBackgroundJobs(): Promise<void> {
@@ -1188,47 +1090,41 @@ export class NativeBridgeController {
     }
 
     try {
-      const jobs = await this.backgroundJobStore.listBySession(this.state.sessionId);
-      this.backgroundJobs = jobs.map((job) => this.mapStoredJobToState(job));
+      const polled = await this.backgroundCoordinator.pollSession(this.state.sessionId);
+      this.backgroundJobs = polled.jobs;
       this.syncBackgroundJobs();
-      this.syncDetachedAgentActivities(jobs);
-      for (const job of jobs) {
-        const previous = this.backgroundJobStatusCache.get(job.id);
-        this.backgroundJobStatusCache.set(job.id, job.status === 'queued' ? 'running' : job.status);
-        if (!previous) {
-          continue;
+      const live = this.agentActivities.filter((activity) => !activity.id.startsWith('job:'));
+      this.agentActivities = [...live, ...polled.detachedActivities];
+      this.syncAgentActivities();
+      for (const job of polled.transitioned) {
+        const jobRef = job.id.slice(0, 8);
+        this.appendSystemMessage(
+          `[background] ${job.label} ${
+            job.status === 'done' ? 'finished' : job.status === 'cancelled' ? 'cancelled' : 'failed'
+          } · /jobs result ${jobRef}`,
+        );
+        if (job.status === 'done' && job.result?.verification?.status === 'passed') {
+          const mode = job.result.mode === 'jennie' || job.result.mode === 'lisa' || job.result.mode === 'rosé' || job.result.mode === 'jisoo'
+            ? job.result.mode
+            : (job.preferredMode ?? this.currentMode);
+          await this.finalizeVerificationRecovery({
+            reason: job.reason,
+            purpose: job.purpose ?? 'general',
+            output: job.result.text,
+            mode,
+            appliedToBase:
+              job.result.workspaceApply?.applied ?? !job.result.workspaceApply?.attempted,
+            verification: job.result.verification,
+          });
         }
-
-        if (previous === 'running' && (job.status === 'done' || job.status === 'error' || job.status === 'cancelled')) {
-          const jobRef = job.id.slice(0, 8);
-          this.appendSystemMessage(
-            `[background] ${job.label} ${
-              job.status === 'done' ? 'finished' : job.status === 'cancelled' ? 'cancelled' : 'failed'
-            } · /jobs result ${jobRef}`,
-          );
-          if (job.status === 'done' && job.result?.verification?.status === 'passed') {
-            const mode = job.result.mode === 'jennie' || job.result.mode === 'lisa' || job.result.mode === 'rosé' || job.result.mode === 'jisoo'
-              ? job.result.mode
-              : (job.preferredMode ?? this.currentMode);
-            await this.finalizeVerificationRecovery({
-              reason: job.reason,
-              purpose: job.purpose ?? 'general',
-              output: job.result.text,
-              mode,
-              appliedToBase:
-                job.result.workspaceApply?.applied ?? !job.result.workspaceApply?.attempted,
-              verification: job.result.verification,
-            });
-          }
-          if (job.status === 'done' && job.result?.verification) {
-            await this.maybeScheduleVerificationFollowup({
-              purpose: job.purpose ?? 'general',
-              userPrompt: job.prompt,
-              assistantOutput: job.result.text,
-              verification: job.result.verification,
-              allowRepair: job.reason !== 'verification auto-retry',
-            });
-          }
+        if (job.status === 'done' && job.result?.verification) {
+          await this.maybeScheduleVerificationFollowup({
+            purpose: job.purpose ?? 'general',
+            userPrompt: job.prompt,
+            assistantOutput: job.result.text,
+            verification: job.result.verification,
+            allowRepair: job.reason !== 'verification auto-retry',
+          });
         }
       }
       this.scheduleStatePush();
@@ -1411,7 +1307,11 @@ export class NativeBridgeController {
       if (trimmedPrompt && !trimmedPrompt.startsWith('/')) {
         const inferredPurpose = purpose ?? this.inferPromptPurpose(trimmedPrompt);
         tasks.push(
-          this.buildPromptContextSnapshot(trimmedPrompt, inferredPurpose).catch(() => ''),
+          this.buildPromptContextSnapshot(
+            trimmedPrompt,
+            inferredPurpose,
+            this.getPromptContextSnapshotOptions(trimmedPrompt, inferredPurpose, 'request'),
+          ).catch(() => ''),
         );
       }
 
@@ -1682,7 +1582,7 @@ export class NativeBridgeController {
       this.finishMessage(this.activeAssistantMessageId, '[request aborted]');
     }
 
-    if (this.activeOperation === 'request' && this.isCliBackedProvider()) {
+    if (this.activeOperation === 'request' && this.getProviderCapabilities(this.getCurrentProvider())?.supportsRemoteSession) {
       this.invalidateRemoteSession(this.getCurrentProvider());
     }
 
@@ -1720,17 +1620,23 @@ export class NativeBridgeController {
     const mode = this.currentMode;
     const model = this.getCurrentModel();
     await this.refreshSystemPrompt();
-    const requestContextSnapshot = await this.buildPromptContextSnapshot(trimmedContent);
+
+    if (await this.maybeHandleJennieAutoRoute(trimmedContent)) {
+      return;
+    }
+
+    const directPurpose = this.inferPromptPurpose(trimmedContent);
+    const requestContextSnapshot = await this.buildPromptContextSnapshot(
+      trimmedContent,
+      directPurpose,
+      this.getPromptContextSnapshotOptions(trimmedContent, directPurpose, 'request'),
+    );
     const requestSystemPrompt = requestContextSnapshot
       ? `${this.systemPrompt}\n\n${requestContextSnapshot}`
       : this.systemPrompt;
     this.state.contextPreview = requestContextSnapshot || this.state.contextPreview;
     this.tokenCounter.setModel(model);
     await this.maybeAutoCompact(trimmedContent);
-
-    if (await this.maybeHandleJennieAutoRoute(trimmedContent)) {
-      return;
-    }
 
     const userMessage: NativeMessageState = {
       id: randomUUID(),
@@ -1772,12 +1678,14 @@ export class NativeBridgeController {
     this.abortController = controller;
     this.activeOperation = 'request';
 
-    const tools = this.toolRegistry ? formatToolsForApi(this.toolRegistry) : undefined;
+    const clientCapabilities = this.activeClient.capabilities;
+    const tools =
+      clientCapabilities.supportsApiToolCalls && this.toolRegistry
+        ? formatToolsForApi(this.toolRegistry)
+        : undefined;
     const maxTokens = this.config ? getMaxTokens(this.config) : undefined;
 
     let fullText = '';
-    let done = false;
-    let toolTurns = 0;
     let requestInputTokens = 0;
     let requestOutputTokens = 0;
     let requestUncachedInputTokens = 0;
@@ -1797,107 +1705,87 @@ export class NativeBridgeController {
       });
 
       const maxToolTurns = this.config?.agent.max_turns ?? MAX_TOOL_TURNS_FALLBACK;
-      let attempt = 0;
-
-      while (!controller.signal.aborted) {
-        const apiMessages = [...currentPlan.apiMessages];
-        done = false;
-        toolTurns = 0;
-
-        try {
-          while (!controller.signal.aborted && !done) {
-            if (toolTurns >= maxToolTurns) {
-              fullText = '[error] Maximum tool turns reached';
-              this.finishMessage(assistantMessage.id, fullText);
-              done = true;
-              break;
-            }
-
-            const stream = this.activeClient.stream(apiMessages, {
-              systemPrompt: requestSystemPrompt,
-              model,
-              tools,
-              signal: controller.signal,
-              maxTokens,
-              remoteSessionId: currentPlan.remoteSessionId ?? undefined,
-              cwd: process.cwd(),
-            });
-
-            const outcome = await this.consumeStream(stream, {
+      const result = await this.requestEngine.run(
+        {
+          client: this.activeClient,
+          capabilities: clientCapabilities,
+          provider: this.getCurrentProvider(),
+          model,
+          sessionId: this.state.sessionId,
+          cwd: process.cwd(),
+          plan: currentPlan,
+          systemPrompt: requestSystemPrompt,
+          tools,
+          maxTokens,
+          maxToolTurns,
+          signal: controller.signal,
+        },
+        {
+          beforeApiCall: async (input) => {
+            await this.hookRegistry.emit('beforeApiCall', input);
+          },
+          afterApiCall: async (input) => {
+            await this.hookRegistry.emit('afterApiCall', input);
+          },
+          consumeStream: async (input) =>
+            this.consumeStream(input.stream, {
               assistantMessageId: assistantMessage.id,
-              apiMessages,
-              currentText: fullText,
-              requestInputTokens,
-              requestOutputTokens,
-              requestUncachedInputTokens,
-              requestCachedInputTokens,
-              requestCacheWriteInputTokens,
-              signal: controller.signal,
-              onSession: (sessionId: string) => {
-                activeRemoteSessionId = sessionId;
-                this.rememberRemoteSession({
-                  provider: this.getCurrentProvider(),
-                  sessionId,
-                  lastModel: model,
-                  lastUsedAt: Date.now(),
-                  syncedMessageCount: this.getCanonicalConversationCount() - 1,
-                });
-              },
-            });
-
-            fullText = outcome.fullText;
-            requestInputTokens = outcome.inputTokens;
-            requestOutputTokens = outcome.outputTokens;
-            requestUncachedInputTokens = outcome.uncachedInputTokens;
-            requestCachedInputTokens = outcome.cachedInputTokens;
-            requestCacheWriteInputTokens = outcome.cacheWriteInputTokens;
-            done = outcome.done;
-
-            if (!outcome.continueWithTools || controller.signal.aborted) {
-              break;
+              apiMessages: input.apiMessages,
+              currentText: input.currentText,
+              requestInputTokens: input.requestInputTokens,
+              requestOutputTokens: input.requestOutputTokens,
+              requestUncachedInputTokens: input.requestUncachedInputTokens,
+              requestCachedInputTokens: input.requestCachedInputTokens,
+              requestCacheWriteInputTokens: input.requestCacheWriteInputTokens,
+              signal: input.signal,
+              onSession: input.onSession,
+            }),
+          onSessionObserved: ({ sessionId, phase }) => {
+            activeRemoteSessionId = sessionId;
+            if (!clientCapabilities.supportsRemoteSession) {
+              return;
             }
 
-            toolTurns += 1;
-          }
-
-          break;
-        } catch (error: unknown) {
-          if (
-            currentPlan.remoteSessionId &&
-            attempt === 0 &&
-            !controller.signal.aborted
-          ) {
+            this.rememberRemoteSession({
+              provider: this.getCurrentProvider(),
+              sessionId,
+              lastModel: model,
+              lastUsedAt: Date.now(),
+              syncedMessageCount:
+                phase === 'stream'
+                  ? this.getCanonicalConversationCount() - 1
+                  : this.getCanonicalConversationCount(),
+            });
+          },
+          onRemoteSessionRetry: async () => {
             this.invalidateRemoteSession(this.getCurrentProvider());
-            currentPlan = await this.prepareRequestPlan(userMessage, true);
-            this.state.requestEstimate = this.estimateRequestForPlan(currentPlan);
-            fullText = '';
-            requestInputTokens = 0;
-            requestOutputTokens = 0;
-            requestUncachedInputTokens = 0;
-            requestCachedInputTokens = 0;
-            requestCacheWriteInputTokens = 0;
-            activeRemoteSessionId = currentPlan.remoteSessionId;
             this.updateMessage(assistantMessage.id, '');
+            const freshPlan = await this.prepareRequestPlan(userMessage, true);
+            this.state.requestEstimate = this.estimateRequestForPlan(freshPlan);
             this.scheduleStatePush();
-            attempt += 1;
-            continue;
-          }
+            return freshPlan;
+          },
+          onPlanUpdated: (plan) => {
+            currentPlan = plan;
+            activeRemoteSessionId = plan.remoteSessionId;
+          },
+          onMaxToolTurnsReached: () => {
+            this.finishMessage(assistantMessage.id, '[error] Maximum tool turns reached');
+          },
+          serializeError,
+        },
+      );
 
-          throw error;
-        }
-      }
+      currentPlan = result.plan;
+      activeRemoteSessionId = result.activeRemoteSessionId;
+      fullText = result.fullText;
+      requestInputTokens = result.inputTokens;
+      requestOutputTokens = result.outputTokens;
+      requestUncachedInputTokens = result.uncachedInputTokens;
+      requestCachedInputTokens = result.cachedInputTokens;
+      requestCacheWriteInputTokens = result.cacheWriteInputTokens;
 
       if (!controller.signal.aborted) {
-        if (this.isCliBackedProvider() && activeRemoteSessionId) {
-          this.rememberRemoteSession({
-            provider: this.getCurrentProvider(),
-            sessionId: activeRemoteSessionId,
-            lastModel: model,
-            lastUsedAt: Date.now(),
-            syncedMessageCount: this.getCanonicalConversationCount(),
-          });
-        }
-
         await this.hookRegistry.emit('afterResponse', {
           provider: this.getCurrentProvider(),
           model,
@@ -1924,7 +1812,6 @@ export class NativeBridgeController {
           });
         }
 
-        const directPurpose = this.inferPromptPurpose(trimmedContent);
         this.rememberSessionArtifact(directPurpose, fullText, trimmedContent);
         this.state.loadingLabel = 'verifier';
         this.scheduleStatePush();
@@ -1948,7 +1835,7 @@ export class NativeBridgeController {
       }
     } catch (error: unknown) {
       if (!controller.signal.aborted) {
-        if (this.isCliBackedProvider()) {
+        if (clientCapabilities.supportsRemoteSession) {
           this.invalidateRemoteSession(this.getCurrentProvider());
         }
         await this.hookRegistry.emit('onError', {
@@ -1991,126 +1878,15 @@ export class NativeBridgeController {
   }
 
   private classifyJennieAutoRoute(prompt: string): AutoRouteDecision {
-    const normalized = normalizeSingleLine(prompt);
-    const lower = normalized.toLowerCase();
-    const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
-
-    const hasDesign = /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b/u.test(lower);
-    const hasPlanning = /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b/u.test(lower);
-    const hasResearch = /\b(research|investigate|look into|survey|compare options|explore)\b/u.test(lower);
-    const hasReview = /\b(review|audit|verify|validation|regression|risk|critic|critique)\b/u.test(lower);
-    const hasExecution = /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b/u.test(lower);
-    const explicitTeam = /\b(team|multi[- ]agent|orchestrate|delegate|parallel|sequential|split (this|it) up|break (this|it) down)\b/u.test(lower);
-    const multiStep =
-      /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(lower) ||
-      /\b(end-to-end|from scratch|full flow|across the repo|whole project|entire codebase)\b/u.test(lower) ||
-      normalized.split(/\n+/u).length > 1;
-    const purposeCount = [hasDesign, hasPlanning, hasResearch, hasReview, hasExecution].filter(Boolean).length;
-
-    if (wordCount <= 6 && purposeCount === 0) {
-      return { kind: 'direct', reason: 'short direct prompt' };
-    }
-
-    if (explicitTeam || (purposeCount >= 2 && multiStep)) {
-      return {
-        kind: 'team',
-        strategy: explicitTeam || (hasExecution && (hasPlanning || hasResearch || hasReview)) ? 'delegate' : 'parallel',
-        reason: explicitTeam ? 'explicit orchestration request' : 'multi-domain request',
-      };
-    }
-
-    if (hasDesign) {
-      return {
-        kind: 'delegate',
-        purpose: 'design',
-        preferredMode: 'jisoo',
-        reason: 'design or UX request',
-      };
-    }
-
-    if (hasResearch) {
-      return {
-        kind: 'delegate',
-        purpose: 'research',
-        preferredMode: 'rosé',
-        reason: 'research request',
-      };
-    }
-
-    if (hasPlanning) {
-      return {
-        kind: 'delegate',
-        purpose: 'planning',
-        preferredMode: 'rosé',
-        reason: 'planning or architecture request',
-      };
-    }
-
-    if (hasReview) {
-      return {
-        kind: 'delegate',
-        purpose: 'review',
-        preferredMode: 'rosé',
-        reason: 'review or validation request',
-      };
-    }
-
-    if (hasExecution) {
-      if (multiStep || wordCount >= 18) {
-        return {
-          kind: 'delegate',
-          purpose: 'execution',
-          preferredMode: 'lisa',
-          reason: 'large implementation request',
-        };
-      }
-      return { kind: 'direct', reason: 'single execution request' };
-    }
-
-    return { kind: 'direct', reason: 'no strong orchestration signal' };
+    return classifyJennieAutoRoute(prompt, this.getTeamEligibleModes());
   }
 
   private formatAutoRouteNotice(decision: AutoRouteDecision): string {
-    if (decision.kind === 'team') {
-      return `Auto route · team ${decision.strategy ?? 'parallel'} · ${decision.reason}`;
-    }
-
-    const modeLabel = decision.preferredMode
-      ? HARNESS_MODES[decision.preferredMode].label
-      : 'Auto';
-    const purpose = decision.purpose ?? 'general';
-    return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
+    return formatAutoRouteNotice(decision);
   }
 
   private shouldRunPlanningInterview(prompt: string, decision: AutoRouteDecision): boolean {
-    if (decision.kind === 'direct') {
-      return false;
-    }
-
-    const normalized = normalizeSingleLine(prompt);
-    const lower = normalized.toLowerCase();
-    const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
-    const hasExplicitConstraints =
-      /\b(keep|preserve|avoid|without|must|should not|don't|do not|only|exactly)\b/u.test(lower);
-    const hasExplicitSuccessCriteria =
-      /\b(done|success|pass|green|working|ship|finish|complete|acceptance|criteria)\b/u.test(lower);
-    const clearlySmall =
-      wordCount <= 10 &&
-      !/\b(across the repo|codebase|architecture|end-to-end|refactor|research|review|design)\b/u.test(lower);
-
-    if (clearlySmall) {
-      return false;
-    }
-
-    if (decision.kind === 'team') {
-      return !hasExplicitConstraints || !hasExplicitSuccessCriteria;
-    }
-
-    return (
-      decision.purpose === 'planning'
-      || decision.purpose === 'design'
-      || (decision.purpose === 'execution' && (!hasExplicitConstraints || !hasExplicitSuccessCriteria) && wordCount >= 14)
-    );
+    return shouldRunPlanningInterview(prompt, decision);
   }
 
   private async runPlanningInterview(
@@ -2258,10 +2034,13 @@ export class NativeBridgeController {
     const contextSnapshot = await this.buildPromptContextSnapshot(
       userMessage.content,
       decision.purpose ?? 'general',
+      this.getPromptContextSnapshotOptions(userMessage.content, decision.purpose ?? 'general', 'delegation'),
     );
-    const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
+    const purpose = decision.purpose ?? 'general';
+    const artifactLimit = purpose === 'research' && this.isLikelyExternalResearchPrompt(userMessage.content) ? 1 : 4;
+    const artifacts = this.getArtifactsForPurpose(purpose, artifactLimit);
     const checklist = buildDelegateJobChecklist(
-      decision.purpose ?? 'general',
+      purpose,
       decision.preferredMode ?? null,
       this.verificationModeForPurpose(decision.purpose),
     );
@@ -2272,7 +2051,7 @@ export class NativeBridgeController {
       label,
       cwd: process.cwd(),
       prompt: userMessage.content,
-      purpose: decision.purpose ?? 'general',
+      purpose,
       preferredMode: decision.preferredMode ?? null,
       preferredModel: decision.preferredMode ? this.selectedModels[decision.preferredMode] : null,
       reason: decision.reason,
@@ -2288,7 +2067,7 @@ export class NativeBridgeController {
           id: `job:${backgroundJobId}:delegate`,
           label: decision.preferredMode ? HARNESS_MODES[decision.preferredMode].label : 'Delegate',
           mode: decision.preferredMode ?? null,
-          purpose: decision.purpose ?? 'general',
+          purpose,
           checklistId: 'execute',
           status: 'queued',
           detail: formatChecklistLinkedDetail(
@@ -2304,9 +2083,11 @@ export class NativeBridgeController {
       artifact: null,
     });
 
-    this.backgroundJobs = [this.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
+    this.backgroundJobs = [this.backgroundCoordinator.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
     this.syncBackgroundJobs();
-    this.syncDetachedAgentActivities([record]);
+    const live = this.agentActivities.filter((activity) => !activity.id.startsWith('job:'));
+    this.agentActivities = [...live, ...this.backgroundCoordinator.collectDetachedAgentActivities([record])];
+    this.syncAgentActivities();
     this.scheduleStatePush();
 
     try {
@@ -2361,6 +2142,7 @@ export class NativeBridgeController {
       const contextSnapshot = await this.buildPromptContextSnapshot(
         executionPrompt,
         decision.purpose ?? 'general',
+        this.getPromptContextSnapshotOptions(executionPrompt, decision.purpose ?? 'general', 'delegation'),
       );
       await this.hookRegistry.emit('beforeSend', {
         provider: this.getCurrentProvider(),
@@ -2372,7 +2154,9 @@ export class NativeBridgeController {
       });
 
       const runtime = this.createDelegationRuntime();
-      const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', 4);
+      const routePurpose = decision.purpose ?? 'general';
+      const artifactLimit = routePurpose === 'research' && this.isLikelyExternalResearchPrompt(executionPrompt) ? 1 : 4;
+      const artifacts = this.getArtifactsForPurpose(decision.purpose ?? 'general', artifactLimit);
       const result = await runtime.run(
         {
           prompt: executionPrompt,
@@ -2383,12 +2167,29 @@ export class NativeBridgeController {
           cwd: process.cwd(),
           isolatedLabel: `route-${decision.preferredMode ?? decision.purpose ?? 'general'}`,
           applyWorkspaceChanges: decision.purpose === 'execution' || decision.purpose === 'design',
+          readOnly: !(decision.purpose === 'execution' || decision.purpose === 'design'),
           verificationMode: this.verificationModeForPurpose(decision.purpose),
           contextSnapshot,
           artifacts,
         },
         {
           signal: controller.signal,
+          onApiCallStart: async (input) => {
+            await this.hookRegistry.emit(
+              'beforeApiCall',
+              buildDelegationHookContext(input, {
+                sessionId: this.state.sessionId,
+              }),
+            );
+          },
+          onApiCallComplete: async (input) => {
+            await this.hookRegistry.emit(
+              'afterApiCall',
+              buildDelegationHookContext(input, {
+                sessionId: this.state.sessionId,
+              }),
+            );
+          },
           onText: (delta) => {
             if (!delta) {
               return;
@@ -2432,6 +2233,16 @@ export class NativeBridgeController {
               mode: decision.preferredMode ?? null,
               purpose: decision.purpose ?? 'general',
               detail: state.summary ?? null,
+            });
+          },
+          onExecutionState: (detail) => {
+            this.updateAgentActivity({
+              id: routeActivityId,
+              label: formatModeWorkerLabel(decision.preferredMode ?? null, decision.purpose ?? 'general'),
+              status: 'queued',
+              mode: decision.preferredMode ?? null,
+              purpose: decision.purpose ?? 'general',
+              detail,
             });
           },
         },
@@ -2908,22 +2719,109 @@ export class NativeBridgeController {
     }
 
     const anthropicAuth = this.availableProviders.get('anthropic') ?? this.availableProviders.get('claude');
-    const results: ToolResultBlock[] = [];
+    const results: Array<ToolResultBlock | undefined> = new Array(blocks.length);
+    const preparedExecutions: Array<{
+      index: number;
+      block: ToolUseBlock;
+      tool: Tool;
+      syntheticToolLabel: string;
+      toolContext: ToolContext;
+      toolStartedAt: number;
+      toolActivitySnapshots: Map<string, {
+        id: string;
+        label: string;
+        mode: NamedMode | null;
+        purpose: string | null;
+        status: AgentActivityState['status'];
+        detail: string | null;
+        workspacePath: string | null;
+        updatedAt: number;
+      }>;
+      publishToolHeartbeat: (force?: boolean) => void;
+      syncSyntheticActivity: (
+        status: AgentActivityState['status'],
+        detail?: string | null,
+        workspacePath?: string | null,
+      ) => void;
+      parallelSafe: boolean;
+    }> = [];
 
-    for (const block of blocks) {
+    for (const [index, block] of blocks.entries()) {
       const tool = registry.get(block.name);
       if (!tool) {
         this.setToolStatus(context.assistantMessageId, block.id, 'error', `Unknown tool: ${block.name}`);
-        results.push({
+        results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
           content: `Unknown tool: ${block.name}`,
           is_error: true,
-        });
+        };
         continue;
       }
 
       let progress = '';
+      const toolActivitySnapshots = new Map<string, {
+        id: string;
+        label: string;
+        mode: NamedMode | null;
+        purpose: string | null;
+        status: AgentActivityState['status'];
+        detail: string | null;
+        workspacePath: string | null;
+        updatedAt: number;
+      }>();
+      const toolStartedAt = Date.now();
+      let lastVisibleToolUpdateAt = toolStartedAt;
+      const syntheticToolLabel = previewText(summarizeToolInput(block.name, block.input), 56) || block.name;
+      const syntheticToolActivityId = isParallelSafeToolCall(block.name)
+        ? buildSyntheticToolActivityId(context.assistantMessageId, block.id)
+        : null;
+      const syncSyntheticActivity = (
+        status: AgentActivityState['status'],
+        detail?: string | null,
+        workspacePath?: string | null,
+      ): void => {
+        if (!syntheticToolActivityId) {
+          return;
+        }
+
+        const snapshot = {
+          id: syntheticToolActivityId,
+          label: syntheticToolLabel,
+          status,
+          mode: null,
+          purpose: 'tool',
+          detail: detail ?? null,
+          workspacePath: workspacePath ?? null,
+          updatedAt: Date.now(),
+        };
+        toolActivitySnapshots.set(syntheticToolActivityId, snapshot);
+        this.updateAgentActivity(snapshot);
+      };
+      const publishToolHeartbeat = (force: boolean = false): void => {
+        if (toolActivitySnapshots.size === 0) {
+          return;
+        }
+
+        const now = Date.now();
+        if (!force && now - lastVisibleToolUpdateAt < 10_000) {
+          return;
+        }
+
+        this.setToolStatus(
+          context.assistantMessageId,
+          block.id,
+          'running',
+          summarizeToolResult(
+            formatAgentActivityHeartbeat({
+              label: syntheticToolLabel,
+              elapsedMs: now - toolStartedAt,
+              activities: Array.from(toolActivitySnapshots.values()),
+            }),
+          ),
+        );
+        lastVisibleToolUpdateAt = now;
+      };
       const toolContext: ToolContext = {
         cwd: process.cwd(),
         abortSignal: context.signal,
@@ -2963,6 +2861,8 @@ export class NativeBridgeController {
         },
         onProgress: (text: string): void => {
           progress += text;
+          lastVisibleToolUpdateAt = Date.now();
+          syncSyntheticActivity('running', summarizeToolResult(progress));
           this.setToolStatus(
             context.assistantMessageId,
             block.id,
@@ -2971,6 +2871,16 @@ export class NativeBridgeController {
           );
         },
         onAgentActivity: (activity): void => {
+          toolActivitySnapshots.set(activity.id, {
+            id: activity.id,
+            label: activity.label,
+            status: activity.status,
+            mode: activity.mode ?? null,
+            purpose: activity.purpose ?? null,
+            detail: activity.detail ?? null,
+            workspacePath: activity.workspacePath ?? null,
+            updatedAt: Date.now(),
+          });
           this.updateAgentActivity({
             id: activity.id,
             label: activity.label,
@@ -2980,6 +2890,7 @@ export class NativeBridgeController {
             detail: activity.detail ?? null,
             workspacePath: activity.workspacePath ?? null,
           });
+          publishToolHeartbeat(true);
         },
         contextSnapshot: async (prompt: string, purpose?: string): Promise<string> => {
           return this.buildPromptContextSnapshot(prompt, purpose as DelegationPurpose | 'general' | undefined);
@@ -2996,15 +2907,57 @@ export class NativeBridgeController {
       const authorization = await this.authorizeToolExecution(block, toolContext);
       if (!authorization.allowed) {
         const message = authorization.reason ?? `Tool blocked by permission profile ${this.permissionProfile}`;
+        syncSyntheticActivity('error', message);
         this.setToolStatus(context.assistantMessageId, block.id, 'error', summarizeToolResult(message));
-        results.push({
+        results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
           content: message,
           is_error: true,
-        });
+        };
         continue;
       }
+
+      preparedExecutions.push({
+        index,
+        block,
+        tool,
+        syntheticToolLabel,
+        toolContext,
+        toolStartedAt,
+        toolActivitySnapshots,
+        publishToolHeartbeat,
+        syncSyntheticActivity,
+        parallelSafe: isParallelSafeToolCall(block.name),
+      });
+    }
+
+    const pendingParallel: Array<Promise<void>> = [];
+    const flushParallel = async (): Promise<void> => {
+      if (pendingParallel.length === 0) {
+        return;
+      }
+      await Promise.all(pendingParallel);
+      pendingParallel.length = 0;
+    };
+
+    const runPreparedExecution = async (
+      prepared: (typeof preparedExecutions)[number],
+    ): Promise<void> => {
+      const { index, block, tool, syntheticToolLabel, toolContext, publishToolHeartbeat, syncSyntheticActivity } = prepared;
+      syncSyntheticActivity('running', syntheticToolLabel);
+      this.setToolStatus(
+        context.assistantMessageId,
+        block.id,
+        'running',
+        summarizeToolResult(syntheticToolLabel),
+      );
+      const toolHeartbeatTimer = setInterval(() => {
+        if (context.signal.aborted) {
+          return;
+        }
+        publishToolHeartbeat(false);
+      }, 5_000);
 
       try {
         await this.hookRegistry.emit('beforeToolCall', {
@@ -3013,9 +2966,11 @@ export class NativeBridgeController {
           sessionId: this.state.sessionId,
         });
         const result = await tool.execute(block.input, toolContext);
+        let workspacePath: string | null = null;
         if (result.metadata && typeof result.metadata === 'object') {
           const metadata = result.metadata as Record<string, unknown>;
           if (typeof metadata.workspacePath === 'string' && metadata.workspacePath.trim()) {
+            workspacePath = metadata.workspacePath;
             this.state.workspace = {
               label: block.name,
               path: metadata.workspacePath,
@@ -3041,6 +2996,11 @@ export class NativeBridgeController {
             }
           }
         }
+        syncSyntheticActivity(
+          result.isError ? 'error' : 'done',
+          summarizeToolResult(result.output),
+          workspacePath,
+        );
         this.setToolStatus(
           context.assistantMessageId,
           block.id,
@@ -3055,14 +3015,15 @@ export class NativeBridgeController {
           sessionId: this.state.sessionId,
         });
 
-        results.push({
+        results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
           content: result.output,
           is_error: result.isError || undefined,
-        });
+        };
       } catch (error: unknown) {
         const message = serializeError(error);
+        syncSyntheticActivity('error', message);
         this.setToolStatus(
           context.assistantMessageId,
           block.id,
@@ -3075,30 +3036,44 @@ export class NativeBridgeController {
           error: message,
           sessionId: this.state.sessionId,
         });
-        results.push({
+        results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
           content: message,
           is_error: true,
-        });
+        };
+      } finally {
+        clearInterval(toolHeartbeatTimer);
+      }
+    };
+
+    for (const prepared of preparedExecutions) {
+      if (prepared.parallelSafe) {
+        pendingParallel.push(runPreparedExecution(prepared));
+      } else {
+        await flushParallel();
+        await runPreparedExecution(prepared);
       }
     }
 
-    return results;
+    await flushParallel();
+    return results.filter((item): item is ToolResultBlock => Boolean(item));
   }
 
   private async refreshSystemPrompt(): Promise<void> {
-    const mode = this.currentMode;
-    const model = this.getCurrentModel();
+    const runtime = this.getResolvedModeRuntime();
+    const mode = runtime.mode;
+    const model = runtime.model;
+    const provider = runtime.provider;
     const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
     const cwd = process.cwd();
     const projectName = basename(cwd) || 'unknown-project';
     const loadedSkills = Array.from(this.loadedSkills.values());
 
     try {
-      let prompt = await loadSystemPrompt({
+      const promptContext = {
         model,
-        provider: modeConfig.provider,
+        provider,
         cwd,
         projectName,
         version: PROMPT_VERSION,
@@ -3106,7 +3081,9 @@ export class NativeBridgeController {
         rules: [],
         skills: loadedSkills.map((skill) => skill.name),
         userInstructions: modeConfig.promptAddition.trim(),
-      });
+      };
+      let prompt = await loadSystemPrompt(promptContext);
+      this.orchestratorPrompt = await loadOrchestratorPrompt(promptContext);
 
       if (loadedSkills.length > 0) {
         prompt += `\n\n${loadedSkills
@@ -3131,7 +3108,8 @@ export class NativeBridgeController {
 
       this.systemPrompt = prompt;
     } catch {
-      this.systemPrompt = buildFallbackSystemPrompt(mode, model);
+      this.systemPrompt = buildFallbackSystemPrompt(mode, model, provider);
+      this.orchestratorPrompt = null;
       this.state.contextPreview = null;
     }
 
@@ -3185,39 +3163,21 @@ export class NativeBridgeController {
     ].join('\n');
   }
 
-  private getWorkflowSnapshot(): WorkflowStateSnapshot {
+  private buildWorkflowStateSource(): WorkflowStateSource {
     return {
-      mode: this.currentMode,
-      selectedModels: { ...this.selectedModels },
+      currentMode: this.currentMode,
+      selectedModels: this.selectedModels,
       permissionProfile: this.permissionProfile,
-      todos: this.todos.map((item) => ({ ...item })),
-      remoteSessions: Array.from(this.remoteSessions.values()).map((session) => ({ ...session })),
-      artifacts: this.artifacts.map((artifact) => ({ ...artifact })),
-      queuedPrompts: [...this.queuedPrompts],
-      backgroundJobs: this.backgroundJobs.map((job) => ({
-        id: job.id,
-        kind: job.kind,
-        label: job.label,
-        status: job.status,
-        detail: job.detail,
-        startedAt: job.startedAt,
-        updatedAt: job.updatedAt,
-        finishedAt: job.finishedAt ?? null,
-        prompt: job.prompt,
-        purpose: job.purpose,
-        preferredMode: job.preferredMode ?? null,
-        strategy: job.strategy,
-        reason: job.reason ?? null,
-        artifactId: job.artifactId ?? null,
-        artifactTitle: job.artifactTitle ?? null,
-        verificationSummary: job.verificationSummary ?? null,
-        attempt: job.attempt ?? 0,
-        hasResult: job.hasResult ?? false,
-        resultPreview: job.resultPreview ?? null,
-        workspacePath: job.workspacePath ?? null,
-        checklist: job.checklist.map((item) => ({ ...item })),
-      })),
+      todos: this.todos,
+      remoteSessions: this.remoteSessions.values(),
+      artifacts: this.artifacts,
+      queuedPrompts: this.queuedPrompts,
+      backgroundJobs: this.backgroundJobs,
     };
+  }
+
+  private getWorkflowSnapshot(): WorkflowStateSnapshot {
+    return this.workflowStateStore.buildSnapshot(this.buildWorkflowStateSource());
   }
 
   private async persistWorkflowState(
@@ -3225,190 +3185,7 @@ export class NativeBridgeController {
     sessionId: string = this.state.sessionId ?? '',
     snapshot: WorkflowStateSnapshot = this.getWorkflowSnapshot(),
   ): Promise<void> {
-    if (!this.sessionManager || !sessionId) {
-      return;
-    }
-
-    await this.sessionManager.append(sessionId, {
-      type: 'message',
-      timestamp: new Date().toISOString(),
-      data: {
-        kind: 'controller_state',
-        reason,
-        controllerState: snapshot,
-      },
-    });
-  }
-
-  private parseWorkflowSnapshot(entry: SessionEntry): WorkflowStateSnapshot | null {
-    const snapshot = entry.data.controllerState;
-    if (typeof snapshot !== 'object' || snapshot === null) {
-      return null;
-    }
-
-    const record = snapshot as Record<string, unknown>;
-    const mode =
-      record.mode === 'jennie' || record.mode === 'lisa' || record.mode === 'rosé' || record.mode === 'jisoo'
-        ? record.mode
-        : this.currentMode;
-    const permissionProfile = normalizePermissionProfile(record.permissionProfile);
-    const selectedModelsRecord = typeof record.selectedModels === 'object' && record.selectedModels !== null
-      ? (record.selectedModels as Record<string, unknown>)
-      : {};
-    const selectedModels: Record<NamedMode, string> = {
-      jennie: typeof selectedModelsRecord.jennie === 'string' ? selectedModelsRecord.jennie : this.selectedModels.jennie,
-      lisa: typeof selectedModelsRecord.lisa === 'string' ? selectedModelsRecord.lisa : this.selectedModels.lisa,
-      'rosé': typeof selectedModelsRecord['rosé'] === 'string' ? selectedModelsRecord['rosé'] : this.selectedModels['rosé'],
-      jisoo: typeof selectedModelsRecord.jisoo === 'string' ? selectedModelsRecord.jisoo : this.selectedModels.jisoo,
-    };
-    const todos = Array.isArray(record.todos)
-      ? record.todos
-          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-          .map((item) => ({
-            id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
-            step: typeof item.step === 'string' ? item.step.trim() : '',
-            status: isPlanStatus(item.status) ? item.status : 'pending',
-            owner: typeof item.owner === 'string' && item.owner.trim() ? item.owner.trim() : undefined,
-            updatedAt: typeof item.updatedAt === 'string' ? item.updatedAt : entry.timestamp,
-          }))
-          .filter((item) => item.step.length > 0)
-      : [];
-    const remoteSessions = Array.isArray(record.remoteSessions)
-      ? record.remoteSessions
-          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-          .map((item) => ({
-            provider: typeof item.provider === 'string' ? item.provider : '',
-            sessionId: typeof item.sessionId === 'string' ? item.sessionId : '',
-            syncedMessageCount: typeof item.syncedMessageCount === 'number' ? item.syncedMessageCount : 0,
-            lastModel: typeof item.lastModel === 'string' ? item.lastModel : '',
-            lastUsedAt: typeof item.lastUsedAt === 'number' ? item.lastUsedAt : Date.parse(entry.timestamp),
-          }))
-          .filter((item) => item.provider && item.sessionId)
-      : [];
-    const artifacts = Array.isArray(record.artifacts)
-      ? record.artifacts
-          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-          .map((item) => {
-            const source: WorkflowArtifact['source'] =
-              item.source === 'delegate' || item.source === 'team' || item.source === 'session'
-                ? item.source
-                : 'session';
-            const mode: WorkflowArtifact['mode'] =
-              item.mode === 'jennie' || item.mode === 'lisa' || item.mode === 'rosé' || item.mode === 'jisoo'
-                ? item.mode
-                : undefined;
-            return {
-              id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
-              kind: isArtifactKind(item.kind) ? item.kind : 'answer',
-              title: typeof item.title === 'string' ? item.title.trim() : '',
-              summary: typeof item.summary === 'string' ? item.summary.trim() : '',
-              payload:
-                typeof item.payload === 'object' && item.payload !== null
-                  ? (item.payload as WorkflowArtifact['payload'])
-                  : undefined,
-              source,
-              mode,
-              createdAt: typeof item.createdAt === 'string' ? item.createdAt : entry.timestamp,
-            };
-          })
-          .filter((item) => item.title.length > 0 && item.summary.length > 0)
-      : [];
-    const queuedPrompts = Array.isArray(record.queuedPrompts)
-      ? record.queuedPrompts
-          .filter((item): item is string => typeof item === 'string')
-          .map((item) => item.trim())
-          .filter((item) => item.length > 0)
-      : [];
-    const backgroundJobs = Array.isArray(record.backgroundJobs)
-      ? record.backgroundJobs
-          .filter((item): item is Record<string, unknown> => typeof item === 'object' && item !== null)
-          .map((item): WorkflowBackgroundJobSnapshot | null => {
-            const status = item.status === 'running' || item.status === 'done' || item.status === 'error'
-              ? item.status
-              : null;
-            const kind = item.kind === 'delegate' || item.kind === 'team' ? item.kind : null;
-            if (!status || !kind) {
-              return null;
-            }
-
-            return {
-              id: typeof item.id === 'string' && item.id.trim() ? item.id : randomUUID(),
-              kind,
-              label: typeof item.label === 'string' && item.label.trim() ? item.label.trim() : kind,
-              status,
-              detail: typeof item.detail === 'string' ? item.detail : null,
-              startedAt: typeof item.startedAt === 'number' ? item.startedAt : Date.parse(entry.timestamp),
-              updatedAt: typeof item.updatedAt === 'number' ? item.updatedAt : Date.parse(entry.timestamp),
-              prompt: typeof item.prompt === 'string' && item.prompt.trim() ? item.prompt.trim() : undefined,
-              purpose:
-                item.purpose === 'general' ||
-                item.purpose === 'execution' ||
-                item.purpose === 'planning' ||
-                item.purpose === 'research' ||
-                item.purpose === 'review' ||
-                item.purpose === 'design' ||
-                item.purpose === 'oracle'
-                  ? item.purpose
-                  : undefined,
-              preferredMode:
-                item.preferredMode === 'jennie' || item.preferredMode === 'lisa' || item.preferredMode === 'rosé' || item.preferredMode === 'jisoo'
-                  ? item.preferredMode
-                  : null,
-              strategy:
-                item.strategy === 'parallel' || item.strategy === 'sequential' || item.strategy === 'delegate'
-                  ? item.strategy
-                  : undefined,
-              reason: typeof item.reason === 'string' ? item.reason : null,
-              artifactId: typeof item.artifactId === 'string' && item.artifactId.trim() ? item.artifactId.trim() : null,
-              artifactTitle: typeof item.artifactTitle === 'string' && item.artifactTitle.trim() ? item.artifactTitle.trim() : null,
-              verificationSummary:
-                typeof item.verificationSummary === 'string' && item.verificationSummary.trim()
-                  ? item.verificationSummary.trim()
-                  : null,
-              attempt: typeof item.attempt === 'number' && Number.isFinite(item.attempt) ? item.attempt : 0,
-              finishedAt: typeof item.finishedAt === 'number' ? item.finishedAt : null,
-              hasResult: item.hasResult === true,
-              resultPreview:
-                typeof item.resultPreview === 'string' && item.resultPreview.trim()
-                  ? item.resultPreview.trim()
-                  : null,
-              workspacePath:
-                typeof item.workspacePath === 'string' && item.workspacePath.trim()
-                  ? item.workspacePath.trim()
-                  : null,
-              checklist: Array.isArray(item.checklist)
-                ? item.checklist
-                    .filter((part): part is Record<string, unknown> => typeof part === 'object' && part !== null)
-                    .map((part) => ({
-                      id: typeof part.id === 'string' && part.id.trim() ? part.id.trim() : randomUUID(),
-                      label: typeof part.label === 'string' && part.label.trim() ? part.label.trim() : 'step',
-                      owner: typeof part.owner === 'string' && part.owner.trim() ? part.owner.trim() : null,
-                      status:
-                        part.status === 'pending' || part.status === 'in_progress' || part.status === 'completed' || part.status === 'error'
-                          ? part.status
-                          : 'pending',
-                      detail: typeof part.detail === 'string' && part.detail.trim() ? part.detail.trim() : null,
-                      updatedAt:
-                        typeof part.updatedAt === 'number' && Number.isFinite(part.updatedAt)
-                          ? part.updatedAt
-                          : Date.parse(entry.timestamp),
-                    }))
-                : [],
-            };
-          })
-          .filter((item): item is WorkflowBackgroundJobSnapshot => item !== null)
-      : [];
-
-    return {
-      mode,
-      selectedModels,
-      permissionProfile,
-      todos,
-      remoteSessions,
-      artifacts,
-      queuedPrompts,
-      backgroundJobs,
-    };
+    await this.workflowStateStore.persist(reason, sessionId, snapshot);
   }
 
   private async setPermissionProfile(profile: PermissionProfile): Promise<void> {
@@ -3515,7 +3292,12 @@ export class NativeBridgeController {
 
     try {
       const loaded = await this.sessionManager.load(requestedSessionId);
-      this.restoreSession(loaded);
+      this.applyRestoredSession(this.workflowStateStore.restoreSession(loaded, {
+        fallbackMode: this.currentMode,
+        fallbackSelectedModels: this.selectedModels,
+        fallbackPermissionProfile: this.permissionProfile,
+        normalizePermissionProfile,
+      }));
       return true;
     } catch (error: unknown) {
       this.appendSystemMessage(
@@ -3525,140 +3307,42 @@ export class NativeBridgeController {
     }
   }
 
-  private restoreSession(session: LoadedSession): void {
-    let restoredMessages: NativeMessageState[] = [];
-    let restoredMode: NamedMode | null = null;
-    let restoredSnapshot: WorkflowStateSnapshot | null = null;
-
-    for (const entry of session.entries) {
-      const timestamp = Date.parse(entry.timestamp);
-      const baseTimestamp = Number.isNaN(timestamp) ? Date.now() : timestamp;
-
-      if (entry.type === 'compaction') {
-        const summary = getEntryString(entry, 'summary');
-        if (!summary) {
-          continue;
-        }
-
-        restoredMessages = [
-          {
-            id: randomUUID(),
-            role: 'user',
-            content: summary,
-            timestamp: baseTimestamp,
-          },
-          {
-            id: randomUUID(),
-            role: 'assistant',
-            content: 'Context compacted. Ready to continue.',
-            timestamp: baseTimestamp + 1,
-          },
-        ];
-        continue;
-      }
-
-      if (entry.type !== 'message') {
-        continue;
-      }
-
-      const snapshot = this.parseWorkflowSnapshot(entry);
-      if (snapshot) {
-        restoredSnapshot = snapshot;
-        continue;
-      }
-
-      const user = getEntryString(entry, 'user');
-      const assistant = getEntryString(entry, 'assistant');
-      const system = getEntryString(entry, 'system');
-      const mode = getEntryString(entry, 'mode');
-      const entryMode =
-        mode === 'jennie' || mode === 'lisa' || mode === 'rosé' || mode === 'jisoo'
-          ? mode
-          : null;
-
-      if (entryMode) {
-        restoredMode = entryMode;
-      }
-
-      if (user) {
-        restoredMessages.push({
-          id: randomUUID(),
-          role: 'user',
-          content: user,
-          timestamp: baseTimestamp,
-        });
-      }
-
-      if (assistant) {
-        restoredMessages.push({
-          id: randomUUID(),
-          role: 'assistant',
-          content: assistant,
-          timestamp: baseTimestamp + 1,
-        });
-      }
-
-      if (system) {
-        restoredMessages.push({
-          id: randomUUID(),
-          role: 'system',
-          content: system,
-          timestamp: baseTimestamp + 2,
-        });
-      }
-    }
-
-    const inferredMode =
-      restoredSnapshot?.mode ??
-      restoredMode ??
-      findModeForProviderModel(session.header.provider, session.header.model) ??
-      this.currentMode;
-
-    this.currentMode = inferredMode;
-    this.state.mode = inferredMode;
+  private applyRestoredSession(restored: ReturnType<WorkflowStateStore['restoreSession']>): void {
+    this.currentMode = restored.mode;
+    this.state.mode = restored.mode;
     this.remoteSessions.clear();
     this.agentActivities = [];
     this.backgroundJobs = [];
-    this.backgroundJobStatusCache.clear();
+    this.backgroundCoordinator.clearStatusCache();
     this.queuedPrompts = [];
     this.syncAgentActivities();
     this.syncBackgroundJobs();
-
-    if (restoredSnapshot) {
-      this.selectedModels = { ...restoredSnapshot.selectedModels };
-      this.permissionProfile = restoredSnapshot.permissionProfile;
-      this.lastSafePermissionProfile =
-        this.permissionProfile === 'permissionless' ? DEFAULT_PERMISSION_PROFILE : this.permissionProfile;
-      this.state.permissionProfile = this.permissionProfile;
-      this.state.playingWithFire = this.permissionProfile === 'permissionless';
-      this.todos = restoredSnapshot.todos.map((item) => ({ ...item }));
-      this.state.todos = this.todos.map((item) => ({ ...item }));
-      this.artifacts = restoredSnapshot.artifacts.map((artifact) => ({ ...artifact }));
-      this.syncArtifacts();
-      this.queuedPrompts = [...restoredSnapshot.queuedPrompts];
-      this.state.queuedPrompts = [...this.queuedPrompts];
-      this.backgroundJobs = restoredSnapshot.backgroundJobs.map((job) => ({
-        ...job,
-        status: job.status === 'running' ? 'error' : job.status,
-        detail:
-          job.status === 'running'
-            ? 'interrupted by restart'
-            : job.detail,
-        checklist: Array.isArray(job.checklist) ? job.checklist.map((item) => ({ ...item })) : [],
-        controller: null,
-      }));
-      this.syncBackgroundJobs();
-      for (const remoteSession of restoredSnapshot.remoteSessions) {
-        this.remoteSessions.set(remoteSession.provider, { ...remoteSession });
-      }
+    this.selectedModels = { ...restored.selectedModels };
+    this.permissionProfile = restored.permissionProfile;
+    this.lastSafePermissionProfile =
+      this.permissionProfile === 'permissionless' ? DEFAULT_PERMISSION_PROFILE : this.permissionProfile;
+    this.state.permissionProfile = this.permissionProfile;
+    this.state.playingWithFire = this.permissionProfile === 'permissionless';
+    this.todos = restored.todos.map((item) => ({ ...item }));
+    this.state.todos = this.todos.map((item) => ({ ...item }));
+    this.artifacts = restored.artifacts.map((artifact) => ({ ...artifact }));
+    this.syncArtifacts();
+    this.queuedPrompts = [...restored.queuedPrompts];
+    this.state.queuedPrompts = [...this.queuedPrompts];
+    this.backgroundJobs = restored.backgroundJobs.map((job) => ({
+      ...job,
+      status: job.status === 'running' ? 'error' : job.status,
+      detail: job.status === 'running' ? 'interrupted by restart' : job.detail,
+      checklist: Array.isArray(job.checklist) ? job.checklist.map((item) => ({ ...item })) : [],
+      controller: null,
+    }));
+    this.syncBackgroundJobs();
+    for (const remoteSession of restored.remoteSessions) {
+      this.remoteSessions.set(remoteSession.provider, { ...remoteSession });
     }
 
-    if (session.header.model && !restoredSnapshot) {
-      this.selectedModels[inferredMode] = session.header.model;
-    }
-
-    this.state.sessionId = session.header.id;
-    this.state.messages = restoredMessages;
+    this.state.sessionId = restored.sessionId;
+    this.state.messages = restored.messages;
     this.updateRemoteSessionState();
   }
 
@@ -3756,21 +3440,39 @@ export class NativeBridgeController {
     return resolveModeBinding(mode, (provider) => this.hasResolvedProvider(provider));
   }
 
+  private getResolvedModeRuntime(mode: NamedMode = this.currentMode): {
+    mode: NamedMode;
+    provider: string;
+    model: string;
+  } {
+    const binding = this.getModeBinding(mode);
+    const selected = this.selectedModels[mode];
+    const providerName = resolveProviderConfigName(binding.provider);
+    const providerConfig = this.config?.providers[providerName];
+    const availableModels = providerConfig?.models.map((candidate) => candidate.id) ?? [];
+
+    return {
+      mode,
+      provider: binding.provider,
+      model: selected && availableModels.includes(selected) ? selected : binding.model,
+    };
+  }
+
+  private getProviderCapabilities(provider: string): ApiClientCapabilities | null {
+    const auth = this.availableProviders.get(provider);
+    if (!auth) {
+      return null;
+    }
+
+    return getClientCapabilities(provider, auth.tokenType);
+  }
+
   private getCurrentProvider(): string {
-    return this.getModeBinding().provider;
+    return this.getResolvedModeRuntime().provider;
   }
 
   private getCurrentModel(): string {
-    const binding = this.getModeBinding();
-    const selected = this.selectedModels[this.currentMode];
-    if (!selected) {
-      return binding.model;
-    }
-
-    const providerName = resolveProviderConfigName(binding.provider);
-    const providerConfig = this.config?.providers[providerName];
-    const availableModels = providerConfig?.models.map((model) => model.id) ?? [];
-    return availableModels.includes(selected) ? selected : binding.model;
+    return this.getResolvedModeRuntime().model;
   }
 
   private resolveCurrentProviderModels(): string[] {
@@ -3778,35 +3480,28 @@ export class NativeBridgeController {
       return [];
     }
 
-    const providerName = resolveProviderConfigName(this.getCurrentProvider());
+    const providerName = resolveProviderConfigName(this.getResolvedModeRuntime().provider);
     const providerConfig = this.config.providers[providerName];
     return providerConfig?.models.map((model) => model.id) ?? [];
   }
 
   private reconfigureClient(): void {
-    const provider = this.getCurrentProvider();
-    const model = this.getCurrentModel();
-    const modeConfig = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
+    const runtime = this.getResolvedModeRuntime();
+    const provider = runtime.provider;
+    const model = runtime.model;
 
     this.state.provider = provider;
     this.state.model = model;
     this.state.models = this.resolveCurrentProviderModels();
     this.state.modes = MODE_ORDER.map((modeName) => {
       const modeEntry = HARNESS_MODES[modeName];
-      const binding = this.getModeBinding(modeName);
-      const providerName = resolveProviderConfigName(binding.provider);
-      const providerConfig = this.config?.providers[providerName];
-      const selectedModel = this.selectedModels[modeName];
-      const resolvedModel =
-        selectedModel && providerConfig?.models.some((candidate) => candidate.id === selectedModel)
-          ? selectedModel
-          : binding.model;
+      const modeRuntime = this.getResolvedModeRuntime(modeName);
       return {
         name: modeName,
         label: modeEntry.label,
         tagline: modeEntry.tagline,
-        provider: binding.provider,
-        model: resolvedModel,
+        provider: modeRuntime.provider,
+        model: modeRuntime.model,
         active: modeName === this.currentMode,
       };
     });
@@ -3827,8 +3522,7 @@ export class NativeBridgeController {
       this.state.error = `No auth found for ${provider}. Run: ddudu auth login`;
     }
 
-    this.systemPrompt = buildFallbackSystemPrompt(this.currentMode, model)
-      .replace(/\$\{provider\}/g, modeConfig.provider);
+    this.systemPrompt = buildFallbackSystemPrompt(this.currentMode, model, provider);
 
     this.updateRemoteSessionState();
     this.syncUsageState();
@@ -3836,11 +3530,12 @@ export class NativeBridgeController {
 
   private estimateCurrentContextFootprint(): { tokens: number; limit: number; percent: number } {
     const provider = this.getCurrentProvider();
+    const capabilities = this.getProviderCapabilities(provider);
     const history = countApiMessageTokens(
       toApiMessages(this.getCanonicalConversationMessages()),
       (text) => this.tokenCounter.countTokens(text),
     );
-    const includeTools = !this.isCliBackedProvider(provider);
+    const includeTools = capabilities?.supportsApiToolCalls === true;
     const includeSystem = provider === 'anthropic' || !this.isCliBackedProvider(provider);
     const tools =
       includeTools && this.toolRegistry
@@ -3892,17 +3587,12 @@ export class NativeBridgeController {
       availableProviders: this.availableProviders,
       sessionManager: this.sessionManager,
       worktreeManager: this.worktreeManager,
-      resolveModel: (mode: NamedMode): string => {
-        const binding = this.getModeBinding(mode);
-        const selected = this.selectedModels[mode];
-        if (!selected) {
-          return binding.model;
-        }
-
-        const providerName = resolveProviderConfigName(binding.provider);
-        const providerConfig = this.config?.providers[providerName];
-        return providerConfig?.models.some((model) => model.id === selected) ? selected : binding.model;
+      executionSchedulerConfig: {
+        providerBudgets: this.config?.agent.provider_budgets,
+        maxParallelWrites: this.config?.agent.max_parallel_writes,
+        pollMs: this.config?.agent.scheduler_poll_ms,
       },
+      resolveModel: (mode: NamedMode): string => this.getResolvedModeRuntime(mode).model,
     });
   }
 
@@ -3926,7 +3616,8 @@ export class NativeBridgeController {
 
   private estimateRequestForPlan(plan: RequestPlan): NativeRequestEstimateState {
     const provider = this.getCurrentProvider();
-    const includeTools = !this.isCliBackedProvider(provider);
+    const capabilities = this.getProviderCapabilities(provider);
+    const includeTools = capabilities?.supportsApiToolCalls === true;
     const includeSystem =
       plan.mode === 'full' ||
       provider === 'anthropic' ||
@@ -4103,7 +3794,12 @@ export class NativeBridgeController {
     }
 
     const loaded = await this.sessionManager.load(sessionId);
-    this.restoreSession(loaded);
+    this.applyRestoredSession(this.workflowStateStore.restoreSession(loaded, {
+      fallbackMode: this.currentMode,
+      fallbackSelectedModels: this.selectedModels,
+      fallbackPermissionProfile: this.permissionProfile,
+      normalizePermissionProfile,
+    }));
     this.invalidateDerivedCaches({ briefing: true, promptContext: true });
     await this.refreshSystemPrompt();
     this.reconfigureClient();
@@ -4287,22 +3983,63 @@ export class NativeBridgeController {
 
   private inferPromptPurpose(prompt: string): DelegationPurpose | 'general' {
     const lower = prompt.toLowerCase();
-    if (/\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color)\b/u.test(lower)) {
+    if (/\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color)\b|(?:디자인|레이아웃|타이포|접근성|색상)/u.test(lower)) {
       return 'design';
     }
-    if (/\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b/u.test(lower)) {
+    if (/\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b|(?:계획|플랜|설계|아키텍처|전략|로드맵|스펙)/u.test(lower)) {
       return 'planning';
     }
-    if (/\b(review|audit|verify|validation|regression|risk|critic|critique)\b/u.test(lower)) {
+    if (/\b(review|audit|verify|validation|regression|risk|critic|critique)\b|(?:리뷰|검토|검증|감사|리스크|회귀)/u.test(lower)) {
       return 'review';
     }
-    if (/\b(research|investigate|look into|survey|compare|explore)\b/u.test(lower)) {
+    if (/\b(research|investigate|look into|survey|compare|explore)\b|(?:리서치|조사|찾아|찾아줘|비교|탐색|분석해|알아봐)/u.test(lower)) {
       return 'research';
     }
-    if (/\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b/u.test(lower)) {
+    if (/\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b|(?:구현|수정|고쳐|작성|편집|리팩터|패치|코드|변경)/u.test(lower)) {
       return 'execution';
     }
     return 'general';
+  }
+
+  private isLikelyExternalResearchPrompt(prompt: string): boolean {
+    if (this.extractPromptFileHints(prompt).length > 0) {
+      return false;
+    }
+
+    if (this.extractPromptSymbolHints(prompt, 4).length > 0) {
+      return false;
+    }
+
+    const lower = prompt.toLowerCase();
+    if (
+      /\b(file|files|repo|repository|codebase|function|class|module|component|api|schema|diff|commit|refactor|build|test|lint|mcp|lsp|prompt|config)\b/u.test(lower)
+      || /(?:파일|레포|리포지토리|코드베이스|함수|클래스|모듈|컴포넌트|스키마|커밋|빌드|테스트|린트|설정|심볼)/u.test(lower)
+    ) {
+      return false;
+    }
+
+    return true;
+  }
+
+  private getPromptContextSnapshotOptions(
+    prompt: string | undefined,
+    purpose: DelegationPurpose | 'general',
+    scope: 'request' | 'delegation' | 'team' = 'request',
+  ): ContextSnapshotOptions {
+    if (!prompt || purpose !== 'research' || !this.isLikelyExternalResearchPrompt(prompt)) {
+      return {};
+    }
+
+    return {
+      includeRelevantFiles: false,
+      includeChangedFiles: false,
+      includeBriefing: false,
+      includePlan: false,
+      includeUncertainties: false,
+      includeOperationalState: false,
+      includeMemory: false,
+      maxArtifacts: scope === 'team' ? 1 : 0,
+    };
   }
 
   private extractRankedFilesFromSearch(output: string, limit: number = 5): string[] {
@@ -4525,6 +4262,7 @@ export class NativeBridgeController {
     const parts: string[] = [];
     const effectivePurpose = purpose ?? (prompt ? this.inferPromptPurpose(prompt) : 'general');
     const snapshotOptions: Required<ContextSnapshotOptions> = {
+      includeRelevantFiles: options.includeRelevantFiles ?? true,
       includeChangedFiles: options.includeChangedFiles ?? true,
       includeBriefing: options.includeBriefing ?? true,
       includePlan: options.includePlan ?? true,
@@ -4541,12 +4279,14 @@ export class NativeBridgeController {
     }
     if (prompt) {
       parts.push(`request_focus: ${effectivePurpose}`);
-      const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
-      if (relevantFiles.length > 0) {
-        parts.push(
-          'relevant_files:',
-          ...relevantFiles.map((filePath) => `- ${filePath}`),
-        );
+      if (snapshotOptions.includeRelevantFiles) {
+        const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
+        if (relevantFiles.length > 0) {
+          parts.push(
+            'relevant_files:',
+            ...relevantFiles.map((filePath) => `- ${filePath}`),
+          );
+        }
       }
     }
     const relevantArtifacts = this.getArtifactsForPurpose(effectivePurpose, snapshotOptions.maxArtifacts);
@@ -5995,7 +5735,7 @@ export class NativeBridgeController {
         scope === 'current' && this.state.sessionId
           ? await this.backgroundJobStore.listBySession(this.state.sessionId)
           : await this.backgroundJobStore.list();
-      return jobs.map((job) => this.mapStoredJobToState(job));
+      return jobs.map((job) => this.backgroundCoordinator.mapStoredJobToState(job));
     } catch {
       return this.backgroundJobs.slice();
     }
@@ -6415,29 +6155,7 @@ export class NativeBridgeController {
     messages: NativeMessageState[],
     mode: NamedMode = this.currentMode,
   ): Promise<void> {
-    if (!this.sessionManager) {
-      return;
-    }
-
-    for (const message of messages) {
-      const data: Record<string, unknown> = { mode };
-      if (message.role === 'user') {
-        data.user = message.content;
-      } else if (message.role === 'assistant') {
-        data.assistant = message.content;
-      } else if (message.role === 'system') {
-        data.system = message.content;
-      } else {
-        continue;
-      }
-
-      await this.sessionManager.append(sessionId, {
-        type: 'message',
-        timestamp: new Date(message.timestamp).toISOString(),
-        data,
-      });
-    }
-
+    await this.workflowStateStore.seedSessionMessages(sessionId, messages, mode);
     await this.persistWorkflowState('seed_session', sessionId);
   }
 
@@ -6452,6 +6170,9 @@ export class NativeBridgeController {
       provider: this.getCurrentProvider(),
       model: this.getCurrentModel(),
       title: name.trim() || `fork:${this.currentMode}`,
+      metadata: {
+        mode: this.currentMode,
+      },
     });
     await this.seedSessionMessages(session.id, this.state.messages);
     this.state.sessionId = session.id;
@@ -6477,6 +6198,9 @@ export class NativeBridgeController {
       provider: this.getCurrentProvider(),
       model: this.getCurrentModel(),
       title: `handoff:${trimmedGoal.slice(0, 48)}`,
+      metadata: {
+        mode: this.currentMode,
+      },
     });
 
     const now = Date.now();
@@ -6775,35 +6499,62 @@ export class NativeBridgeController {
 
     const controller = new AbortController();
     this.abortController = controller;
+    const runStartedAt = Date.now();
+    let lastVisibleTeamUpdateAt = runStartedAt;
+    const publishTeamLiveStatus = (force: boolean = false): void => {
+      const now = Date.now();
+      if (!force && now - lastVisibleTeamUpdateAt < 10_000) {
+        return;
+      }
+      const currentActivities = this.agentActivities.filter((activity) => activity.id.startsWith(`team:${runId}:`));
+      this.updateMessage(
+        assistantMessageId,
+        this.teamExecutionCoordinator.formatLiveStatus({
+          strategy,
+          task,
+          elapsedMs: now - runStartedAt,
+          agentActivities: currentActivities,
+        }),
+      );
+      lastVisibleTeamUpdateAt = now;
+    };
+    publishTeamLiveStatus(true);
+    const liveStatusHeartbeat = setInterval(() => {
+      if (controller.signal.aborted || this.activeAssistantMessageId !== assistantMessageId) {
+        return;
+      }
+      publishTeamLiveStatus(false);
+    }, 5_000);
 
     try {
-      const orchestrator = new TeamOrchestrator({
+      const result = await this.teamExecutionCoordinator.run({
         name: 'ddudu-native-team',
-        agents: teamAgents,
+        task,
         strategy,
+        agents: teamAgents,
         maxRounds: 2,
         sharedContext: `cwd=${process.cwd()} · mode=${this.currentMode} · model=${this.getCurrentModel()}`,
+        signal: controller.signal,
         runAgent: async (agent, input, round) =>
           this.executeTeamAgent(agent, input, round, controller.signal, runId, this.teamRunIsolatedNotes),
         onMessage: (message) => {
+          lastVisibleTeamUpdateAt = Date.now();
           this.updateMessage(
             assistantMessageId,
-            this.formatTeamProgress(message),
+            this.teamExecutionCoordinator.formatProgress(message),
           );
         },
       });
-
-      const result = await orchestrator.run(task, controller.signal);
-      const formatted = this.formatTeamResult(
+      const formatted = this.teamExecutionCoordinator.formatResult({
         strategy,
         task,
-        teamAgents,
-        result.messages,
-        result.output,
-        result.success,
-        result.rounds,
-        this.teamRunIsolatedNotes,
-      );
+        agents: teamAgents,
+        messages: result.messages,
+        output: result.output,
+        success: result.success,
+        rounds: result.rounds,
+        isolatedNotes: this.teamRunIsolatedNotes,
+      });
       this.teamLastSummary = `${strategy} · ${result.success ? 'ok' : 'incomplete'} · ${result.rounds} rounds`;
       this.finishMessage(assistantMessageId, formatted);
       this.rememberTeamArtifact(strategy, task, result.output, this.teamRunIsolatedNotes);
@@ -6836,6 +6587,7 @@ export class NativeBridgeController {
       this.finishMessage(assistantMessageId, message);
       return message;
     } finally {
+      clearInterval(liveStatusHeartbeat);
       this.state.loading = false;
       this.state.loadingLabel = '';
       this.state.loadingSince = null;
@@ -6869,9 +6621,18 @@ export class NativeBridgeController {
     }
 
     const backgroundJobId = randomUUID();
-    const contextSnapshot = await this.buildPromptContextSnapshot(task, 'planning');
+    const teamPurpose = this.inferPromptPurpose(task);
+    const contextSnapshot = await this.buildPromptContextSnapshot(
+      task,
+      teamPurpose,
+      this.getPromptContextSnapshotOptions(task, teamPurpose, 'team'),
+    );
     const planArtifact = this.rememberTeamPlanArtifact(strategy, task, teamPlan.allocation);
-    const artifacts = [planArtifact, ...this.getArtifactsForPurpose('planning', 4).filter((item) => item.id !== planArtifact.id)];
+    const purposeArtifactLimit = teamPurpose === 'research' && this.isLikelyExternalResearchPrompt(task) ? 1 : 4;
+    const artifacts = [
+      planArtifact,
+      ...this.getArtifactsForPurpose(teamPurpose, purposeArtifactLimit).filter((item) => item.id !== planArtifact.id),
+    ];
     const checklist = buildTeamJobChecklist(teamAgents, strategy);
     const record = await this.backgroundJobStore.create({
       id: backgroundJobId,
@@ -6880,13 +6641,13 @@ export class NativeBridgeController {
       label: `team ${strategy}`,
       cwd: process.cwd(),
       prompt: task,
-      purpose: 'general',
+      purpose: teamPurpose,
       preferredMode: null,
       preferredModel: null,
       strategy,
       reason: options.routeNote ?? `team ${strategy}`,
       attempt: options.attempt ?? 0,
-      verificationMode: 'checks',
+      verificationMode: this.verificationModeForPurpose(teamPurpose),
       contextSnapshot,
       artifacts,
       teamAgents,
@@ -6911,9 +6672,11 @@ export class NativeBridgeController {
       artifact: null,
     });
 
-    this.backgroundJobs = [this.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
+    this.backgroundJobs = [this.backgroundCoordinator.mapStoredJobToState(record), ...this.backgroundJobs.filter((job) => job.id !== record.id)];
     this.syncBackgroundJobs();
-    this.syncDetachedAgentActivities([record]);
+    const live = this.agentActivities.filter((activity) => !activity.id.startsWith('job:'));
+    this.agentActivities = [...live, ...this.backgroundCoordinator.collectDetachedAgentActivities([record])];
+    this.syncAgentActivities();
     this.scheduleStatePush();
 
     try {
@@ -6934,81 +6697,15 @@ export class NativeBridgeController {
     task: string,
     strategy: 'parallel' | 'sequential' | 'delegate',
   ): { allocation: WorkAllocationPlan; agents: TeamAgentRole[] } | null {
-    const availableModes = this.getTeamEligibleModes();
-    if (availableModes.length === 0) {
+    const draft = createTeamExecutionPlanDraft(task, strategy, this.getTeamEligibleModes());
+    if (!draft) {
       return null;
     }
-    const allocation = planWorkAllocation(task, strategy, availableModes);
-    const leadMode =
-      allocation.units.find((unit) => unit.role === 'planner' || unit.role === 'reviewer')?.preferredMode ??
-      (availableModes.includes('jennie') ? 'jennie' : availableModes[0]);
-
-    const makeAgent = (
-      id: string,
-      mode: NamedMode,
-      role: 'lead' | 'worker' | 'reviewer',
-      systemPrompt: string,
-      options: Partial<TeamAgentRole> = {},
-    ): TeamAgentRole => {
-      const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
-      return {
-        id,
-        name: modeConfig.label,
-        mode,
-        role,
-        provider: modeConfig.provider,
-        model: this.selectedModels[mode] ?? modeConfig.model,
-        systemPrompt,
-        ...options,
-      };
-    };
-
-    const agents: TeamAgentRole[] = [
-      makeAgent(
-        'lead',
-        leadMode,
-        'lead',
-        buildSpecialistPrompt(
-          'coordinator',
-          'Coordinate specialists, merge their outputs, and return the best merged answer.',
-        ),
-        {
-          roleProfile: 'coordinator',
-          taskLabel: 'Coordinate specialists and synthesize the result',
-          readOnly: true,
-        },
-      ),
-    ];
-
-    let counter = 0;
-    const unitsByLabel = new Map(allocation.units.map((unit) => [unit.label, unit]));
-    for (const unit of allocation.units) {
-      const mode = unit.preferredMode ?? leadMode;
-      agents.push(
-        makeAgent(
-          `${unit.role}_${counter += 1}`,
-          mode,
-          unit.role === 'reviewer' ? 'reviewer' : 'worker',
-          buildSpecialistPrompt(unit.role, unit.label, unit.successCriteria),
-          {
-            roleProfile: unit.role,
-            taskLabel: unit.label,
-            taskBrief: unit.brief,
-            deliverable: unit.deliverable,
-            successCriteria: unit.successCriteria,
-            readOnly: unit.readOnly,
-            dependencyLabels: [...unit.dependsOn],
-            dependencyUnitIds: unit.dependsOn
-              .map((label) => unitsByLabel.get(label)?.id ?? null)
-              .filter((id): id is string => typeof id === 'string'),
-            handoffTo: unit.handoffTo ? getSpecialistRoleProfile(unit.handoffTo).label : undefined,
-            workUnitId: unit.id,
-          },
-        ),
-      );
-    }
-
-    return { allocation, agents };
+    return this.teamExecutionCoordinator.createPlan({
+      draft,
+      resolveRuntime: (mode) => this.getResolvedModeRuntime(mode),
+      orchestratorPrompt: this.orchestratorPrompt,
+    });
   }
 
   private buildTeamAgents(task: string, strategy: 'parallel' | 'sequential' | 'delegate'): TeamAgentRole[] {
@@ -7038,73 +6735,95 @@ export class NativeBridgeController {
       detail: formatTeamAgentDetail(agent, `round ${round} · ${agent.roleProfile ?? agent.role}`),
     });
     try {
-      const contextSnapshot = await this.buildPromptContextSnapshot(input, purpose);
-      const artifacts = this.getArtifactsForPurpose(purpose, 4);
-      const result = await runtime.run(
-        {
-          prompt: [
-            `Round ${round}`,
-            `Team task context for ${agent.name}:`,
-            input,
-          ].join('\n\n'),
-          purpose,
-          preferredMode: agent.mode,
-          preferredModel: agent.model,
-          roleProfile: agent.roleProfile ?? null,
-          taskLabel: agent.taskLabel ?? null,
-          systemPrompt: agent.systemPrompt,
-          maxTokens: this.config ? getMaxTokens(this.config) : undefined,
-          parentSessionId: this.state.sessionId,
-          cwd: process.cwd(),
-          isolatedLabel: `team-${agent.id}-r${round}`,
-          verificationMode: agent.role === 'worker' || agent.role === 'reviewer' ? 'checks' : 'none',
-          contextSnapshot,
-          artifacts,
+      const contextSnapshot = await this.buildPromptContextSnapshot(
+        input,
+        purpose,
+        this.getPromptContextSnapshotOptions(input, purpose, 'team'),
+      );
+      const artifactLimit = purpose === 'research' && this.isLikelyExternalResearchPrompt(input) ? 1 : 4;
+      const artifacts = this.getArtifactsForPurpose(purpose, artifactLimit);
+      const result = await runTeamAgentDelegation({
+        runtime,
+        agent,
+        input,
+        round,
+        signal,
+        maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+        parentSessionId: this.state.sessionId,
+        cwd: process.cwd(),
+        contextSnapshot,
+        artifacts,
+        onApiCallStart: async (input) => {
+          await this.hookRegistry.emit(
+            'beforeApiCall',
+            buildDelegationHookContext(input, {
+              sessionId: this.state.sessionId,
+              teamAgentId: agent.id,
+              teamRound: round,
+            }),
+          );
         },
-        {
-          signal,
-          onText: (delta) => {
-            if (delta.trim()) {
-              this.updateAgentActivity({
-                id: activityId,
-                label: formatTeamAgentLabel(agent),
-                status: 'running',
-                mode: agent.mode,
-                purpose,
-                detail: previewText(delta, 64),
-              });
-            }
-          },
-          onToolState: (states) => {
-            const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
-            if (activeTool) {
-              this.updateAgentActivity({
-                id: activityId,
-                label: formatTeamAgentLabel(agent),
-                status: 'running',
-                mode: agent.mode,
-                purpose,
-                detail: `${activeTool.name} ${activeTool.status}`,
-              });
-            }
-          },
-          onVerificationState: (state) => {
+        onApiCallComplete: async (input) => {
+          await this.hookRegistry.emit(
+            'afterApiCall',
+            buildDelegationHookContext(input, {
+              sessionId: this.state.sessionId,
+              teamAgentId: agent.id,
+              teamRound: round,
+            }),
+          );
+        },
+        onText: (delta) => {
+          if (delta.trim()) {
             this.updateAgentActivity({
               id: activityId,
               label: formatTeamAgentLabel(agent),
-              status:
-                state.status === 'running'
-                  ? 'verifying'
-                  : state.status === 'passed' || state.status === 'skipped'
-                    ? 'done'
-                    : 'error',
+              status: 'running',
               mode: agent.mode,
               purpose,
-              detail: state.summary ?? null,
+              detail: previewText(delta, 64),
             });
-          },
+          }
         },
-      );
+        onToolState: (states) => {
+          const activeTool = states.find((state) => state.status === 'running') ?? states[states.length - 1];
+          if (activeTool) {
+            this.updateAgentActivity({
+              id: activityId,
+              label: formatTeamAgentLabel(agent),
+              status: 'running',
+              mode: agent.mode,
+              purpose,
+              detail: `${activeTool.name} ${activeTool.status}`,
+            });
+          }
+        },
+        onVerificationState: (state) => {
+          this.updateAgentActivity({
+            id: activityId,
+            label: formatTeamAgentLabel(agent),
+            status:
+              state.status === 'running'
+                ? 'verifying'
+                : state.status === 'passed' || state.status === 'skipped'
+                  ? 'done'
+                  : 'error',
+            mode: agent.mode,
+            purpose,
+            detail: state.summary ?? null,
+          });
+        },
+        onExecutionState: (detail) => {
+          this.updateAgentActivity({
+            id: activityId,
+            label: formatTeamAgentLabel(agent),
+            status: 'queued',
+            mode: agent.mode,
+            purpose,
+            detail,
+          });
+        },
+      });
 
       this.setWorkspaceState(result.workspace ?? null);
       if (result.verification) {
@@ -7135,7 +6854,7 @@ export class NativeBridgeController {
         workspacePath: result.workspace?.path ?? null,
       });
 
-      return result.text.trim() || `[${agent.name}] no output`;
+      return result.output;
     } catch (error: unknown) {
       this.updateAgentActivity({
         id: activityId,
@@ -7147,68 +6866,6 @@ export class NativeBridgeController {
       });
       throw error;
     }
-  }
-
-  private formatTeamProgress(message: TeamMessage): string {
-    const meta = message.metadata && Object.keys(message.metadata).length > 0
-      ? ` ${JSON.stringify(message.metadata)}`
-      : '';
-    return [
-      `team · ${message.type}`,
-      `${message.from} → ${message.to}${meta}`,
-      '',
-      previewText(message.content, 320),
-    ].join('\n');
-  }
-
-  private formatTeamResult(
-    strategy: 'parallel' | 'sequential' | 'delegate',
-    task: string,
-    agents: TeamAgentRole[],
-    messages: TeamMessage[],
-    output: string,
-    success: boolean,
-    rounds: number,
-    isolatedNotes: string[],
-  ): string {
-    const recentMessages = messages
-      .slice(-6)
-      .map((message) => `- ${message.from} -> ${message.to} [${message.type}] ${previewText(message.content, 92)}`);
-    const assignments = agents
-      .filter((agent) => isRunnableTeamAgent(agent))
-      .map((agent) =>
-        [
-          `- ${formatTeamAgentLabel(agent)}: ${agent.taskLabel ?? agent.role}`,
-          agent.dependencyLabels && agent.dependencyLabels.length > 0
-            ? `after ${agent.dependencyLabels.join(', ')}`
-            : null,
-          agent.handoffTo ? `handoff ${agent.handoffTo}` : null,
-        ]
-          .filter((part): part is string => Boolean(part))
-          .join(' · '),
-      );
-
-    return [
-      '# Team Run',
-      '',
-      `status: ${success ? 'success' : 'incomplete'}`,
-      `strategy: ${strategy}`,
-      `rounds: ${rounds}`,
-      `task: ${task}`,
-      `agents: ${agents.map((agent) => `${agent.name}/${agent.model}`).join(', ')}`,
-      '',
-      '## Assignments',
-      ...(assignments.length > 0 ? assignments : ['- No specialist assignments recorded.']),
-      '',
-      '## Final Output',
-      output.trim() || 'No final output.',
-      '',
-      '## Recent Coordination',
-      ...(recentMessages.length > 0 ? recentMessages : ['- No coordination messages recorded.']),
-      ...(isolatedNotes.length > 0
-        ? ['', '## Isolated Runs', ...isolatedNotes]
-        : []),
-    ].join('\n');
   }
 
   private async runInitSummary(): Promise<string> {
@@ -7274,16 +6931,7 @@ export class NativeBridgeController {
   }
 
   private isCliBackedProvider(provider: string = this.getCurrentProvider()): boolean {
-    const auth = this.availableProviders.get(provider);
-    if (provider === 'anthropic') {
-      return auth?.tokenType === 'oauth';
-    }
-
-    if (provider === 'openai') {
-      return auth?.tokenType === 'bearer';
-    }
-
-    return false;
+    return this.getProviderCapabilities(provider)?.executionMode === 'cli';
   }
 
   private getCanonicalConversationMessages(): NativeMessageState[] {
@@ -7326,10 +6974,11 @@ export class NativeBridgeController {
     forceFresh: boolean = false,
   ): Promise<RequestPlan> {
     const provider = this.getCurrentProvider();
+    const capabilities = this.getProviderCapabilities(provider);
     const bridgeSession = !forceFresh ? this.remoteSessions.get(provider) : undefined;
     const canonicalMessages = this.getCanonicalConversationMessages();
 
-    if (this.isCliBackedProvider(provider) && bridgeSession) {
+    if (capabilities?.supportsRemoteSession && bridgeSession) {
       const missingMessages = canonicalMessages.slice(bridgeSession.syncedMessageCount);
       if (missingMessages.length === 0) {
         return {

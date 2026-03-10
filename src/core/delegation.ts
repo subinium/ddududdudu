@@ -1,13 +1,18 @@
 import type { ApiMessage, ToolStateUpdate } from '../api/anthropic-client.js';
 import { createClient } from '../api/client-factory.js';
 import { formatArtifactForHandoff } from './artifacts.js';
+import { ExecutionScheduler, type ExecutionSchedulerConfig } from './execution-scheduler.js';
 import { resolveModeBinding } from './mode-resolution.js';
 import { buildSpecialistPrompt, type SpecialistRole } from './specialist-roles.js';
 import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { VerificationRunner } from './verifier.js';
-import type { IsolatedWorkspace, WorkspaceApplyResult } from './worktree-manager.js';
+import type {
+  IsolatedWorkspace,
+  WorkspaceApplyResult,
+  WorkspaceCleanupResult,
+} from './worktree-manager.js';
 import { WorktreeManager } from './worktree-manager.js';
 import type { WorkflowArtifact, WorkflowArtifactKind } from './workflow-state.js';
 
@@ -43,6 +48,7 @@ export interface DelegationRequest {
   verificationMode?: VerificationMode;
   forceIsolation?: boolean;
   applyWorkspaceChanges?: boolean;
+  readOnly?: boolean;
   contextSnapshot?: string;
   artifacts?: WorkflowArtifact[];
 }
@@ -51,6 +57,28 @@ export interface DelegationHandlers {
   onText?: (text: string) => void;
   onToolState?: (states: ToolStateUpdate[]) => void;
   onVerificationState?: (state: { status: 'running' | 'passed' | 'failed' | 'skipped'; summary?: string }) => void;
+  onExecutionState?: (detail: string) => void;
+  onApiCallStart?: (input: {
+    provider: string;
+    model: string;
+    mode: NamedMode;
+    purpose: DelegationPurpose;
+    cwd: string;
+    localSessionId?: string;
+  }) => Promise<void> | void;
+  onApiCallComplete?: (input: {
+    provider: string;
+    model: string;
+    mode: NamedMode;
+    purpose: DelegationPurpose;
+    cwd: string;
+    localSessionId?: string;
+    remoteSessionId?: string;
+    usage: DelegationResult['usage'];
+    durationMs: number;
+    status: 'ok' | 'error';
+    error?: string;
+  }) => Promise<void> | void;
   signal?: AbortSignal;
 }
 
@@ -67,6 +95,7 @@ export interface DelegationResult {
   cwd: string;
   workspace?: IsolatedWorkspace | null;
   workspaceApply?: WorkspaceApplyResult | null;
+  workspaceCleanup?: WorkspaceCleanupResult | null;
   verification?: VerificationSummary;
   usage: {
     input: number;
@@ -89,6 +118,7 @@ interface DelegationRuntimeConfig {
   sessionManager?: SessionManager | null;
   resolveModel?: (mode: NamedMode) => string;
   worktreeManager?: WorktreeManager | null;
+  executionSchedulerConfig?: Partial<ExecutionSchedulerConfig>;
 }
 
 const MODE_PROFILES: Record<NamedMode, DelegationModeProfile> = {
@@ -273,10 +303,12 @@ const buildDelegationPrompt = (
 export class DelegationRuntime {
   private readonly config: DelegationRuntimeConfig;
   private readonly providers: Map<string, DelegationCredentials>;
+  private readonly executionScheduler: ExecutionScheduler;
 
   public constructor(config: DelegationRuntimeConfig) {
     this.config = config;
     this.providers = normalizeProviderMap(config.availableProviders);
+    this.executionScheduler = new ExecutionScheduler(config.executionSchedulerConfig ?? {});
   }
 
   public listAvailableModes(): NamedMode[] {
@@ -319,6 +351,7 @@ export class DelegationRuntime {
         request.isolatedLabel ??
         [mode, purpose, request.parentSessionId?.slice(0, 8)].filter(Boolean).join('-'),
       forceIsolation: request.forceIsolation ?? false,
+      readOnly: request.readOnly ?? false,
     });
     const effectiveCwd = workspace?.path ?? baseCwd;
     const client = createClient(provider, auth.token, auth.tokenType);
@@ -329,6 +362,12 @@ export class DelegationRuntime {
     let localSessionId: string | undefined;
     let verification: VerificationSummary | undefined;
     let workspaceApply: WorkspaceApplyResult | null = null;
+    let workspaceCleanup: WorkspaceCleanupResult | null = null;
+    const writeIntent =
+      request.readOnly === false ||
+      request.applyWorkspaceChanges === true ||
+      ((purpose === 'execution' || purpose === 'design') && request.readOnly !== true);
+    const writeKey = writeIntent ? baseCwd : null;
 
     if (this.config.sessionManager) {
       const session = await this.config.sessionManager.create({
@@ -357,38 +396,69 @@ export class DelegationRuntime {
       ]
         .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
-      for await (const event of client.stream(messages, {
-        systemPrompt: combinedSystemPrompt,
-        model,
-        maxTokens: request.maxTokens ?? 8192,
-        signal: handlers.signal,
-        cwd: effectiveCwd,
-      })) {
-        if (event.type === 'text') {
-          const delta = event.text ?? '';
-          text += delta;
-          handlers.onText?.(delta);
-          continue;
-        }
+      const writeLease =
+        writeKey
+          ? await this.executionScheduler.acquire({
+              writeKey,
+              signal: handlers.signal,
+              onWait: handlers.onExecutionState,
+            })
+          : null;
+      try {
+        const providerLease = await this.executionScheduler.acquire({
+          provider,
+          signal: handlers.signal,
+          onWait: handlers.onExecutionState,
+        });
+        try {
+          await handlers.onApiCallStart?.({
+            provider,
+            model,
+            mode,
+            purpose,
+            cwd: effectiveCwd,
+            localSessionId,
+          });
+          for await (const event of client.stream(messages, {
+            systemPrompt: combinedSystemPrompt,
+            model,
+            maxTokens: request.maxTokens ?? 8192,
+            signal: handlers.signal,
+            cwd: effectiveCwd,
+          })) {
+            if (event.type === 'text') {
+              const delta = event.text ?? '';
+              text += delta;
+              handlers.onText?.(delta);
+              continue;
+            }
 
-        if (event.type === 'tool_state' && event.toolStates) {
-          handlers.onToolState?.(event.toolStates);
-          continue;
-        }
+            if (event.type === 'tool_state' && event.toolStates) {
+              handlers.onToolState?.(event.toolStates);
+              continue;
+            }
 
-        if (event.type === 'session' && event.sessionId) {
-          remoteSessionId = event.sessionId;
-          continue;
-        }
+            if (event.type === 'session' && event.sessionId) {
+              remoteSessionId = event.sessionId;
+              continue;
+            }
 
-        if (event.type === 'done') {
-          text = event.fullText ?? text;
-          usage = event.usage ?? usage;
-          break;
-        }
+            if (event.type === 'done') {
+              text = event.fullText ?? text;
+              usage = event.usage ?? usage;
+              break;
+            }
 
-        if (event.type === 'error') {
-          throw event.error ?? new Error(`Delegated ${mode} request failed.`);
+            if (event.type === 'error') {
+              throw event.error ?? new Error(`Delegated ${mode} request failed.`);
+            }
+          }
+        } finally {
+          await providerLease.release();
+        }
+      } finally {
+        if (writeLease) {
+          await writeLease.release();
         }
       }
 
@@ -410,6 +480,17 @@ export class DelegationRuntime {
         workspaceApply = await this.config.worktreeManager?.applyToBase(workspace) ?? null;
       }
 
+      if (workspace && this.config.worktreeManager) {
+        const inspection = await this.config.worktreeManager.inspect(workspace);
+        const shouldCleanup =
+          workspaceApply?.applied === true ||
+          workspaceApply?.empty === true ||
+          !inspection.hasChanges;
+        if (shouldCleanup) {
+          workspaceCleanup = await this.config.worktreeManager.cleanup(workspace);
+        }
+      }
+
       const result: DelegationResult = {
         text: text.trim(),
         mode,
@@ -421,12 +502,26 @@ export class DelegationRuntime {
         localSessionId,
         remoteSessionId,
         cwd: effectiveCwd,
-        workspace,
+        workspace: workspaceCleanup?.removed ? null : workspace,
         workspaceApply,
+        workspaceCleanup,
         verification,
         usage,
         durationMs: Date.now() - start,
       };
+
+      await handlers.onApiCallComplete?.({
+        provider,
+        model,
+        mode,
+        purpose,
+        cwd: effectiveCwd,
+        localSessionId,
+        remoteSessionId,
+        usage,
+        durationMs: result.durationMs,
+        status: 'ok',
+      });
 
       if (this.config.sessionManager && localSessionId) {
         await this.config.sessionManager.append(localSessionId, buildSessionEntry(request, result));
@@ -449,6 +544,20 @@ export class DelegationRuntime {
           },
         });
       }
+
+      await handlers.onApiCallComplete?.({
+        provider,
+        model,
+        mode,
+        purpose,
+        cwd: effectiveCwd,
+        localSessionId,
+        remoteSessionId,
+        usage,
+        durationMs: Date.now() - start,
+        status: 'error',
+        error: serializeError(error),
+      });
 
       throw error;
     }
@@ -480,6 +589,7 @@ export class DelegationRuntime {
     baseCwd: string;
     label: string;
     forceIsolation: boolean;
+    readOnly: boolean;
   }): Promise<IsolatedWorkspace | null> {
     const manager = this.config.worktreeManager;
     if (!manager) {
@@ -495,6 +605,10 @@ export class DelegationRuntime {
       options.purpose === 'execution' ||
       options.purpose === 'design' ||
       options.purpose === 'review';
+
+    if (options.readOnly && options.purpose === 'research' && !options.forceIsolation) {
+      return null;
+    }
 
     if (!shouldIsolate) {
       return null;

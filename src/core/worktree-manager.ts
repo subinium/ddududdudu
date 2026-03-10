@@ -26,6 +26,19 @@ export interface WorkspaceApplyResult {
   error?: string;
 }
 
+export interface WorkspaceInspectionResult {
+  hasChanges: boolean;
+  summary: string;
+}
+
+export interface WorkspaceCleanupResult {
+  attempted: boolean;
+  removed: boolean;
+  summary: string;
+  path: string;
+  error?: string;
+}
+
 const slugify = (value: string): string => {
   const normalized = value
     .trim()
@@ -127,13 +140,58 @@ export class WorktreeManager {
   }
 
   public async remove(workspace: IsolatedWorkspace): Promise<void> {
+    await this.cleanup(workspace);
+  }
+
+  public async inspect(workspace: IsolatedWorkspace): Promise<WorkspaceInspectionResult> {
+    try {
+      const summary = await runGit(workspace.path, ['status', '--short']);
+      const normalized = summary.trim();
+      return {
+        hasChanges: normalized.length > 0,
+        summary: normalized || 'workspace clean',
+      };
+    } catch (error: unknown) {
+      return {
+        hasChanges: true,
+        summary: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  public async cleanup(workspace: IsolatedWorkspace): Promise<WorkspaceCleanupResult> {
     try {
       await runGit(workspace.repoRoot, ['worktree', 'remove', '--force', workspace.path]);
-    } catch {
-      // Fall back to direct deletion if git cleanup fails.
+      await rm(workspace.path, { recursive: true, force: true });
+      return {
+        attempted: true,
+        removed: true,
+        summary: 'workspace removed',
+        path: workspace.path,
+      };
+    } catch (error: unknown) {
+      try {
+        await rm(workspace.path, { recursive: true, force: true });
+        return {
+          attempted: true,
+          removed: true,
+          summary: 'workspace removed after git cleanup fallback',
+          path: workspace.path,
+        };
+      } catch (removeError: unknown) {
+        const details = [error, removeError]
+          .map((entry) => (entry instanceof Error ? entry.message : String(entry)))
+          .filter((entry) => entry.trim().length > 0)
+          .join(' | ');
+        return {
+          attempted: true,
+          removed: false,
+          summary: 'workspace cleanup failed',
+          path: workspace.path,
+          error: details || 'unknown cleanup failure',
+        };
+      }
     }
-
-    await rm(workspace.path, { recursive: true, force: true });
   }
 
   public async applyToBase(workspace: IsolatedWorkspace): Promise<WorkspaceApplyResult> {

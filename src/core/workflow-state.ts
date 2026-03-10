@@ -4,6 +4,7 @@ import type { DelegationPurpose } from './delegation.js';
 export type PlanItemStatus = 'pending' | 'in_progress' | 'completed';
 export type PermissionProfile = 'plan' | 'ask' | 'workspace-write' | 'permissionless';
 export type WorkflowArtifactKind = 'answer' | 'plan' | 'review' | 'design' | 'patch' | 'briefing' | 'research';
+export const WORKFLOW_STATE_VERSION = 1;
 
 export interface WorkflowArtifactPayload {
   purpose?: DelegationPurpose | 'general';
@@ -95,6 +96,7 @@ export interface WorkflowBackgroundJobSnapshot {
 }
 
 export interface WorkflowStateSnapshot {
+  version: number;
   mode: NamedMode;
   selectedModels: Record<NamedMode, string>;
   permissionProfile: PermissionProfile;

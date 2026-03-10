@@ -8,6 +8,9 @@ const ts = require('typescript');
 const projectRoot = process.cwd();
 const srcRoot = path.join(projectRoot, 'src');
 const distRoot = path.join(projectRoot, 'dist');
+const buildNonce = `${process.pid}-${Date.now()}`;
+const stagedDistRoot = path.join(projectRoot, `.dist-build-${buildNonce}`);
+const previousDistRoot = path.join(projectRoot, `.dist-prev-${buildNonce}`);
 const configPath = path.join(projectRoot, 'tsconfig.json');
 const args = new Set(process.argv.slice(2));
 const noEmit = args.has('--noEmit');
@@ -42,7 +45,8 @@ const compilerOptions = {
 };
 
 if (!noEmit) {
-  fs.rmSync(distRoot, { recursive: true, force: true });
+  removeDirectory(stagedDistRoot);
+  removeDirectory(previousDistRoot);
 }
 
 const diagnostics = [];
@@ -71,7 +75,7 @@ for (const fileName of parsedConfig.fileNames) {
   }
 
   const relativePath = path.relative(srcRoot, fileName);
-  const outFile = path.join(distRoot, relativePath).replace(/\.ts$/, '.js');
+  const outFile = path.join(noEmit ? distRoot : stagedDistRoot, relativePath).replace(/\.ts$/, '.js');
   const outMap = `${outFile}.map`;
   fs.mkdirSync(path.dirname(outFile), { recursive: true });
   fs.writeFileSync(outFile, output.outputText, 'utf8');
@@ -82,17 +86,26 @@ for (const fileName of parsedConfig.fileNames) {
 
 diagnostics.push(...validateLocalModuleContracts(sourceFiles));
 
-if (!noEmit) {
-  copyStaticFiles(srcRoot, distRoot);
-}
-
 const filteredDiagnostics = diagnostics.filter(
   (diagnostic) => diagnostic.category === ts.DiagnosticCategory.Error,
 );
 
 if (filteredDiagnostics.length > 0) {
+  if (!noEmit) {
+    removeDirectory(stagedDistRoot);
+    removeDirectory(previousDistRoot);
+  }
   console.error(ts.formatDiagnosticsWithColorAndContext(filteredDiagnostics, formatHost()));
   process.exit(1);
+}
+
+if (!noEmit) {
+  copyStaticFiles(srcRoot, stagedDistRoot);
+  replaceDirectoryAtomically(stagedDistRoot, distRoot, previousDistRoot);
+  const entryPoint = path.join(distRoot, 'index.js');
+  if (fs.existsSync(entryPoint)) {
+    fs.chmodSync(entryPoint, 0o755);
+  }
 }
 
 process.exit(0);
@@ -120,6 +133,58 @@ function copyStaticFiles(fromDir, toDir) {
     fs.mkdirSync(path.dirname(targetPath), { recursive: true });
     fs.copyFileSync(sourcePath, targetPath);
   }
+}
+
+function replaceDirectoryAtomically(nextDir, targetDir, backupDir) {
+  removeDirectory(backupDir);
+
+  if (fs.existsSync(targetDir)) {
+    fs.renameSync(targetDir, backupDir);
+  }
+
+  try {
+    fs.renameSync(nextDir, targetDir);
+  } catch (error) {
+    if (fs.existsSync(backupDir) && !fs.existsSync(targetDir)) {
+      fs.renameSync(backupDir, targetDir);
+    }
+    throw error;
+  }
+
+  try {
+    removeDirectory(backupDir);
+  } catch (error) {
+    console.warn(`Warning: failed to remove backup dist directory '${backupDir}': ${error.message}`);
+  }
+}
+
+function removeDirectory(targetPath) {
+  if (!fs.existsSync(targetPath)) {
+    return;
+  }
+
+  const retryableCodes = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM']);
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    try {
+      fs.rmSync(targetPath, {
+        recursive: true,
+        force: true,
+        maxRetries: 3,
+        retryDelay: 50,
+      });
+      return;
+    } catch (error) {
+      if (!retryableCodes.has(error.code) || attempt === 5) {
+        throw error;
+      }
+      waitMs(50 * (attempt + 1));
+    }
+  }
+}
+
+function waitMs(durationMs) {
+  const sleeper = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sleeper, 0, 0, durationMs);
 }
 
 function validateLocalModuleContracts(sourceFiles) {

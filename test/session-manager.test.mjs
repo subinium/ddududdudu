@@ -38,3 +38,32 @@ test('SessionManager.list derives readable title, provider, model, and preview',
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('SessionManager.list prefers mode stored in session header metadata', async () => {
+  const root = await mkdtemp(resolve(tmpdir(), 'ddudu-session-header-mode-'));
+  try {
+    const manager = new SessionManager(resolve(root, 'sessions'));
+    const header = await manager.create({
+      provider: 'anthropic',
+      model: 'claude-sonnet-4-6',
+      metadata: {
+        mode: 'jennie',
+      },
+    });
+
+    await manager.append(header.id, {
+      type: 'message',
+      timestamp: new Date().toISOString(),
+      data: {
+        user: 'continue the fallback session',
+        assistant: 'resumed',
+      },
+    });
+
+    const sessions = await manager.list();
+    assert.equal(sessions.length, 1);
+    assert.equal(sessions[0]?.mode, 'jennie');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -313,6 +313,14 @@ export const taskTool: Tool = {
     });
 
     const taskId = randomUUID();
+    ctx.onAgentActivity?.({
+      id: taskId,
+      label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
+      status: 'running',
+      mode: effectiveMode,
+      purpose: effectivePurpose,
+      detail: preview(args.prompt),
+    });
 
     const result = await pool.runTask(
       {
@@ -323,11 +331,29 @@ export const taskTool: Tool = {
       },
       (text) => {
         ctx.onProgress?.(text);
+        if (text.trim()) {
+          ctx.onAgentActivity?.({
+            id: taskId,
+            label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
+            status: 'running',
+            mode: effectiveMode,
+            purpose: effectivePurpose,
+            detail: preview(text, 64),
+          });
+        }
       },
       ctx.abortSignal,
     );
 
     if (result.status !== 'completed') {
+      ctx.onAgentActivity?.({
+        id: taskId,
+        label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
+        status: 'error',
+        mode: effectiveMode,
+        purpose: effectivePurpose,
+        detail: result.error ?? `Sub-agent ${result.status}`,
+      });
       return {
         output: result.error ?? `Sub-agent failed with status: ${result.status}`,
         isError: true,
@@ -341,6 +367,15 @@ export const taskTool: Tool = {
         },
       };
     }
+
+    ctx.onAgentActivity?.({
+      id: taskId,
+      label: activityLabel(effectiveMode, effectivePurpose, specialistRole),
+      status: 'done',
+      mode: effectiveMode,
+      purpose: effectivePurpose,
+      detail: preview(result.text, 64),
+    });
 
     return {
       output: result.text,

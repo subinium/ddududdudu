@@ -32,21 +32,66 @@ export interface WorkAllocationPlan {
 
 const normalizeTask = (task: string): string => task.replace(/\s+/g, ' ').trim();
 
+const KNOWN_FILE_EXTENSION_PATTERN = /\.(?:[cm]?[jt]sx?|json|md|rs|py|go|java|rb|php|c|cc|cpp|h|hpp|swift|kt|ya?ml)$/iu;
+
+const uniqueValues = (values: string[]): string[] => Array.from(new Set(values));
+
 const detectTaskSignals = (task: string) => {
   const normalized = normalizeTask(task);
   const lower = normalized.toLowerCase();
   return {
     normalized,
-    hasDesign: /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b/u.test(lower),
-    hasPlanning: /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b/u.test(lower),
-    hasResearch: /\b(research|investigate|look into|survey|compare|explore|analyze)\b/u.test(lower),
-    hasReview: /\b(review|audit|verify|validation|regression|risk|critic|critique)\b/u.test(lower),
-    hasExecution: /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b/u.test(lower),
-    docsHeavy: /\b(doc|docs|readme|contributing|rule|prompt|instruction|config|mcp|auth|provider|integration|guide)\b/u.test(lower),
+    hasDesign: /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b|(?:디자인|레이아웃|타이포|접근성|색상|인터랙션)/u.test(lower),
+    hasPlanning: /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b|(?:계획|플랜|설계|아키텍처|전략|로드맵|스펙)/u.test(lower),
+    hasResearch: /\b(research|investigate|look into|survey|compare|explore|analyze)\b|(?:리서치|조사|찾아|찾아줘|비교|탐색|분석해|알아봐)/u.test(lower),
+    hasReview: /\b(review|audit|verify|validation|regression|risk|critic|critique)\b|(?:리뷰|검토|검증|감사|리스크|회귀)/u.test(lower),
+    hasExecution: /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b|(?:구현|수정|고쳐|작성|편집|리팩터|패치|코드|변경)/u.test(lower),
+    docsHeavy: /\b(doc|docs|readme|contributing|rule|prompt|instruction|config|mcp|auth|provider|integration|guide)\b|(?:문서|리드미|가이드|규칙|설정|인증|프로바이더|통합)/u.test(lower),
     repoWide:
-      /\b(across the repo|entire repo|whole project|codebase|end-to-end|from scratch|full flow)\b/u.test(lower) ||
+      /\b(across the repo|entire repo|whole project|codebase|end-to-end|from scratch|full flow)\b|(?:전체 프로젝트|코드베이스|엔드투엔드|처음부터|전체 흐름)/u.test(lower) ||
       normalized.split(/\n+/u).length > 1,
   };
+};
+
+const isLikelyResearchSubjectToken = (value: string): boolean => {
+  const normalized = value.trim();
+  if (!/^[a-z0-9][a-z0-9._-]{1,31}$/iu.test(normalized)) {
+    return false;
+  }
+  if (normalized.includes('.') && KNOWN_FILE_EXTENSION_PATTERN.test(normalized)) {
+    return false;
+  }
+  if (normalized.startsWith('http')) {
+    return false;
+  }
+  return true;
+};
+
+const extractResearchSubjects = (task: string): string[] => {
+  const normalized = normalizeTask(task);
+  const subjects: string[] = [];
+
+  for (const match of normalized.matchAll(/[a-z0-9][a-z0-9._-]{1,31}(?:\s*\/\s*[a-z0-9][a-z0-9._-]{1,31}){1,7}/giu)) {
+    const fragments = (match[0] ?? '')
+      .split('/')
+      .map((item) => item.trim())
+      .filter((item) => isLikelyResearchSubjectToken(item));
+    if (fragments.length >= 2) {
+      subjects.push(...fragments);
+    }
+  }
+
+  for (const match of normalized.matchAll(/([a-z0-9][a-z0-9._-]{1,31}(?:\s*,\s*[a-z0-9][a-z0-9._-]{1,31}){2,7})/giu)) {
+    const fragments = (match[1] ?? '')
+      .split(',')
+      .map((item) => item.trim())
+      .filter((item) => isLikelyResearchSubjectToken(item));
+    if (fragments.length >= 3) {
+      subjects.push(...fragments);
+    }
+  }
+
+  return uniqueValues(subjects).slice(0, 6);
 };
 
 const createUnit = (
@@ -93,6 +138,33 @@ export const planWorkAllocation = (
   availableModes: NamedMode[],
 ): WorkAllocationPlan => {
   const signals = detectTaskSignals(task);
+  const researchSubjects = extractResearchSubjects(task);
+
+  if (
+    signals.hasResearch
+    && researchSubjects.length >= 2
+    && !signals.hasExecution
+    && !signals.hasDesign
+    && !signals.hasReview
+    && !signals.hasPlanning
+  ) {
+    return {
+      units: researchSubjects.map((subject) =>
+        createUnit(
+          'explorer',
+          `Research ${subject}`,
+          `Investigate ${subject}, gather concrete facts, and return a concise comparison-ready briefing.`,
+          [
+            `Identify what ${subject} refers to.`,
+            `Collect concrete facts or distinguishing signals for ${subject}.`,
+            `Call out ambiguity, uncertainty, or missing evidence for ${subject}.`,
+          ],
+          availableModes,
+        )),
+      suggestedStrategy: 'parallel',
+    };
+  }
+
   const units: WorkUnit[] = [];
 
   const needsPlanning =

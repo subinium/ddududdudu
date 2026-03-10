@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { promisify } from 'node:util';
@@ -71,6 +71,60 @@ test('WorktreeManager creates unique isolated worktrees for concurrent runs', as
 
     await manager.remove(first);
     await manager.remove(second);
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('WorktreeManager.inspect reports whether an isolated workspace has changes', async () => {
+  const repoRoot = await mkdtemp(resolve(tmpdir(), 'ddudu-worktree-inspect-'));
+  try {
+    await runGit(repoRoot, ['init']);
+    await runGit(repoRoot, ['config', 'user.name', 'ddudu-test']);
+    await runGit(repoRoot, ['config', 'user.email', 'ddudu@test.local']);
+
+    await writeFile(resolve(repoRoot, 'app.txt'), 'hello\n', 'utf8');
+    await runGit(repoRoot, ['add', 'app.txt']);
+    await runGit(repoRoot, ['commit', '-m', 'init']);
+
+    const manager = new WorktreeManager(repoRoot, '.ddudu/test-worktrees');
+    const workspace = await manager.create('inspect-pass');
+    assert.ok(workspace, 'expected isolated workspace');
+
+    const clean = await manager.inspect(workspace);
+    assert.equal(clean.hasChanges, false);
+
+    await writeFile(resolve(workspace.path, 'app.txt'), 'dirty\n', 'utf8');
+    const dirty = await manager.inspect(workspace);
+    assert.equal(dirty.hasChanges, true);
+    assert.match(dirty.summary, /app\.txt/);
+
+    await manager.remove(workspace);
+  } finally {
+    await rm(repoRoot, { recursive: true, force: true });
+  }
+});
+
+test('WorktreeManager.cleanup removes isolated workspaces', async () => {
+  const repoRoot = await mkdtemp(resolve(tmpdir(), 'ddudu-worktree-cleanup-'));
+  try {
+    await runGit(repoRoot, ['init']);
+    await runGit(repoRoot, ['config', 'user.name', 'ddudu-test']);
+    await runGit(repoRoot, ['config', 'user.email', 'ddudu@test.local']);
+
+    await writeFile(resolve(repoRoot, 'app.txt'), 'hello\n', 'utf8');
+    await runGit(repoRoot, ['add', 'app.txt']);
+    await runGit(repoRoot, ['commit', '-m', 'init']);
+
+    const manager = new WorktreeManager(repoRoot, '.ddudu/test-worktrees');
+    const workspace = await manager.create('cleanup-pass');
+    assert.ok(workspace, 'expected isolated workspace');
+
+    const result = await manager.cleanup(workspace);
+    assert.equal(result.attempted, true);
+    assert.equal(result.removed, true);
+
+    await assert.rejects(stat(workspace.path));
   } finally {
     await rm(repoRoot, { recursive: true, force: true });
   }
