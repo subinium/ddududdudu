@@ -101,6 +101,7 @@ Prefer:
 - file ranges over full files
 - symbol-based reads over generic reads
 - typed artifacts over transcript replay
+- route classification before heavyweight retrieval when the task shape is obvious
 - purpose-aware memory selection over full memory dumps
 - changed-files-first ranking for active code changes
 - readable extraction over raw document payloads unless fidelity is required
@@ -123,6 +124,19 @@ Bad compaction preserves:
 
 Typed artifacts are especially valuable here because they preserve operational meaning rather than narrative summary.
 
+## External Research Fast Path
+
+External research should not pay the same context costs as active code editing.
+
+When the prompt is mostly asking for comparison, research, or fact-finding outside the repo, a good harness should:
+
+- route the request before building a heavyweight code snapshot
+- skip relevant-file retrieval and changed-file scans unless the repo is clearly part of the question
+- keep artifact carry-over small
+- avoid loading broad memory or planning state that does not improve the next search decision
+
+This is one of the easiest ways to cut latency without weakening answer quality.
+
 ## Performance Principle
 
 The target metric is not "smallest prompt".
@@ -142,6 +156,8 @@ Current `ddudu` leans on:
 - purpose-aware artifact selection
 - purpose-aware memory selection
 - task-type-specific request snapshots
+- lightweight snapshots for external research
+- route-before-snapshot for obvious team and delegation cases
 - compaction plus provider `resume` and `hydrate`
 
 The main tuning surface is no longer "add more prompt".

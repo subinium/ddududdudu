@@ -56,6 +56,19 @@ The core layers depend on a second ring of systems:
 | Verifiers | objective pass/fail signals after generation |
 | Background workers | detached and long-running execution |
 
+## Current ddudu Decomposition
+
+Inside those layers, `ddudu` is currently split into a few explicit runtime boundaries:
+
+- `RequestEngine` owns the direct model loop, tool turns, retries, and provider session handling
+- `RoutingCoordinator` owns direct vs delegate vs team decisions and planning-interview gating
+- `WorkflowStateStore` owns canonical workflow snapshots, session restore, and mode metadata recovery
+- `TeamExecutionCoordinator` owns team plan materialization, specialist orchestration, and live progress summaries
+- `BackgroundCoordinator` plus the background execution service own detached job lifecycle and the shared foreground/background execution path
+
+This matters because orchestration bugs are usually boundary bugs.
+The system becomes easier to reason about once routing, execution, state, and detached lifecycle stop living in one controller file.
+
 ## Boundary Rules
 
 Some boundaries are especially important:
@@ -103,6 +116,7 @@ Common architecture failures:
 - detached jobs
 - verification
 - context selection
+- operator-visible worker state
 
 The intent is not to replace provider runtimes.
 The intent is to coordinate them more effectively.

@@ -59,6 +59,9 @@ For delegated work, workspace state needs its own boundary:
 - isolated worktree
 - detached background workspace
 
+That boundary can be selective.
+Write-oriented or risky work may need isolation, while read-only research can often skip worktree setup entirely.
+
 This is operational state, not just prompt state.
 
 ## First-Class State Objects
@@ -70,6 +73,8 @@ At minimum, a harness should model:
 - todo and plan state
 - verification state
 - detached jobs
+- worker activity snapshots
+- pending ask-user state
 - recent artifacts
 - workspace identity
 
@@ -82,6 +87,8 @@ Git worktrees are a useful middle layer:
 - safer than editing the main workspace directly
 - lighter than a VM or container
 - practical for repair and review loops
+
+They are best treated as a conditional tool, not a universal default.
 
 They should not be confused with a full sandbox.
 
@@ -119,7 +126,9 @@ Current `ddudu` uses:
 - canonical sessions
 - provider-backed sessions
 - detached background jobs
-- git worktree isolation
+- versioned workflow snapshots
+- git worktree isolation where it improves execution safety
+- explicit worktree cleanup after delegated runs
 - resumable checkpoints and handoffs
 
 The design bias is explicit state over transcript reconstruction.

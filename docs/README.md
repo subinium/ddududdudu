@@ -58,6 +58,14 @@ These docs exist to make those design decisions explicit.
 | [Trust And Sandbox](./trust-and-sandbox.md) | policy surfaces, trust boundaries, and enforcement limits |
 | [Operator Surface](./operator-surface.md) | observability, information hierarchy, and interaction design |
 
+## Current Implementation Themes
+
+The current `ddudu` implementation is especially shaped by a few practical choices:
+
+- request execution, routing, workflow state, team orchestration, and background lifecycle now sit behind separate runtime boundaries instead of one controller blob
+- pure external research takes a lightweight context path and can fan out into multiple read-only workers when the prompt names multiple subjects
+- the operator surface now prioritizes run state, todo ownership, worker visibility, and explicit ask-user choices over redundant runtime detail
+
 ## What These Docs Are Not
 
 These are not marketing notes and not command references.

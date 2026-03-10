@@ -35,6 +35,12 @@ When people say an AI coding tool "performs better", that can mean many differen
 
 Those gains often come from the harness, not only from the model.
 
+In practice that often means:
+
+- route obvious research work before paying for a full repo snapshot
+- split itemized comparison requests into actual parallel workers instead of one overloaded researcher
+- avoid write-oriented isolation and verification costs for read-only research by default
+
 ## 3. Context Should Be Selected, Not Accumulated
 
 The context engine should not optimize for maximum inclusion.
@@ -71,6 +77,9 @@ Delegation is only useful if it:
 - defines an expected deliverable
 - carries explicit success criteria
 - returns something more structured than generic prose
+
+That also means the decomposition itself matters.
+If the user asks for `A/B/C` research, the useful split is usually by subject, not by abstract role label alone.
 
 ## 6. Verification Is The Default Loop
 

@@ -39,6 +39,7 @@ At any time, the operator should be able to tell:
 - which worker owns which task
 - whether verification has passed
 - whether the harness is waiting on policy or user input
+- which option the harness is asking the user to choose from
 
 If these are unclear, trust collapses even when the underlying system is technically correct.
 
@@ -84,11 +85,12 @@ Effect:
 High-signal state should appear first:
 
 1. current run
-2. checklist or todo state
-3. workers and ownership
-4. detached jobs
-5. queue
-6. context and systems
+2. todo board
+3. run checklist
+4. workers and ownership
+5. detached jobs
+6. queue
+7. context and systems
 
 Low-signal internals should be pushed into inspectors, palettes, or explicit secondary surfaces.
 
@@ -101,6 +103,16 @@ Examples:
 
 This hierarchy is not cosmetic.
 It is a prioritization of operator attention.
+
+## Interaction Surfaces
+
+Different UI regions should carry different classes of information:
+
+- the main transcript should show user-visible answers and high-level progress
+- the side rail should show run status, todos, worker ownership, detached jobs, queue, context, and systems
+- the composer should surface ask-user choices directly instead of hiding them behind a generic prompt
+
+When these roles blur together, operators lose confidence even if the model is technically still working.
 
 ## Progress Model
 
@@ -118,11 +130,13 @@ That structure is significantly more trustworthy than generic activity indicator
 
 `ddudu` currently leans on:
 
-- checklist-driven workflow summaries
-- worker-to-task mapping
+- a shared todo board separated from the run checklist
+- worker-to-task mapping for delegated and tool-driven subagents
+- heartbeat summaries when long-running work goes quiet
 - detached job state
 - queue visibility
-- context/system summary instead of verbose internals
+- visible ask-user options in the composer
+- context/system summaries instead of repeated provider trivia
 
 The long-term quality bar is not "more panels".
 It is "less ambiguity about system state".

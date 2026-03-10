@@ -38,6 +38,17 @@ In short:
 - delegation should compress complexity
 - it should not amplify it
 
+## Research Fan-Out
+
+Comparison and research prompts often benefit from a task-shaped split.
+
+If the operator asks for `A/B/C` research, the useful decomposition is usually:
+
+- one read-only worker per subject
+- a lead or synthesis step only after those workers finish
+
+That is much more effective than a single "research" worker serially checking every subject while the UI claims the task is parallel.
+
 ## Deliverable-Driven Delegation
 
 Before delegating, define:
@@ -83,9 +94,22 @@ A useful checklist shows:
 - active
 - done
 - failed
+- blocked
 - owning worker
 
 This is more actionable than a generic "agent running" indicator.
+
+## Selective Isolation And Verification
+
+Not every delegated task should pay the same execution overhead.
+
+Useful defaults are:
+
+- isolated worktrees for write-capable or risky execution
+- verification loops for workers that are expected to change or validate code
+- no worktree and no verification by default for read-only research workers
+
+Otherwise the harness spends most of its time paying orchestration tax instead of making progress.
 
 ## Review And Repair Loops
 
@@ -124,9 +148,11 @@ Current `ddudu` already uses:
 
 - mode-aware delegation
 - detached background jobs
-- worktree isolation
+- selective worktree isolation
 - typed artifacts
 - verifier → repair → escalate → apply flow
+- itemized research fan-out
+- worker-visible ownership and live heartbeats
 
 The next maturity step is usually tighter artifact discipline, not more subagents.
 
