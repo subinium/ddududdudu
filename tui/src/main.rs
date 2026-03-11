@@ -86,6 +86,10 @@ struct NativeMessageState {
     #[serde(default)]
     is_streaming: bool,
     #[serde(default)]
+    thinking: Option<String>,
+    #[serde(default)]
+    is_thinking: Option<bool>,
+    #[serde(default)]
     tool_calls: Vec<NativeToolCallState>,
 }
 
@@ -1335,6 +1339,7 @@ impl App {
             available_width,
             self.fold_tool_calls,
             self.fold_system_messages,
+            self.spinner_index,
         );
         let height = area.height as usize;
         let max_scroll = lines.len().saturating_sub(height);
@@ -1458,7 +1463,7 @@ impl App {
                     }
                     (Some(mode), None) => title_case_label(mode),
                     (None, Some(purpose)) => display_purpose_role(purpose),
-                    (None, None) => "worker".to_string(),
+                    (None, None) => "워커".to_string(),
                 }
             };
             let todo_ref = item
@@ -4557,7 +4562,7 @@ fn parse_inline_markdown_runs(text: &str, base_style: Style) -> Vec<(Style, Stri
             ("__", "__", base_style.add_modifier(Modifier::BOLD)),
             ("*", "*", base_style.add_modifier(Modifier::ITALIC)),
             ("_", "_", base_style.add_modifier(Modifier::ITALIC)),
-            ("`", "`", Style::default().fg(SUCCESS)),
+            ("`", "`", Style::default().fg(FG)),
         ] {
             if let Some(stripped) = slice.strip_prefix(open) {
                 if let Some(end) = stripped.find(close) {
@@ -4871,10 +4876,7 @@ fn render_assistant_markdown_line(
     }
 
     if *in_code_block {
-        return wrap_styled_runs(
-            vec![(Style::default().fg(SUCCESS), raw_line.to_string())],
-            width,
-        );
+        return wrap_styled_runs(vec![(Style::default().fg(FG), raw_line.to_string())], width);
     }
 
     if raw_line.trim().is_empty() {
@@ -4937,10 +4939,7 @@ fn render_assistant_markdown_line(
         || trimmed_start.starts_with('[')
         || trimmed_start.starts_with(']')
     {
-        return wrap_styled_runs(
-            vec![(Style::default().fg(SUCCESS), raw_line.to_string())],
-            width,
-        );
+        return wrap_styled_runs(vec![(Style::default().fg(FG), raw_line.to_string())], width);
     }
 
     wrap_styled_runs(parse_inline_markdown_runs(raw_line, base), width)
@@ -4974,6 +4973,7 @@ fn build_transcript_lines(
     width: usize,
     fold_tool_calls: bool,
     fold_system_messages: bool,
+    spinner_index: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let width = width.max(10);
@@ -4981,6 +4981,7 @@ fn build_transcript_lines(
 
     for message in messages {
         let mut rendered_any = false;
+        let mut first_visual_line = true;
         let (prefix, prefix_style, text_style) = match message.role.as_str() {
             "user" => (
                 "› ",
@@ -5001,8 +5002,17 @@ fn build_transcript_lines(
         };
 
         let prefix_width = prefix.width();
+        let content_width = width.saturating_sub(prefix_width);
+        let has_thinking_content = message
+            .thinking
+            .as_ref()
+            .map(|thinking| !thinking.trim().is_empty())
+            .unwrap_or(false);
+        let should_render_thinking = message.role == "assistant"
+            && (message.is_thinking.unwrap_or(false) || has_thinking_content);
+
         if fold_system_messages && message.role == "system" && !message.content.trim().is_empty() {
-            let folded = preview_line(&message.content, width.saturating_sub(prefix_width));
+            let folded = preview_line(&message.content, content_width);
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), prefix_style),
                 Span::styled(
@@ -5011,49 +5021,115 @@ fn build_transcript_lines(
                 ),
             ]));
             rendered_any = true;
-        } else if !message.content.trim().is_empty() || message.tool_calls.is_empty() {
-            let mut first_visual_line = true;
+        } else if !message.content.trim().is_empty()
+            || message.tool_calls.is_empty()
+            || should_render_thinking
+        {
             if message.role == "assistant" {
-                let mut in_code_block = false;
-                let raw_lines = message.content.split('\n').collect::<Vec<_>>();
-                let mut index = 0usize;
-                while index < raw_lines.len() {
-                    let raw_line = raw_lines[index];
-                    let rendered = if !in_code_block {
-                        if let Some((consumed, table_lines)) = render_markdown_table_block(
-                            &raw_lines[index..],
-                            width.saturating_sub(prefix_width),
-                        ) {
-                            index += consumed;
-                            table_lines
+                let should_render_main_content =
+                    !message.content.trim().is_empty() || message.tool_calls.is_empty();
+
+                if should_render_thinking {
+                    let thinking_label = if message.is_thinking.unwrap_or(false) {
+                        format!("{} thinking…", SPINNER_FRAMES[spinner_index])
+                    } else {
+                        "thought".to_string()
+                    };
+
+                    let label_line = vec![Span::styled(
+                        thinking_label,
+                        Style::default()
+                            .fg(ACCENT_DIM)
+                            .add_modifier(Modifier::ITALIC),
+                    )];
+                    append_guttered_span_lines(
+                        &mut lines,
+                        vec![label_line],
+                        "│ ",
+                        Style::default().fg(ACCENT_DIM),
+                        &mut first_visual_line,
+                    );
+
+                    let thinking_text = message.thinking.as_deref().unwrap_or("");
+                    let thinking_lines: Vec<&str> = thinking_text.lines().take(3).collect();
+                    for line in &thinking_lines {
+                        let styled = vec![Span::styled(
+                            preview_line(line, content_width),
+                            Style::default()
+                                .fg(ACCENT_DIM)
+                                .add_modifier(Modifier::ITALIC),
+                        )];
+                        append_guttered_span_lines(
+                            &mut lines,
+                            vec![styled],
+                            "│ ",
+                            Style::default().fg(ACCENT_DIM),
+                            &mut first_visual_line,
+                        );
+                    }
+
+                    let total_lines = thinking_text.lines().count();
+                    if total_lines > 3 {
+                        let more = vec![Span::styled(
+                            format!("… +{} more lines", total_lines - 3),
+                            Style::default().fg(MUTED),
+                        )];
+                        append_guttered_span_lines(
+                            &mut lines,
+                            vec![more],
+                            "│ ",
+                            Style::default().fg(ACCENT_DIM),
+                            &mut first_visual_line,
+                        );
+                    }
+
+                    if !message.content.trim().is_empty() {
+                        lines.push(Line::from(Span::raw(String::new())));
+                    }
+                    rendered_any = true;
+                }
+
+                if should_render_main_content {
+                    let mut in_code_block = false;
+                    let raw_lines = message.content.split('\n').collect::<Vec<_>>();
+                    let mut index = 0usize;
+                    while index < raw_lines.len() {
+                        let raw_line = raw_lines[index];
+                        let rendered = if !in_code_block {
+                            if let Some((consumed, table_lines)) =
+                                render_markdown_table_block(&raw_lines[index..], content_width)
+                            {
+                                index += consumed;
+                                table_lines
+                            } else {
+                                index += 1;
+                                render_assistant_markdown_line(
+                                    raw_line,
+                                    content_width,
+                                    &mut in_code_block,
+                                )
+                            }
                         } else {
                             index += 1;
                             render_assistant_markdown_line(
                                 raw_line,
-                                width.saturating_sub(prefix_width),
+                                content_width,
                                 &mut in_code_block,
                             )
-                        }
-                    } else {
-                        index += 1;
-                        render_assistant_markdown_line(
-                            raw_line,
-                            width.saturating_sub(prefix_width),
-                            &mut in_code_block,
-                        )
-                    };
-                    append_guttered_span_lines(
-                        &mut lines,
-                        rendered,
-                        prefix,
-                        prefix_style,
-                        &mut first_visual_line,
-                    );
-                    rendered_any = true;
+                        };
+                        append_guttered_span_lines(
+                            &mut lines,
+                            rendered,
+                            prefix,
+                            prefix_style,
+                            &mut first_visual_line,
+                        );
+                        rendered_any = true;
+                    }
                 }
             } else {
                 for raw_line in message.content.split('\n') {
-                    let wrapped = wrap_plain(raw_line, width.saturating_sub(prefix_width));
+                    let wrapped = wrap_plain(raw_line, content_width);
                     for chunk in wrapped {
                         let gutter = if first_visual_line {
                             prefix.to_string()
@@ -5087,10 +5163,24 @@ fn build_transcript_lines(
         }
 
         if message.is_streaming {
-            lines.push(Line::from(Span::styled(
-                "  streaming…",
+            let indicator = if message.is_thinking.unwrap_or(false) {
+                format!("{} thinking…", SPINNER_FRAMES[spinner_index])
+            } else {
+                format!("{} writing…", SPINNER_FRAMES[spinner_index])
+            };
+            let streaming_line = vec![Span::styled(
+                indicator,
+                Style::default()
+                    .fg(ACCENT_DIM)
+                    .add_modifier(Modifier::ITALIC),
+            )];
+            append_guttered_span_lines(
+                &mut lines,
+                vec![streaming_line],
+                "│ ",
                 Style::default().fg(ACCENT_DIM),
-            )));
+                &mut first_visual_line,
+            );
             rendered_any = true;
         }
 

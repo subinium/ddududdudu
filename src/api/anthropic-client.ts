@@ -53,6 +53,7 @@ export interface ApiToolDefinition {
 
 export interface StreamCallbacks {
   onText: (text: string) => void;
+  onThinking?: (text: string) => void;
   onError: (error: Error) => void;
   onDone: (fullText: string, usage: UsageSummary) => void;
   onToolUse?: (
@@ -207,6 +208,15 @@ export class AnthropicClient {
         system: systemPrompt.trim() || undefined,
         messages: buildMessages(messages),
         tools: aiTools,
+        providerOptions: {
+          anthropic: {
+            sendReasoning: true,
+            thinking: {
+              type: 'enabled',
+              budgetTokens: 10_000,
+            },
+          },
+        },
         abortSignal: signal,
         maxOutputTokens: this.config.maxTokens,
       });
@@ -219,8 +229,21 @@ export class AnthropicClient {
 
       for await (const chunk of result.fullStream) {
         if (chunk.type === 'text-delta') {
-          fullText += chunk.text;
-          callbacks.onText(chunk.text);
+          const textDelta = (chunk as { text?: string; delta?: string }).text
+            ?? (chunk as { text?: string; delta?: string }).delta
+            ?? '';
+          fullText += textDelta;
+          callbacks.onText(textDelta);
+          continue;
+        }
+
+        if (chunk.type === 'reasoning-delta') {
+          const thinkingDelta = (chunk as { text?: string; delta?: string }).text
+            ?? (chunk as { text?: string; delta?: string }).delta
+            ?? '';
+          if (thinkingDelta) {
+            callbacks.onThinking?.(thinkingDelta);
+          }
           continue;
         }
 

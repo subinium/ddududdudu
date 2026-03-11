@@ -30,6 +30,8 @@ export interface NativeMessageState {
   role: NativeMessageRole;
   content: string;
   timestamp: number;
+  thinking?: string;
+  isThinking?: boolean;
   isStreaming?: boolean;
   toolCalls?: NativeToolCallState[];
 }

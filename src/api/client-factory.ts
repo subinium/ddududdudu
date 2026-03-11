@@ -6,8 +6,9 @@ import type {
 import { DEFAULT_ANTHROPIC_BASE_URL } from './anthropic-base-url.js';
 
 export interface StreamEvent {
-  type: 'text' | 'done' | 'error' | 'tool_use' | 'tool_state' | 'session';
+  type: 'text' | 'thinking' | 'done' | 'error' | 'tool_use' | 'tool_state' | 'session';
   text?: string;
+  thinking?: string;
   fullText?: string;
   usage?: {
     input: number;
@@ -51,6 +52,7 @@ const buildStreamAdapter = (
     options: StreamOptions,
     callbacks: {
       onText: (text: string) => void;
+      onThinking?: (text: string) => void;
       onError: (error: Error) => void;
       onDone: (fullText: string, usage: { input: number; output: number }) => void;
       onToolUse?: (
@@ -80,6 +82,9 @@ const buildStreamAdapter = (
   void runner(options, {
     onText: (text: string): void => {
       push({ type: 'text', text });
+    },
+    onThinking: (thinking: string): void => {
+      push({ type: 'thinking', thinking });
     },
     onError: (error: Error): void => {
       push({ type: 'error', error });
@@ -231,15 +236,16 @@ export const createClient = (provider: string, token: string, tokenType: string)
               maxTokens: streamOptions.maxTokens,
             });
 
-            await client.stream(
-              streamOptions.systemPrompt,
-              messages,
-              {
-                onText: callbacks.onText,
-                onError: callbacks.onError,
-                onDone: callbacks.onDone,
-                onToolUse: callbacks.onToolUse,
-              },
+              await client.stream(
+                streamOptions.systemPrompt,
+                messages,
+                {
+                  onText: callbacks.onText,
+                  onThinking: callbacks.onThinking,
+                  onError: callbacks.onError,
+                  onDone: callbacks.onDone,
+                  onToolUse: callbacks.onToolUse,
+                },
               streamOptions.signal,
               streamOptions.tools,
             );

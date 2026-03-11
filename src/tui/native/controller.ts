@@ -3142,6 +3142,7 @@ export class NativeBridgeController {
     continueWithTools: boolean;
   }> {
     let fullText = context.currentText;
+    let thinkingText = '';
     let inputTokens = context.requestInputTokens;
     let outputTokens = context.requestOutputTokens;
     let uncachedInputTokens = context.requestUncachedInputTokens;
@@ -3155,7 +3156,16 @@ export class NativeBridgeController {
         break;
       }
 
+      if (event.type === 'thinking') {
+        thinkingText += event.thinking ?? '';
+        this.updateMessageThinking(context.assistantMessageId, thinkingText, true);
+        continue;
+      }
+
       if (event.type === 'text') {
+        if (thinkingText) {
+          this.updateMessageThinking(context.assistantMessageId, thinkingText, false);
+        }
         fullText += event.text ?? '';
         this.updateMessage(context.assistantMessageId, fullText);
         continue;
@@ -7229,6 +7239,21 @@ export class NativeBridgeController {
         ...message,
         content,
         toolCalls: toolCalls ?? message.toolCalls,
+      };
+    });
+    this.scheduleStatePush();
+  }
+
+  private updateMessageThinking(id: string, thinking: string, isThinking: boolean): void {
+    this.state.messages = this.state.messages.map((message) => {
+      if (message.id !== id) {
+        return message;
+      }
+
+      return {
+        ...message,
+        thinking,
+        isThinking,
       };
     });
     this.scheduleStatePush();
