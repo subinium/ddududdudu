@@ -196,7 +196,7 @@ score: { stability: 0.9, reuse: 0.8, specificity: 0.7, verification: 1, novelty:
 ---
 ```
 
-이 메타데이터는 선택적이고 추가적이다. frontmatter 없는 기존 memory 파일은 변경 없이 계속 동작한다.
+이 메타데이터는 선택 사항이며 부가적이다. frontmatter 없는 기존 memory 파일은 변경 없이 계속 동작한다.
 
 ## 중복 제거와 병합
 
@@ -265,4 +265,4 @@ score: { stability: 0.9, reuse: 0.8, specificity: 0.7, verification: 1, novelty:
 
 ## 설계 규칙
 
-Memory는 재사용 가능한 운영 지식을 보존해야 한다. 서술적 잔재를 축적하는 게 아니다.
+Memory는 재사용 가능한 운영 지식을 보존해야 한다. 대화 찌꺼기를 쌓는 게 아니다.

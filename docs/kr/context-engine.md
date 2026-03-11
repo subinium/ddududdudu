@@ -51,7 +51,7 @@ context의 품질이 양보다 중요하다.
 
 - 좁은 작업에 전체 대화를 재생
 - 줄 단위 수정에 파일 전체 context를 전송
-- 구조화된 artifact 대신 산문으로 provider session을 hydrate
+- 구조화된 artifact 대신 일반 텍스트로 provider session을 hydrate
 
 효과:
 
@@ -121,10 +121,10 @@ context의 품질이 양보다 중요하다.
 
 나쁜 compaction이 보존하는 것:
 
-- 모호한 요약 산문
+- 모호한 요약 텍스트
 - 낮은 엔트로피의 transcript 패러프레이즈
 
-타입이 있는 artifact는 서술적 요약이 아닌 운영적 의미를 보존하기 때문에 여기서 특히 가치 있다.
+타입이 있는 artifact는 단순 서술이 아닌 운영적 의미를 보존하기 때문에 여기서 특히 가치 있다.
 
 ### 2단계 파이프라인
 
