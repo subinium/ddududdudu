@@ -261,7 +261,6 @@ Current implementation supports:
 What it does not yet provide:
 
 - a memory inspector that explains why an entry was promoted
-- automatic wiring of the scored pipeline into the verification flow (wiring pending)
 
 ## Design Rule
 

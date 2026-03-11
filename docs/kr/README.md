@@ -74,6 +74,7 @@
 - 병렬 팀 실행이 이제 전체 라운드 배리어를 기다리는 대신 의존성이 해소되는 대로 계속된다
 - ask-user prompt가 이제 일반 문자열 prompt 대신 질문 종류, 기본값, 유효성 검사, 답변 출처를 가진 구조화된 runtime state다
 - session과 운영자 설정은 기본적으로 전역 우선이며, 프로젝트 `.ddudu/` config는 명시적인 오버라이드 레이어다
+- 프로젝트 instruction은 `.ddudu/DDUDU.md`와 함께 크로스 툴 표준인 `AGENTS.md`를 지원하므로, 한 번 작성한 규칙이 Claude Code, opencode, Codex CLI, Amp에서 모두 적용된다
 - 운영자 표면은 이제 중복된 runtime 세부 정보보다 실행 state, todo 소유권, 워커 가시성, 명시적인 ask-user 선택을 우선시한다
 
 ## 이 문서들이 아닌 것

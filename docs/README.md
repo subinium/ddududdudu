@@ -74,6 +74,7 @@ The current `ddudu` implementation is especially shaped by a few practical choic
 - parallel team execution now continues as dependencies clear instead of waiting on full round barriers
 - ask-user prompts are now structured runtime state with question kind, defaults, validation, and answer provenance instead of a plain string prompt
 - sessions and operator settings are global-first by default, with project `.ddudu/` config as an explicit override layer
+- project instructions support `AGENTS.md` as the cross-tool standard alongside `.ddudu/DDUDU.md`, so rules authored once apply across Claude Code, opencode, Codex CLI, and Amp
 - the operator surface now prioritizes run state, todo ownership, worker visibility, and explicit ask-user choices over redundant runtime detail
 
 ## What These Docs Are Not

@@ -36,7 +36,7 @@ That is why context engineering should be treated as a query-planning problem, n
 | Layer | Content | Expected stability |
 | --- | --- | --- |
 | Stable kernel | operating rules for tool use, verification, delegation, trust | very stable |
-| Project instruction layer | `.ddudu/DDUDU.md`, rules, prompts, compatible instruction files | stable within a repo |
+| Project instruction layer | `.ddudu/DDUDU.md`, `AGENTS.md`, rules, prompts, compatible instruction files | stable within a repo |
 | Memory layer | selected working, semantic, procedural, or episodic memory | semi-stable |
 | Request snapshot | relevant files, artifacts, changed files, todo state, active jobs | highly dynamic |
 | Provider session layer | provider-specific session continuity | runtime-specific |

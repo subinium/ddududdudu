@@ -261,7 +261,6 @@ score: { stability: 0.9, reuse: 0.8, specificity: 0.7, verification: 1, novelty:
 아직 제공하지 않는 것:
 
 - 항목이 왜 승격됐는지 설명하는 memory 인스펙터
-- 점수 기반 파이프라인을 검증 플로우에 자동 연결 (연결 대기 중)
 
 ## 설계 규칙
 

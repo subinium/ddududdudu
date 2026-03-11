@@ -36,7 +36,7 @@ context의 품질이 양보다 중요하다.
 | 레이어 | 내용 | 예상 안정성 |
 | --- | --- | --- |
 | Stable kernel | tool 사용, 검증, 위임, 신뢰에 관한 운영 규칙 | 매우 안정적 |
-| Project instruction layer | `.ddudu/DDUDU.md`, 규칙, prompt, 호환 instruction 파일 | 레포 내에서 안정적 |
+| Project instruction layer | `.ddudu/DDUDU.md`, `AGENTS.md`, 규칙, prompt, 호환 instruction 파일 | 레포 내에서 안정적 |
 | Memory layer | 선택된 working, semantic, procedural, episodic memory | 준안정적 |
 | Request snapshot | 관련 파일, artifact, 변경된 파일, todo 상태, 활성 작업 | 매우 동적 |
 | Provider session layer | provider별 session 연속성 | runtime 의존적 |
