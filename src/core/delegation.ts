@@ -396,76 +396,72 @@ export class DelegationRuntime {
       ]
         .filter((part): part is string => typeof part === 'string' && part.trim().length > 0)
         .join('\n\n');
-      const writeLease =
-        writeKey
-          ? await this.executionScheduler.acquire({
-              writeKey,
-              signal: handlers.signal,
-              onWait: handlers.onExecutionState,
-            })
-          : null;
+      const executionLease = await this.executionScheduler.acquire({
+        provider,
+        writeKey,
+        signal: handlers.signal,
+        onWait: handlers.onExecutionState,
+      });
       try {
-        const providerLease = await this.executionScheduler.acquire({
+        await handlers.onApiCallStart?.({
           provider,
-          signal: handlers.signal,
-          onWait: handlers.onExecutionState,
+          model,
+          mode,
+          purpose,
+          cwd: effectiveCwd,
+          localSessionId,
         });
-        try {
-          await handlers.onApiCallStart?.({
-            provider,
-            model,
-            mode,
-            purpose,
-            cwd: effectiveCwd,
-            localSessionId,
-          });
-          for await (const event of client.stream(messages, {
-            systemPrompt: combinedSystemPrompt,
-            model,
-            maxTokens: request.maxTokens ?? 8192,
-            signal: handlers.signal,
-            cwd: effectiveCwd,
-          })) {
-            if (event.type === 'text') {
-              const delta = event.text ?? '';
-              text += delta;
-              handlers.onText?.(delta);
-              continue;
-            }
-
-            if (event.type === 'tool_state' && event.toolStates) {
-              handlers.onToolState?.(event.toolStates);
-              continue;
-            }
-
-            if (event.type === 'session' && event.sessionId) {
-              remoteSessionId = event.sessionId;
-              continue;
-            }
-
-            if (event.type === 'done') {
-              text = event.fullText ?? text;
-              usage = event.usage ?? usage;
-              break;
-            }
-
-            if (event.type === 'error') {
-              throw event.error ?? new Error(`Delegated ${mode} request failed.`);
-            }
+        for await (const event of client.stream(messages, {
+          systemPrompt: combinedSystemPrompt,
+          model,
+          maxTokens: request.maxTokens ?? 8192,
+          signal: handlers.signal,
+          cwd: effectiveCwd,
+        })) {
+          if (event.type === 'text') {
+            const delta = event.text ?? '';
+            text += delta;
+            handlers.onText?.(delta);
+            continue;
           }
-        } finally {
-          await providerLease.release();
+
+          if (event.type === 'tool_state' && event.toolStates) {
+            handlers.onToolState?.(event.toolStates);
+            continue;
+          }
+
+          if (event.type === 'session' && event.sessionId) {
+            remoteSessionId = event.sessionId;
+            continue;
+          }
+
+          if (event.type === 'done') {
+            text = event.fullText ?? text;
+            usage = event.usage ?? usage;
+            break;
+          }
+
+          if (event.type === 'error') {
+            throw event.error ?? new Error(`Delegated ${mode} request failed.`);
+          }
         }
       } finally {
-        if (writeLease) {
-          await writeLease.release();
-        }
+        await executionLease.release();
       }
 
       const verificationMode = this.resolveVerificationMode(purpose, request.verificationMode);
       if (verificationMode !== 'none') {
         handlers.onVerificationState?.({ status: 'running', summary: `verification ${verificationMode}` });
-        verification = await new VerificationRunner(effectiveCwd).run(verificationMode);
+        const verificationLease = await this.executionScheduler.acquire({
+          resource: 'verification',
+          signal: handlers.signal,
+          onWait: handlers.onExecutionState,
+        });
+        try {
+          verification = await new VerificationRunner(effectiveCwd).run(verificationMode);
+        } finally {
+          await verificationLease.release();
+        }
         handlers.onVerificationState?.({
           status: verification.status,
           summary: verification.summary,

@@ -14,6 +14,7 @@ export const SLASH_COMMANDS: AutocompleteItem[] = [
   { label: '/permissions', description: 'Set permission profile, tool policy, network, or secret trust', value: '/permissions' },
   { label: '/memory', description: 'Read, write, append, or clear scoped memory', value: '/memory' },
   { label: '/session', description: 'Inspect or resume saved sessions', value: '/session' },
+  { label: '/resume', description: 'Resume the last or a selected saved session', value: '/resume' },
   { label: '/config', description: 'Show current configuration', value: '/config' },
   { label: '/help', description: 'Show available commands', value: '/help' },
   { label: '/doctor', description: 'Check system health', value: '/doctor' },

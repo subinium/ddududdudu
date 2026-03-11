@@ -41,9 +41,13 @@ These docs exist to make those design decisions explicit.
 1. the harness matters at least as much as the prompt
 2. state is more durable than transcript
 3. context quality matters more than context size
-4. verification matters more than confident prose
-5. trust should be enforced by runtime policy, not just requested in language
-6. the UI is part of the control plane, not a cosmetic shell
+4. the smallest executable unit should start first
+5. verification should sit at the boundaries where work can break, land, or ship
+6. trust should be enforced by runtime policy, not just requested in language
+7. execution should be only as heavy as the task requires
+8. parallelism should be controlled by policy, not by creating more agent ceremony
+9. the UI is part of the control plane, not a cosmetic shell
+10. interactive questions should be modeled state, not ad hoc terminal text
 
 ## Reading Order
 
@@ -63,7 +67,13 @@ These docs exist to make those design decisions explicit.
 The current `ddudu` implementation is especially shaped by a few practical choices:
 
 - request execution, routing, workflow state, team orchestration, and background lifecycle now sit behind separate runtime boundaries instead of one controller blob
+- lightweight research fan-out now has its own runtime boundary instead of pretending every parallel request is a managed team run
 - pure external research takes a lightweight context path and can fan out into multiple read-only workers when the prompt names multiple subjects
+- mixed implementation work now prefers direct or delegated execution before escalating into a managed team run
+- provider, search, write, and verification pressure now share one scheduler model instead of being treated as unrelated waits
+- parallel team execution now continues as dependencies clear instead of waiting on full round barriers
+- ask-user prompts are now structured runtime state with question kind, defaults, validation, and answer provenance instead of a plain string prompt
+- sessions and operator settings are global-first by default, with project `.ddudu/` config as an explicit override layer
 - the operator surface now prioritizes run state, todo ownership, worker visibility, and explicit ask-user choices over redundant runtime detail
 
 ## What These Docs Are Not

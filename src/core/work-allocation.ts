@@ -47,6 +47,9 @@ const detectTaskSignals = (task: string) => {
     hasReview: /\b(review|audit|verify|validation|regression|risk|critic|critique)\b|(?:리뷰|검토|검증|감사|리스크|회귀)/u.test(lower),
     hasExecution: /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b|(?:구현|수정|고쳐|작성|편집|리팩터|패치|코드|변경)/u.test(lower),
     docsHeavy: /\b(doc|docs|readme|contributing|rule|prompt|instruction|config|mcp|auth|provider|integration|guide)\b|(?:문서|리드미|가이드|규칙|설정|인증|프로바이더|통합)/u.test(lower),
+    multiStep:
+      /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(lower) ||
+      normalized.split(/\n+/u).length > 1,
     repoWide:
       /\b(across the repo|entire repo|whole project|codebase|end-to-end|from scratch|full flow)\b|(?:전체 프로젝트|코드베이스|엔드투엔드|처음부터|전체 흐름)/u.test(lower) ||
       normalized.split(/\n+/u).length > 1,
@@ -67,7 +70,7 @@ const isLikelyResearchSubjectToken = (value: string): boolean => {
   return true;
 };
 
-const extractResearchSubjects = (task: string): string[] => {
+export const extractResearchSubjects = (task: string): string[] => {
   const normalized = normalizeTask(task);
   const subjects: string[] = [];
 
@@ -168,12 +171,15 @@ export const planWorkAllocation = (
   const units: WorkUnit[] = [];
 
   const needsPlanning =
-    signals.hasPlanning || (signals.hasExecution && (signals.hasResearch || signals.docsHeavy || signals.repoWide));
+    signals.hasPlanning || (signals.hasExecution && (signals.repoWide || signals.multiStep) && (signals.hasResearch || signals.docsHeavy));
   const needsExplorer = signals.hasExecution || signals.hasReview || signals.repoWide;
   const needsLibrarian = signals.docsHeavy || signals.hasPlanning || signals.hasResearch;
   const needsExecutor = signals.hasExecution || (!signals.hasPlanning && !signals.hasResearch && !signals.hasReview);
   const needsDesigner = signals.hasDesign;
-  const needsReviewer = signals.hasReview || signals.hasExecution || signals.hasDesign;
+  const needsReviewer =
+    signals.hasReview
+    || signals.hasDesign
+    || (signals.hasExecution && (signals.hasPlanning || signals.hasResearch || signals.docsHeavy || signals.repoWide));
 
   if (needsPlanning) {
     pushUniqueRole(
@@ -249,7 +255,16 @@ export const planWorkAllocation = (
   const reviewer = units.find((unit) => unit.role === 'reviewer');
 
   for (const unit of units) {
-    if (planner && unit.id !== planner.id && !unit.dependsOn.includes(planner.label)) {
+    if (!planner || unit.id === planner.id) {
+      continue;
+    }
+
+    // Let discovery workers start immediately so planning does not become a full barrier.
+    if (unit.role === 'explorer' || unit.role === 'librarian') {
+      continue;
+    }
+
+    if (!unit.dependsOn.includes(planner.label)) {
       unit.dependsOn.push(planner.label);
     }
   }

@@ -98,10 +98,10 @@ Effect:
 
 Prefer:
 
+- execution-shape classification before heavyweight retrieval when the task shape is obvious
 - file ranges over full files
 - symbol-based reads over generic reads
 - typed artifacts over transcript replay
-- route classification before heavyweight retrieval when the task shape is obvious
 - purpose-aware memory selection over full memory dumps
 - changed-files-first ranking for active code changes
 - readable extraction over raw document payloads unless fidelity is required
@@ -124,9 +124,9 @@ Bad compaction preserves:
 
 Typed artifacts are especially valuable here because they preserve operational meaning rather than narrative summary.
 
-## External Research Fast Path
+## Execution-Shape-First Retrieval
 
-External research should not pay the same context costs as active code editing.
+Context cost should follow execution shape, not only request length.
 
 When the prompt is mostly asking for comparison, research, or fact-finding outside the repo, a good harness should:
 
@@ -134,6 +134,14 @@ When the prompt is mostly asking for comparison, research, or fact-finding outsi
 - skip relevant-file retrieval and changed-file scans unless the repo is clearly part of the question
 - keep artifact carry-over small
 - avoid loading broad memory or planning state that does not improve the next search decision
+
+Likewise, focused implementation work should not automatically pay repo-wide orchestration or planning costs.
+
+If one owner can start with a narrow code slice, a good harness should prefer:
+
+- focused file and artifact retrieval
+- direct or single-owner delegated execution
+- lightweight scout context before managed team context
 
 This is one of the easiest ways to cut latency without weakening answer quality.
 
@@ -157,7 +165,7 @@ Current `ddudu` leans on:
 - purpose-aware memory selection
 - task-type-specific request snapshots
 - lightweight snapshots for external research
-- route-before-snapshot for obvious team and delegation cases
+- route-before-snapshot for obvious direct, delegation, team, and research cases
 - compaction plus provider `resume` and `hydrate`
 
 The main tuning surface is no longer "add more prompt".

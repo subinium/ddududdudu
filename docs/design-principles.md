@@ -41,6 +41,15 @@ In practice that often means:
 - split itemized comparison requests into actual parallel workers instead of one overloaded researcher
 - avoid write-oriented isolation and verification costs for read-only research by default
 
+Performance is therefore not "how many subagents exist".
+It is "how much unnecessary execution weight the harness avoids".
+
+That changes the optimization target:
+
+- reduce bootstrap cost per unit of work
+- let ready work continue without waiting for unrelated slow work
+- separate search, model, write, and verification bottlenecks instead of treating them as one queue
+
 ## 3. Context Should Be Selected, Not Accumulated
 
 The context engine should not optimize for maximum inclusion.
@@ -81,9 +90,53 @@ Delegation is only useful if it:
 That also means the decomposition itself matters.
 If the user asks for `A/B/C` research, the useful split is usually by subject, not by abstract role label alone.
 
-## 6. Verification Is The Default Loop
+## 6. Prefer The Smallest Executable Unit
+
+The harness should prefer the smallest unit of work that can be started immediately.
+
+That means:
+
+- direct execution before managed orchestration when one worker can start now
+- delegation before full team runs when one coherent owner can carry the next step
+- subject shards for independent comparison work
+- narrow diffs and incremental notes over waiting for one grand final answer
+
+The point is not just lower cost.
+It is faster accumulation of real progress.
+
+## 7. Execution Should Be Only As Heavy As Necessary
+
+Once the smallest useful unit is identified, the harness should still avoid paying the same cost for every task.
+
+`ddudu` should prefer policy-driven execution weight:
+
+- minimal context before full context
+- shared workspace before isolated workspace when safe
+- no verification before light verification when that is sufficient
+- lightweight fan-out before managed multi-agent orchestration when the work is mostly read-only
+
+This is why "fast" and "safe" are not opposites here.
+The goal is to apply the smallest runtime that can still be trusted.
+
+## 8. Parallelism Should Increase Throughput, Not Ceremony
+
+Parallelism is useful when the work is actually independent.
+
+That implies:
+
+- subject fan-out for independent comparison work
+- many readers or scouts, but bounded writers
+- continuous scheduling when dependencies clear
+- partial results as soon as shards complete
+- final synthesis or verification only where it adds real value
+
+The system should not create a fully managed subagent for every tiny shard by default.
+That often increases coordination cost more than throughput.
+
+## 9. Verification Should Sit At Boundaries
 
 The system should not treat verification as a nice-to-have after generation.
+But it also should not pay the same verification cost for every shard.
 
 A serious harness should be built around loops such as:
 
@@ -93,9 +146,15 @@ A serious harness should be built around loops such as:
 4. escalate
 5. apply or report
 
-This biases the system toward completed work rather than plausible work.
+The important nuance is where the loop sits.
 
-## 7. Trust Must Live In Runtime Policy
+- write-capable workers often need verification before apply
+- review and ship boundaries often need stronger checks than read-only shards
+- pure research or narrow scouts often only need evidence quality, not full repo verification
+
+This biases the system toward completed work rather than plausible work without forcing every worker through the heaviest path.
+
+## 10. Trust Must Live In Runtime Policy
 
 Natural-language safety guidance is not enough once the harness can:
 
@@ -112,7 +171,37 @@ Trust therefore needs:
 - observable approval boundaries
 - runtime enforcement
 
-## 8. The UI Is Part Of The Control Plane
+## 11. Personas Are Interfaces, Not Architecture
+
+Modes, specialist labels, and agent names are useful operator affordances.
+They are not the real execution model.
+
+The real model should live in policy such as:
+
+- how much context to load
+- whether the task is shardable
+- how many readers and writers to allow
+- what verification tier to require
+- what isolation boundary to enforce
+
+If the architecture depends too much on persona labels, performance tuning and correctness both get harder.
+
+## 12. User Questions Should Be Structured State
+
+Once the harness can ask the operator to resolve ambiguity, choose a risk boundary, or confirm a dangerous action, those questions stop being casual text.
+
+They become execution state.
+
+That means a serious harness should model:
+
+- question kind such as input, confirm, select, number, or path
+- choice metadata such as recommended or dangerous options
+- defaults and validation
+- answer provenance such as selected choice vs custom typed input
+
+If user questions are only raw strings, the UI becomes inconsistent and policy prompts become harder to trust.
+
+## 13. The UI Is Part Of The Control Plane
 
 Once a harness supports:
 
@@ -131,7 +220,7 @@ It becomes part of the trust model because it determines whether the operator ca
 - what already passed
 - who owns what
 
-## 9. ddudu Is A Control Plane Around Provider Workers
+## 14. ddudu Is A Control Plane Around Provider Workers
 
 `ddudu` is not built on the assumption that official tools are weak.
 
@@ -146,4 +235,5 @@ It is built on the assumption that there is still useful design space above prov
 
 ## Design Rule
 
-Treat the harness as an operating system for software work, not as an oversized chat prompt.
+Treat the harness as an operating system for software work:
+start the smallest executable unit quickly, accumulate visible progress, ask explicit structured questions when operator input is needed, and only add heavier orchestration when it increases throughput or trust.

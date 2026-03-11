@@ -20,7 +20,7 @@ const getConfigPath = (cwd: string, scope: 'project' | 'global'): string => {
 
 export const readDduduConfigOverride = async (
   cwd: string,
-  scope: 'project' | 'global' = 'project',
+  scope: 'project' | 'global' = 'global',
 ): Promise<Record<string, unknown>> => {
   const configPath = getConfigPath(cwd, scope);
   try {
@@ -40,7 +40,7 @@ export const readDduduConfigOverride = async (
 export const writeDduduConfigOverride = async (
   cwd: string,
   value: Record<string, unknown>,
-  scope: 'project' | 'global' = 'project',
+  scope: 'project' | 'global' = 'global',
 ): Promise<string> => {
   const configPath = getConfigPath(cwd, scope);
   await mkdir(dirname(configPath), { recursive: true });
@@ -52,7 +52,7 @@ export const setDduduConfigValue = async (
   cwd: string,
   keyPath: string,
   value: unknown,
-  scope: 'project' | 'global' = 'project',
+  scope: 'project' | 'global' = 'global',
 ): Promise<string> => {
   const root = await readDduduConfigOverride(cwd, scope);
   const keys = keyPath.split('.').map((part) => part.trim()).filter(Boolean);
@@ -77,7 +77,7 @@ export const setDduduConfigValue = async (
 export const deleteDduduConfigValue = async (
   cwd: string,
   keyPath: string,
-  scope: 'project' | 'global' = 'project',
+  scope: 'project' | 'global' = 'global',
 ): Promise<string> => {
   const root = await readDduduConfigOverride(cwd, scope);
   const keys = keyPath.split('.').map((part) => part.trim()).filter(Boolean);

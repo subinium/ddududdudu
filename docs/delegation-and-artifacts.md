@@ -27,6 +27,14 @@ Delegation helps when it:
 - creates safer isolation boundaries
 - improves verification or review quality
 
+Delegation should usually be earned.
+
+For many implementation tasks, the better default is:
+
+- direct execution if one owner can start immediately
+- one delegated owner if isolation or specialization helps
+- managed team orchestration only when multiple independent units can truly move in parallel
+
 Delegation hurts when it:
 
 - splits simple tasks for no reason
@@ -111,6 +119,18 @@ Useful defaults are:
 
 Otherwise the harness spends most of its time paying orchestration tax instead of making progress.
 
+## Many Readers, Bounded Writers
+
+Parallelism is not the same thing as giving every worker write authority.
+
+For code work, the useful default is often:
+
+- many scouts or readers
+- one or two writers
+- one final reviewer or verifier
+
+That reduces merge pressure while still increasing throughput.
+
 ## Review And Repair Loops
 
 Delegation becomes much more valuable when tied to verification.
@@ -152,6 +172,7 @@ Current `ddudu` already uses:
 - typed artifacts
 - verifier → repair → escalate → apply flow
 - itemized research fan-out
+- direct or delegated execution as the default before escalating into managed team runs
 - worker-visible ownership and live heartbeats
 
 The next maturity step is usually tighter artifact discipline, not more subagents.

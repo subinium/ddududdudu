@@ -65,9 +65,41 @@ export interface NativeLspState {
   connectedLabels: string[];
 }
 
+export interface NativeAskUserOptionState {
+  value: string;
+  label: string;
+  description: string | null;
+  recommended: boolean;
+  danger: boolean;
+  shortcut: string | null;
+}
+
+export interface NativeAskUserValidationState {
+  pattern: string | null;
+  minLength: number | null;
+  maxLength: number | null;
+  message: string | null;
+}
+
 export interface NativeAskUserState {
   question: string;
-  options: string[];
+  kind: 'input' | 'confirm' | 'single_select' | 'number' | 'path';
+  detail: string | null;
+  placeholder: string | null;
+  submitLabel: string | null;
+  allowCustomAnswer: boolean;
+  required: boolean;
+  defaultValue: string | null;
+  defaultOptionIndex: number | null;
+  validation: NativeAskUserValidationState | null;
+  options: NativeAskUserOptionState[];
+}
+
+export interface NativeAskUserAnswer {
+  value: string;
+  source: 'choice' | 'custom' | 'default';
+  optionIndex: number | null;
+  optionLabel: string | null;
 }
 
 export interface NativePlanItemState extends Omit<PlanItem, 'status'> {
@@ -198,5 +230,5 @@ export type NativeBridgeCommand =
   | { type: 'cycle_mode'; direction?: 1 | -1 }
   | { type: 'set_model'; model: string }
   | { type: 'toggle_fire' }
-  | { type: 'answer_ask_user'; answer: string }
+  | { type: 'answer_ask_user'; answer: NativeAskUserAnswer }
   | { type: 'append_system'; content: string };

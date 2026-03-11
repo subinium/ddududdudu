@@ -222,11 +222,16 @@ export class TeamOrchestrator {
   private async executeParallelRound(round: number): Promise<void> {
     const pending = new Set(this.workerIds);
     const completed = new Set<string>();
+    const inFlight = new Map<string, Promise<{ workerId: string }>>();
 
-    while (pending.size > 0) {
-      const ready = this.selectReadyWorkers(pending, completed);
-      const wave = this.ensureReadyWorkers(ready, pending, completed);
-      const workerTasks = wave.map((workerId) => {
+    const scheduleReadyWorkers = (): void => {
+      if (pending.size === 0) {
+        return;
+      }
+
+      const ready = this.selectReadyWorkers(pending, completed).filter((workerId) => !inFlight.has(workerId));
+
+      for (const workerId of ready) {
         const dependencyContext = this.collectDependencyOutputs(workerId, completed);
         const taskText = this.buildWorkerSubtask(workerId, round, dependencyContext);
         this.routeMessage({
@@ -238,18 +243,27 @@ export class TeamOrchestrator {
             strategy: 'parallel',
             round,
             dependencyCount: this.getWorkerDependencies(workerId).length,
-            waveSize: wave.length,
+            readyCount: ready.length,
           },
           timestamp: Date.now(),
         });
-        return this.runWorkerFromQueue(workerId, round, dependencyContext);
-      });
-
-      await Promise.all(workerTasks);
-      for (const workerId of wave) {
-        pending.delete(workerId);
-        completed.add(workerId);
+        inFlight.set(
+          workerId,
+          this.runWorkerFromQueue(workerId, round, dependencyContext).then(() => ({ workerId })),
+        );
       }
+    };
+
+    while (pending.size > 0 || inFlight.size > 0) {
+      scheduleReadyWorkers();
+      if (inFlight.size === 0) {
+        this.ensureReadyWorkers(this.selectReadyWorkers(pending, completed), pending, completed);
+      }
+
+      const finished = await Promise.race(inFlight.values());
+      inFlight.delete(finished.workerId);
+      pending.delete(finished.workerId);
+      completed.add(finished.workerId);
     }
 
     await this.synthesizeLeadOutput(round);

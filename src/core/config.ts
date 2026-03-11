@@ -77,6 +77,10 @@ const DEFAULT_CONFIG: DduduConfig = {
       openai: 4,
       gemini: 2,
     },
+    resource_budgets: {
+      search: 8,
+      verification: 2,
+    },
     max_parallel_writes: 4,
     scheduler_poll_ms: 125,
   },

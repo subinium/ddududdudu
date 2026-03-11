@@ -47,6 +47,7 @@ export interface AgentConfig {
   max_turns: number;
   timeout_minutes: number;
   provider_budgets?: Record<string, number>;
+  resource_budgets?: Record<string, number>;
   max_parallel_writes?: number;
   scheduler_poll_ms?: number;
   routing?: RoutingRule[];
@@ -129,6 +130,7 @@ export interface AgentConfigOverride {
   max_turns?: number;
   timeout_minutes?: number;
   provider_budgets?: Record<string, number>;
+  resource_budgets?: Record<string, number>;
   max_parallel_writes?: number;
   scheduler_poll_ms?: number;
   routing?: RoutingRule[];

@@ -83,6 +83,7 @@ const printUsage = (): void => {
     `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
     `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
     `  ${P}ddudu session${X} list|pick|resume|last ${D}Session management${X}`,
+    `  ${P}ddudu resume${X} [last|pick|ID]   ${D}Resume saved session quickly${X}`,
     '',
     `${PL}Shortcuts (TUI)${X}`,
     `  Shift+Tab  cycle mode   Esc  interrupt`,
@@ -200,29 +201,6 @@ const parseConfigValue = (value: string): unknown => {
   return value;
 };
 
-const isRecord = (value: unknown): value is Record<string, unknown> => {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
-};
-
-const setNestedValue = (target: Record<string, unknown>, keyPath: string, value: unknown): void => {
-  const keys = keyPath.split('.').filter((segment: string) => segment.length > 0);
-  if (keys.length === 0) {
-    throw new Error('config key cannot be empty');
-  }
-
-  let cursor: Record<string, unknown> = target;
-  for (let index = 0; index < keys.length - 1; index += 1) {
-    const key = keys[index];
-    const current = cursor[key];
-    if (!isRecord(current)) {
-      cursor[key] = {};
-    }
-    cursor = cursor[key] as Record<string, unknown>;
-  }
-
-  cursor[keys[keys.length - 1]] = value;
-};
-
 const handleConfig = async (parsed: ParsedCommand): Promise<void> => {
   if (parsed.subcommand === 'show') {
     process.stdout.write(`${await loadMergedConfigText()}\n`);
@@ -234,29 +212,13 @@ const handleConfig = async (parsed: ParsedCommand): Promise<void> => {
     if (!key || value === undefined) {
       throw new Error('config set requires KEY and VALUE');
     }
-
-    const { access, mkdir, readFile, writeFile } = await import('node:fs/promises');
-    const { constants } = await import('node:fs');
-    const { resolve } = await import('node:path');
-    const yamlModule = await import('yaml');
-
-    const configDir = resolve(process.cwd(), '.ddudu');
-    const configPath = resolve(configDir, 'config.yaml');
-    await mkdir(configDir, { recursive: true });
-
-    let raw = '';
-    try {
-      await access(configPath, constants.R_OK);
-      raw = await readFile(configPath, 'utf8');
-    } catch {
-      raw = '';
-    }
-
-    const parsedYaml = raw.trim().length > 0 ? (yamlModule.parse(raw) as unknown) : {};
-    const target = isRecord(parsedYaml) ? parsedYaml : {};
-    setNestedValue(target, key, parseConfigValue(value));
-    await writeFile(configPath, yamlModule.stringify(target), 'utf8');
-    process.stdout.write(`Updated ${key}\n`);
+    const { setDduduConfigValue } = await import('./core/config-editor.js');
+    const scope =
+      parsed.flags.project === true || parsed.flags.scope === 'project'
+        ? 'project'
+        : 'global';
+    const updatedPath = await setDduduConfigValue(process.cwd(), key, parseConfigValue(value), scope);
+    process.stdout.write(`Updated ${key} (${scope})\n${updatedPath}\n`);
     return;
   }
 
@@ -395,6 +357,25 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
   }
 
   throw new Error('Unknown session subcommand');
+};
+
+const handleResume = async (parsed: ParsedCommand): Promise<void> => {
+  const target = parsed.args[0]?.trim();
+  const synthetic: ParsedCommand = {
+    command: 'session',
+    subcommand:
+      !target || target.toLowerCase() === 'last'
+        ? 'last'
+        : target.toLowerCase() === 'pick'
+          ? 'pick'
+          : 'resume',
+    args:
+      !target || target.toLowerCase() === 'last' || target.toLowerCase() === 'pick'
+        ? []
+        : [target],
+    flags: parsed.flags,
+  };
+  await handleSession(synthetic);
 };
 
 const handleJob = async (parsed: ParsedCommand): Promise<void> => {
@@ -929,6 +910,11 @@ const runCommand = async (parsed: ParsedCommand): Promise<void> => {
 
   if (parsed.command === 'session') {
     await handleSession(parsed);
+    return;
+  }
+
+  if (parsed.command === 'resume') {
+    await handleResume(parsed);
     return;
   }
 

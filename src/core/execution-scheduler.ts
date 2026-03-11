@@ -5,6 +5,7 @@ import { resolve } from 'node:path';
 
 export interface ExecutionSchedulerConfig {
   providerBudgets: Record<string, number>;
+  resourceBudgets: Record<string, number>;
   maxParallelWrites: number;
   pollMs: number;
   staleMs: number;
@@ -16,6 +17,7 @@ export interface ExecutionLease {
 
 export interface ExecutionAcquireOptions {
   provider?: string | null;
+  resource?: string | null;
   writeKey?: string | null;
   signal?: AbortSignal;
   onWait?: (message: string) => void;
@@ -27,6 +29,11 @@ const DEFAULT_PROVIDER_BUDGETS: Record<string, number> = {
   openai: 4,
   codex: 4,
   gemini: 2,
+};
+
+const DEFAULT_RESOURCE_BUDGETS: Record<string, number> = {
+  search: 8,
+  verification: 2,
 };
 
 const normalizeProviderKey = (provider: string): string => {
@@ -101,6 +108,10 @@ export class ExecutionScheduler {
         ...DEFAULT_PROVIDER_BUDGETS,
         ...(config.providerBudgets ?? {}),
       },
+      resourceBudgets: {
+        ...DEFAULT_RESOURCE_BUDGETS,
+        ...(config.resourceBudgets ?? {}),
+      },
       maxParallelWrites: Math.max(1, config.maxParallelWrites ?? 4),
       pollMs: Math.max(25, config.pollMs ?? 125),
       staleMs: Math.max(5_000, config.staleMs ?? 10 * 60_000),
@@ -118,6 +129,11 @@ export class ExecutionScheduler {
           options.onWait,
         );
         releases.push(providerRelease);
+      }
+
+      if (options.resource) {
+        const resourceRelease = await this.acquireResourceSlot(options.resource, options.signal, options.onWait);
+        releases.push(resourceRelease);
       }
 
       if (options.writeKey) {
@@ -152,33 +168,14 @@ export class ExecutionScheduler {
     onWait?: (message: string) => void,
   ): Promise<() => Promise<void>> {
     const capacity = Math.max(1, this.config.providerBudgets[provider] ?? 2);
-    const providerDir = resolve(leaseBaseDir(), 'providers', provider);
-    await mkdir(providerDir, { recursive: true });
-
-    while (true) {
-      if (signal?.aborted) {
-        throw new Error(`Provider slot acquisition aborted for ${provider}.`);
-      }
-
-      for (let index = 0; index < capacity; index += 1) {
-        const slotDir = resolve(providerDir, `slot-${index + 1}`);
-        try {
-          await mkdir(slotDir);
-          await writeLeaseMetadata(slotDir);
-          return async () => {
-            await rm(slotDir, { recursive: true, force: true });
-          };
-        } catch {
-          if (await isStaleLease(slotDir, this.config.staleMs)) {
-            await rm(slotDir, { recursive: true, force: true }).catch(() => undefined);
-            continue;
-          }
-        }
-      }
-
-      onWait?.(`waiting for ${provider} provider slot`);
-      await sleep(this.config.pollMs, signal);
-    }
+    return this.acquireSlotGroup({
+      dir: resolve(leaseBaseDir(), 'providers', slug(provider)),
+      capacity,
+      signal,
+      onWait,
+      waitMessage: `waiting for ${provider} provider slot`,
+      abortMessage: `Provider slot acquisition aborted for ${provider}.`,
+    });
   }
 
   private async acquireWriteSlot(
@@ -187,16 +184,53 @@ export class ExecutionScheduler {
     onWait?: (message: string) => void,
   ): Promise<() => Promise<void>> {
     const repoKey = slug(writeKey);
-    const writeDir = resolve(leaseBaseDir(), 'writes', repoKey);
-    await mkdir(writeDir, { recursive: true });
+    return this.acquireSlotGroup({
+      dir: resolve(leaseBaseDir(), 'writes', repoKey),
+      capacity: this.config.maxParallelWrites,
+      signal,
+      onWait,
+      waitMessage: 'waiting for write workspace slot',
+      abortMessage: `Write slot acquisition aborted for ${writeKey}.`,
+    });
+  }
+
+  private async acquireResourceSlot(
+    resource: string,
+    signal?: AbortSignal,
+    onWait?: (message: string) => void,
+  ): Promise<() => Promise<void>> {
+    const resourceKey = slug(resource);
+    const capacity = Math.max(
+      1,
+      this.config.resourceBudgets[resourceKey] ?? this.config.resourceBudgets[resource] ?? 2,
+    );
+    return this.acquireSlotGroup({
+      dir: resolve(leaseBaseDir(), 'resources', resourceKey),
+      capacity,
+      signal,
+      onWait,
+      waitMessage: `waiting for ${resourceKey} slot`,
+      abortMessage: `Resource slot acquisition aborted for ${resourceKey}.`,
+    });
+  }
+
+  private async acquireSlotGroup(input: {
+    dir: string;
+    capacity: number;
+    signal?: AbortSignal;
+    onWait?: (message: string) => void;
+    waitMessage: string;
+    abortMessage: string;
+  }): Promise<() => Promise<void>> {
+    await mkdir(input.dir, { recursive: true });
 
     while (true) {
-      if (signal?.aborted) {
-        throw new Error(`Write slot acquisition aborted for ${writeKey}.`);
+      if (input.signal?.aborted) {
+        throw new Error(input.abortMessage);
       }
 
-      for (let index = 0; index < this.config.maxParallelWrites; index += 1) {
-        const slotDir = resolve(writeDir, `slot-${index + 1}`);
+      for (let index = 0; index < input.capacity; index += 1) {
+        const slotDir = resolve(input.dir, `slot-${index + 1}`);
         try {
           await mkdir(slotDir);
           await writeLeaseMetadata(slotDir);
@@ -211,20 +245,25 @@ export class ExecutionScheduler {
         }
       }
 
-      onWait?.('waiting for write workspace slot');
-      await sleep(this.config.pollMs, signal);
+      input.onWait?.(input.waitMessage);
+      await sleep(this.config.pollMs, input.signal);
     }
   }
 }
 
 export const deriveExecutionSchedulerConfig = (input: {
   providerBudgets?: Record<string, number> | undefined;
+  resourceBudgets?: Record<string, number> | undefined;
   maxParallelWrites?: number | undefined;
   pollMs?: number | undefined;
 }): ExecutionSchedulerConfig => ({
   providerBudgets: {
     ...DEFAULT_PROVIDER_BUDGETS,
     ...(input.providerBudgets ?? {}),
+  },
+  resourceBudgets: {
+    ...DEFAULT_RESOURCE_BUDGETS,
+    ...(input.resourceBudgets ?? {}),
   },
   maxParallelWrites: Math.max(1, input.maxParallelWrites ?? 4),
   pollMs: Math.max(25, input.pollMs ?? 125),

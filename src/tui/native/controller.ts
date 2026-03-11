@@ -39,6 +39,7 @@ import { deriveContextProfile, type ContextProfile } from '../../core/context-pr
 import { DelegationRuntime, type DelegationPurpose } from '../../core/delegation.js';
 import { DEFAULT_SYSTEM_PROMPT } from '../../core/default-prompts.js';
 import { GitCheckpoint } from '../../core/git-checkpoint.js';
+import { ExecutionScheduler, type ExecutionSchedulerConfig } from '../../core/execution-scheduler.js';
 import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
@@ -80,9 +81,9 @@ import {
   type WorkflowArtifactPayload,
   type WorkflowStateSnapshot,
 } from '../../core/workflow-state.js';
-import type { WorkAllocationPlan } from '../../core/work-allocation.js';
+import { extractResearchSubjects, type WorkAllocationPlan } from '../../core/work-allocation.js';
 import { McpManager, type McpServerConfig, type McpTool } from '../../mcp/client.js';
-import type { ToolContext } from '../../tools/index.js';
+import type { AskUserAnswer, AskUserOption, AskUserPrompt, ToolContext, ToolResult } from '../../tools/index.js';
 import type { Tool, ToolParameter } from '../../tools/index.js';
 import { ToolRegistry } from '../../tools/registry.js';
 import { discoverToolboxTools } from '../../tools/toolbox.js';
@@ -105,6 +106,7 @@ import {
   formatAgentActivityHeartbeat,
   buildDelegationHookContext,
 } from './controller-support.js';
+import { buildChoicePrompt, buildInputPrompt } from './ask-user-support.js';
 import { RequestEngine } from './request-engine.js';
 import {
   classifyJennieAutoRoute,
@@ -113,6 +115,11 @@ import {
   shouldRunPlanningInterview,
   type AutoRouteDecision,
 } from './routing-coordinator.js';
+import {
+  formatResearchProgress,
+  ResearchRuntime,
+  type ResearchShardResult,
+} from './research-runtime.js';
 import {
   formatTeamAgentDetail,
   formatTeamAgentLabel,
@@ -169,7 +176,7 @@ type BackgroundJobState = BackgroundUiJobState;
 
 type EmitFn = (event: NativeBridgeEvent) => void;
 type AskUserResolver = {
-  resolve: (answer: string) => void;
+  resolve: (answer: AskUserAnswer) => void;
   reject: (error: Error) => void;
 };
 
@@ -188,6 +195,21 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
   'list_dir',
   'git_status',
   'git_diff',
+  'grep',
+  'glob',
+  'repo_map',
+  'symbol_search',
+  'definition_search',
+  'reference_search',
+  'reference_hotspots',
+  'changed_files',
+  'file_importance',
+  'codebase_search',
+  'docs_lookup',
+  'web_search',
+  'web_fetch',
+]);
+const SEARCH_RESOURCE_TOOL_NAMES = new Set([
   'grep',
   'glob',
   'repo_map',
@@ -920,6 +942,7 @@ export class NativeBridgeController {
   private readonly memoryPromotionFingerprints = new Set<string>();
   private readonly worktreeManager = new WorktreeManager(process.cwd());
   private readonly requestEngine = new RequestEngine();
+  private readonly researchRuntime = new ResearchRuntime();
   private readonly teamExecutionCoordinator = new TeamExecutionCoordinator();
   private readonly workflowStateStore = new WorkflowStateStore();
   private readonly teamRunIsolatedNotes: string[] = [];
@@ -1421,7 +1444,7 @@ export class NativeBridgeController {
         return;
       case '/help':
         this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
+          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /resume, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
         );
         return;
       case '/plan':
@@ -1474,6 +1497,9 @@ export class NativeBridgeController {
         return;
       case '/session':
         this.appendSystemMessage(await this.runSessionCommand(rest));
+        return;
+      case '/resume':
+        this.appendSystemMessage(await this.runResumeCommand(rest));
         return;
       case '/memory':
         this.appendSystemMessage(await this.runMemoryCommand(rest));
@@ -1548,10 +1574,15 @@ export class NativeBridgeController {
       this.permissionProfile === 'permissionless'
         ? this.lastSafePermissionProfile
         : 'permissionless';
-    void this.setPermissionProfile(nextProfile);
+    void (async () => {
+      const changed = await this.requestPermissionProfileChange(nextProfile, 'fire');
+      if (!changed) {
+        this.appendSystemMessage(`Permissions unchanged: ${this.permissionProfile}`);
+      }
+    })();
   }
 
-  public answerAskUser(answer: string): void {
+  public answerAskUser(answer: AskUserAnswer): void {
     const pending = this.pendingAskUser;
     if (!pending) {
       return;
@@ -1893,18 +1924,80 @@ export class NativeBridgeController {
     prompt: string,
     decision: AutoRouteDecision,
   ): Promise<{ prompt: string; artifact: WorkflowArtifact }> {
-    const done = await this.promptForInput(
-      'Before I split this up: what should count as done?',
-      ['smallest correct change', 'production-ready result', 'plan first, then execute'],
-    );
-    const constraints = await this.promptForInput(
-      'Any important constraints or things I should not break?',
-      ['keep the API stable', 'minimal diff', 'no UI changes', 'none'],
-    );
-    const optimizeFor = await this.promptForInput(
-      'What should I optimize for?',
-      ['speed', 'minimal diff', 'thoroughness'],
-    );
+    const done = await this.promptForQuestionValue(buildInputPrompt({
+      question: 'Before I split this up: what should count as done?',
+      detail: 'Set the finish line so I can scope the work correctly before execution.',
+      placeholder: 'Describe the outcome you want to ship',
+      submitLabel: 'Continue',
+      options: [
+        {
+          value: 'smallest correct change',
+          label: 'Smallest correct change',
+          description: 'Ship the minimum working result and stop there.',
+        },
+        {
+          value: 'production-ready result',
+          label: 'Production-ready',
+          description: 'Favor completeness, polish, and stronger guardrails.',
+        },
+        {
+          value: 'plan first, then execute',
+          label: 'Plan first',
+          description: 'Start with a short implementation plan before making changes.',
+        },
+      ],
+    }));
+    const constraints = await this.promptForQuestionValue(buildInputPrompt({
+      question: 'Any important constraints or things I should not break?',
+      detail: 'Call out compatibility, UX, infra, or repo boundaries before I start.',
+      placeholder: 'Type constraints, risks, or “none”',
+      submitLabel: 'Continue',
+      options: [
+        {
+          value: 'keep the API stable',
+          label: 'Keep API stable',
+          description: 'Avoid breaking existing interfaces or contracts.',
+        },
+        {
+          value: 'minimal diff',
+          label: 'Minimal diff',
+          description: 'Prefer the smallest patch that solves the problem.',
+        },
+        {
+          value: 'no UI changes',
+          label: 'No UI changes',
+          description: 'Limit work to behavior, logic, or backend-only changes.',
+        },
+        {
+          value: 'none',
+          label: 'No extra constraints',
+          description: 'Proceed with normal judgment and repo conventions.',
+        },
+      ],
+    }));
+    const optimizeFor = await this.promptForQuestionValue(buildInputPrompt({
+      question: 'What should I optimize for?',
+      detail: 'This decides whether I bias toward speed, minimal churn, or depth.',
+      placeholder: 'Type the tradeoff you care about most',
+      submitLabel: 'Start',
+      options: [
+        {
+          value: 'speed',
+          label: 'Speed',
+          description: 'Bias toward the fastest path to a working result.',
+        },
+        {
+          value: 'minimal diff',
+          label: 'Minimal diff',
+          description: 'Keep churn low and touch as little code as possible.',
+        },
+        {
+          value: 'thoroughness',
+          label: 'Thoroughness',
+          description: 'Spend more effort on coverage, edge cases, and polish.',
+        },
+      ],
+    }));
 
     const summary = [
       `Primary outcome: ${done || 'not specified'}`,
@@ -1953,6 +2046,10 @@ export class NativeBridgeController {
 
     const decision = this.classifyJennieAutoRoute(trimmedContent);
     if (decision.kind === 'direct') {
+      return false;
+    }
+
+    if (decision.executionClass === 'research_fast') {
       return false;
     }
 
@@ -2007,6 +2104,12 @@ export class NativeBridgeController {
     this.state.messages.push(userMessage);
 
     if (decision.kind === 'team') {
+      if (decision.executionClass === 'research_fast') {
+        await this.executeResearchFastRun(userMessage, decision, routedContent, {
+          routeNote: this.formatAutoRouteNotice(decision),
+        });
+        return true;
+      }
       await this.executeTeamRun(decision.strategy ?? 'parallel', routedContent, {
         routeNote: this.formatAutoRouteNotice(decision),
       });
@@ -2391,6 +2494,632 @@ export class NativeBridgeController {
     }
   }
 
+  private getResearchFastMode(decision: AutoRouteDecision): NamedMode {
+    if (decision.preferredMode) {
+      return decision.preferredMode;
+    }
+
+    const eligible = this.getTeamEligibleModes();
+    if (eligible.includes('rosé')) {
+      return 'rosé';
+    }
+
+    return eligible[0] ?? this.currentMode;
+  }
+
+  private normalizeAskUserOptions(options: AskUserOption[] | string[] | undefined): NativeAskUserState['options'] {
+    if (!Array.isArray(options)) {
+      return [];
+    }
+
+    const normalized: NativeAskUserState['options'] = [];
+    for (const option of options) {
+      if (typeof option === 'string') {
+        const value = option.trim();
+        if (!value) {
+          continue;
+        }
+        normalized.push({
+          value,
+          label: value,
+          description: null,
+          recommended: false,
+          danger: false,
+          shortcut: null,
+        });
+        continue;
+      }
+
+      if (typeof option !== 'object' || option === null) {
+        continue;
+      }
+
+      const value = typeof option.value === 'string' ? option.value.trim() : '';
+      const label = typeof option.label === 'string' ? option.label.trim() : value;
+      if (!value || !label) {
+        continue;
+      }
+      normalized.push({
+        value,
+        label,
+        description:
+          typeof option.description === 'string' && option.description.trim().length > 0
+            ? option.description.trim()
+            : null,
+        recommended: option.recommended === true,
+        danger: option.danger === true,
+        shortcut:
+          typeof option.shortcut === 'string' && option.shortcut.trim().length > 0
+            ? option.shortcut.trim()
+            : null,
+      });
+    }
+
+    return normalized;
+  }
+
+  private resolveDefaultAskUserOptionIndex(
+    options: NativeAskUserState['options'],
+    defaultValue: string | null,
+  ): number | null {
+    if (options.length === 0) {
+      return null;
+    }
+
+    if (defaultValue) {
+      const explicit = options.findIndex((option) => option.value === defaultValue);
+      if (explicit >= 0) {
+        return explicit;
+      }
+    }
+
+    const recommended = options.findIndex((option) => option.recommended);
+    if (recommended >= 0) {
+      return recommended;
+    }
+
+    return 0;
+  }
+
+  private buildAskUserState(input: string | AskUserPrompt, legacyOptions?: string[]): NativeAskUserState {
+    if (typeof input === 'string') {
+      const options = this.normalizeAskUserOptions(legacyOptions);
+      return {
+        question: input,
+        kind: 'input',
+        detail: null,
+        placeholder: null,
+        submitLabel: null,
+        allowCustomAnswer: true,
+        required: true,
+        defaultValue: null,
+        defaultOptionIndex: this.resolveDefaultAskUserOptionIndex(options, null),
+        validation: null,
+        options,
+      };
+    }
+
+    const options = this.normalizeAskUserOptions(input.options);
+    const kind = input.kind ?? (input.allowCustomAnswer === false ? 'single_select' : 'input');
+    const defaultValue =
+      typeof input.defaultValue === 'string' && input.defaultValue.trim().length > 0
+        ? input.defaultValue.trim()
+        : null;
+    return {
+      question: input.question.trim(),
+      kind,
+      detail: typeof input.detail === 'string' && input.detail.trim().length > 0 ? input.detail.trim() : null,
+      placeholder:
+        typeof input.placeholder === 'string' && input.placeholder.trim().length > 0
+          ? input.placeholder.trim()
+          : null,
+      submitLabel:
+        typeof input.submitLabel === 'string' && input.submitLabel.trim().length > 0
+          ? input.submitLabel.trim()
+          : null,
+      allowCustomAnswer: input.allowCustomAnswer !== false,
+      required: input.required !== false,
+      defaultValue,
+      defaultOptionIndex: this.resolveDefaultAskUserOptionIndex(options, defaultValue),
+      validation: input.validation
+        ? {
+          pattern:
+            typeof input.validation.pattern === 'string' && input.validation.pattern.trim().length > 0
+              ? input.validation.pattern.trim()
+              : null,
+          minLength:
+            typeof input.validation.minLength === 'number' && Number.isFinite(input.validation.minLength)
+              ? Math.max(0, Math.floor(input.validation.minLength))
+              : null,
+          maxLength:
+            typeof input.validation.maxLength === 'number' && Number.isFinite(input.validation.maxLength)
+              ? Math.max(0, Math.floor(input.validation.maxLength))
+              : null,
+          message:
+            typeof input.validation.message === 'string' && input.validation.message.trim().length > 0
+              ? input.validation.message.trim()
+              : null,
+        }
+        : null,
+      options,
+    };
+  }
+
+  private async promptUserQuestion(input: string | AskUserPrompt, legacyOptions?: string[]): Promise<AskUserAnswer> {
+    return await new Promise<AskUserAnswer>((resolve, reject) => {
+      this.pendingAskUser = { resolve, reject };
+      this.state.askUser = this.buildAskUserState(input, legacyOptions);
+      this.scheduleStatePush();
+    });
+  }
+
+  private async promptUserQuestionValue(input: string | AskUserPrompt, legacyOptions?: string[]): Promise<string> {
+    const answer = await this.promptUserQuestion(input, legacyOptions);
+    return answer.value;
+  }
+
+  private getExecutionSchedulerConfig(): Partial<ExecutionSchedulerConfig> {
+    return {
+      providerBudgets: this.config?.agent.provider_budgets,
+      resourceBudgets: this.config?.agent.resource_budgets,
+      maxParallelWrites: this.config?.agent.max_parallel_writes,
+      pollMs: this.config?.agent.scheduler_poll_ms,
+    };
+  }
+
+  private createExecutionScheduler(): ExecutionScheduler {
+    return new ExecutionScheduler(this.getExecutionSchedulerConfig());
+  }
+
+  private getToolExecutionResource(name: string): string | null {
+    return SEARCH_RESOURCE_TOOL_NAMES.has(normalizeToolName(name)) ? 'search' : null;
+  }
+
+  private async runWithExecutionLease<T>(input: {
+    provider?: string | null;
+    resource?: string | null;
+    writeKey?: string | null;
+    signal?: AbortSignal;
+    onWait?: (message: string) => void;
+    operation: () => Promise<T>;
+  }): Promise<T> {
+    const needsLease = Boolean(input.provider || input.resource || input.writeKey);
+    if (!needsLease) {
+      return input.operation();
+    }
+
+    const lease = await this.createExecutionScheduler().acquire({
+      provider: input.provider,
+      resource: input.resource,
+      writeKey: input.writeKey,
+      signal: input.signal,
+      onWait: input.onWait,
+    });
+    try {
+      return await input.operation();
+    } finally {
+      await lease.release();
+    }
+  }
+
+  private buildLightweightToolContext(
+    signal: AbortSignal,
+    options: {
+      onProgress?: (text: string) => void;
+      onAgentActivity?: ToolContext['onAgentActivity'];
+    } = {},
+  ): ToolContext {
+    return {
+      cwd: process.cwd(),
+      abortSignal: signal,
+      onProgress: options.onProgress,
+      onAgentActivity: options.onAgentActivity,
+      sessionId: this.state.sessionId ?? undefined,
+      currentMode: this.currentMode,
+      permissionProfile: this.permissionProfile,
+      setPermissionProfile: async (profile): Promise<void> => {
+        await this.setPermissionProfile(profile);
+      },
+        askUser: (input: string | AskUserPrompt, choices?: string[]): Promise<AskUserAnswer> =>
+          this.promptUserQuestion(input, choices),
+      lsp: this.lspManager,
+    };
+  }
+
+  private async executeLightweightTool(
+    name: string,
+    args: Record<string, unknown>,
+    signal: AbortSignal,
+    options: {
+      onProgress?: (text: string) => void;
+      onAgentActivity?: ToolContext['onAgentActivity'];
+    } = {},
+  ): Promise<ToolResult> {
+    const tool = this.toolRegistry?.get(name);
+    if (!tool) {
+      return {
+        output: `Unknown tool: ${name}`,
+        isError: true,
+      };
+    }
+
+    const toolContext = this.buildLightweightToolContext(signal, options);
+    const authorization = await this.authorizeToolExecution(
+      {
+        id: randomUUID(),
+        name,
+        input: args,
+      },
+      toolContext,
+    );
+    if (!authorization.allowed) {
+      return {
+        output: authorization.reason ?? `Blocked ${name}.`,
+        isError: true,
+      };
+    }
+
+    try {
+      await this.hookRegistry.emit('beforeToolCall', {
+        tool: name,
+        input: args,
+        sessionId: this.state.sessionId,
+      });
+      const result = await this.runWithExecutionLease({
+        resource: this.getToolExecutionResource(name),
+        signal,
+        onWait: options.onProgress,
+        operation: () => tool.execute(args, toolContext),
+      });
+      await this.hookRegistry.emit('afterToolCall', {
+        tool: name,
+        input: args,
+        output: result.output,
+        isError: result.isError ?? false,
+        sessionId: this.state.sessionId,
+      });
+      return result;
+    } catch (error: unknown) {
+      const message = serializeError(error);
+      await this.hookRegistry.emit('onError', {
+        tool: name,
+        input: args,
+        error: message,
+        sessionId: this.state.sessionId,
+      });
+      return {
+        output: message,
+        isError: true,
+      };
+    }
+  }
+
+  private buildResearchSynthesisPrompt(
+    task: string,
+    shards: ResearchShardResult[],
+  ): string {
+    const shardSections = shards.map((shard, index) => {
+      const parts = [
+        `subject: ${shard.subject}`,
+        `query: ${shard.query}`,
+        shard.localDocs ? `local_docs:\n${previewText(shard.localDocs, 1_200)}` : null,
+        shard.webSearch ? `web_search:\n${previewText(shard.webSearch, 1_200)}` : null,
+        shard.fetchedSource ? `fetched_source:\n${previewText(shard.fetchedSource, 1_600)}` : null,
+        shard.error ? `error: ${shard.error}` : null,
+      ].filter((part): part is string => Boolean(part));
+      return [`[shard ${index + 1}]`, ...parts].join('\n');
+    });
+
+    return [
+      `User task: ${task}`,
+      '',
+      'Synthesize the shard evidence into a concise answer.',
+      'Use only the provided evidence.',
+      'If evidence is missing or ambiguous, say so explicitly.',
+      'Prefer a compact comparison table or bullet comparison when the task is comparative.',
+      '',
+      '<research_shards>',
+      shardSections.join('\n\n'),
+      '</research_shards>',
+    ].join('\n');
+  }
+
+  private async synthesizeResearchFast(
+    task: string,
+    shards: ResearchShardResult[],
+    mode: NamedMode,
+    signal: AbortSignal,
+    assistantMessageId: string,
+  ): Promise<{ text: string; provider: string; model: string; inputTokens: number; outputTokens: number }> {
+    const runtime = this.getResolvedModeRuntime(mode);
+    const auth = this.availableProviders.get(runtime.provider);
+    if (!auth) {
+      return {
+        text: formatResearchProgress({
+          task,
+          completed: shards.length,
+          total: shards.length,
+          running: [],
+          shards,
+        }),
+        provider: runtime.provider,
+        model: runtime.model,
+        inputTokens: 0,
+        outputTokens: 0,
+      };
+    }
+
+    const client = createClient(runtime.provider, auth.token, auth.tokenType);
+    const messages: ApiMessage[] = [{
+      role: 'user',
+      content: this.buildResearchSynthesisPrompt(task, shards),
+    }];
+    const systemPrompt = [
+      'You are synthesizing parallel research shards for ddudu.',
+      'Use only the supplied evidence.',
+      'Do not claim searches, code inspection, or verification beyond what the shard evidence shows.',
+      'Return the clearest concise answer for the user task, and call out uncertainty where needed.',
+    ].join('\n');
+
+    let fullText = '';
+    let inputTokens = 0;
+    let outputTokens = 0;
+
+    await this.hookRegistry.emit('beforeApiCall', {
+      provider: runtime.provider,
+      model: runtime.model,
+      mode,
+      sessionId: this.state.sessionId,
+      prompt: task,
+      cwd: process.cwd(),
+    });
+    try {
+      for await (const event of client.stream(messages, {
+        systemPrompt,
+        model: runtime.model,
+        maxTokens: this.config ? getMaxTokens(this.config) : undefined,
+        signal,
+        cwd: process.cwd(),
+      })) {
+        if (signal.aborted) {
+          break;
+        }
+
+        if (event.type === 'text') {
+          fullText += event.text ?? '';
+          this.updateMessage(assistantMessageId, fullText);
+          continue;
+        }
+
+        if (event.type === 'done') {
+          fullText = event.fullText ?? fullText;
+          inputTokens = event.usage?.input ?? 0;
+          outputTokens = event.usage?.output ?? 0;
+          break;
+        }
+
+        if (event.type === 'error') {
+          throw event.error ?? new Error('Research synthesis failed.');
+        }
+      }
+      await this.hookRegistry.emit('afterApiCall', {
+        provider: runtime.provider,
+        model: runtime.model,
+        mode,
+        sessionId: this.state.sessionId,
+        inputTokens,
+        outputTokens,
+        done: true,
+      });
+    } catch (error: unknown) {
+      await this.hookRegistry.emit('afterApiCall', {
+        provider: runtime.provider,
+        model: runtime.model,
+        mode,
+        sessionId: this.state.sessionId,
+        error: serializeError(error),
+      });
+      throw error;
+    }
+
+    return {
+      text: fullText.trim() || formatResearchProgress({
+        task,
+        completed: shards.length,
+        total: shards.length,
+        running: [],
+        shards,
+      }),
+      provider: runtime.provider,
+      model: runtime.model,
+      inputTokens,
+      outputTokens,
+    };
+  }
+
+  private async executeResearchFastRun(
+    userMessage: NativeMessageState,
+    decision: AutoRouteDecision,
+    executionPrompt: string = userMessage.content,
+    options: { routeNote?: string } = {},
+  ): Promise<string> {
+    this.resetEphemeralAgentActivities();
+    const subjects = extractResearchSubjects(executionPrompt);
+    if (subjects.length < 2) {
+      return this.executeTeamRun(decision.strategy ?? 'parallel', executionPrompt, options);
+    }
+
+    const assistantMessageId = randomUUID();
+    this.state.messages.push({
+      id: assistantMessageId,
+      role: 'assistant',
+      content: options.routeNote
+        ? `${options.routeNote}\n\nParallel research · 0/${subjects.length} complete`
+        : `Parallel research · 0/${subjects.length} complete`,
+      timestamp: Date.now(),
+      isStreaming: true,
+    });
+    this.state.loading = true;
+    this.state.loadingLabel = `research · ${subjects.length} shards`;
+    this.state.loadingSince = Date.now();
+    this.state.requestEstimate = null;
+    this.activeAssistantMessageId = assistantMessageId;
+    this.activeOperation = 'team';
+    this.teamRunSince = Date.now();
+    this.teamRunStrategy = 'parallel';
+    this.teamRunTask = executionPrompt;
+    this.syncTeamRunState();
+    this.scheduleStatePush();
+
+    const controller = new AbortController();
+    this.abortController = controller;
+    const completedShards: ResearchShardResult[] = [];
+    const runningSubjects = new Set(subjects);
+    const synthesisActivityId = `research:${assistantMessageId}:synth`;
+
+    try {
+      const result = await this.researchRuntime.run(
+        {
+          task: executionPrompt,
+          subjects,
+          includeLocalDocs: !this.isLikelyExternalResearchPrompt(executionPrompt),
+          maxConcurrency: Math.min(subjects.length, 4),
+          runTool: (name, args) => this.executeLightweightTool(name, args, controller.signal),
+          synthesize: async ({ task, shards }) => {
+            this.updateAgentActivity({
+              id: synthesisActivityId,
+              label: HARNESS_MODES[this.getResearchFastMode(decision)].label,
+              status: 'running',
+              mode: this.getResearchFastMode(decision),
+              purpose: 'research',
+              detail: 'synthesizing shard results',
+            });
+            this.state.loadingLabel = 'research · synthesizing';
+            this.scheduleStatePush();
+            const synthesis = await this.synthesizeResearchFast(
+              task,
+              shards,
+              this.getResearchFastMode(decision),
+              controller.signal,
+              assistantMessageId,
+            );
+            await this.hookRegistry.emit('afterResponse', {
+              provider: synthesis.provider,
+              model: synthesis.model,
+              sessionId: this.state.sessionId,
+              remoteSessionId: null,
+              requestMode: 'full',
+              inputTokens: synthesis.inputTokens,
+              outputTokens: synthesis.outputTokens,
+            });
+            return synthesis.text;
+          },
+        },
+        {
+          signal: controller.signal,
+          onAgentActivity: (activity) => {
+            if (activity.status === 'done' || activity.status === 'error') {
+              runningSubjects.delete(activity.label);
+            } else if (activity.status === 'running' || activity.status === 'queued') {
+              runningSubjects.add(activity.label);
+            }
+            this.updateAgentActivity({
+              id: activity.id,
+              label: activity.label,
+              status: activity.status,
+              mode: null,
+              purpose: activity.purpose ?? 'research',
+              detail: activity.detail ?? null,
+            });
+          },
+          onShardComplete: (shard, completed, total) => {
+            completedShards.push(shard);
+            this.state.loadingLabel = `research · ${completed}/${total}`;
+            this.updateMessage(
+              assistantMessageId,
+              formatResearchProgress({
+                task: executionPrompt,
+                completed,
+                total,
+                running: Array.from(runningSubjects).sort(),
+                shards: completedShards,
+              }),
+            );
+            this.scheduleStatePush();
+          },
+        },
+      );
+
+      this.finishMessage(assistantMessageId, result.output);
+      this.rememberSessionArtifact('research', result.output, userMessage.content);
+      this.updateAgentActivity({
+        id: synthesisActivityId,
+        label: HARNESS_MODES[this.getResearchFastMode(decision)].label,
+        status: 'done',
+        mode: this.getResearchFastMode(decision),
+        purpose: 'research',
+        detail: `${subjects.length} shards synthesized`,
+      });
+
+      if (this.sessionManager && this.state.sessionId) {
+        await this.sessionManager.append(this.state.sessionId, {
+          type: 'message',
+          timestamp: new Date().toISOString(),
+          data: {
+            user: userMessage.content,
+            assistant: result.output,
+            mode: this.getResearchFastMode(decision),
+            requestMode: 'research_fast',
+            teamStrategy: 'parallel',
+            researchSubjects: subjects,
+            shardCount: result.shards.length,
+            autoRoute: decision.reason,
+          },
+        });
+      }
+      this.teamLastSummary = `research_fast · ok · ${result.shards.length} shards`;
+      return `Research run finished · ${this.teamLastSummary}`;
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) {
+        const message = `Research run failed: ${serializeError(error)}`;
+        this.updateAgentActivity({
+          id: synthesisActivityId,
+          label: HARNESS_MODES[this.getResearchFastMode(decision)].label,
+          status: 'error',
+          mode: this.getResearchFastMode(decision),
+          purpose: 'research',
+          detail: serializeError(error),
+        });
+        await this.hookRegistry.emit('onError', {
+          provider: this.getCurrentProvider(),
+          model: this.getCurrentModel(),
+          sessionId: this.state.sessionId,
+          operation: 'research_fast',
+          message: serializeError(error),
+        });
+        this.finishMessage(assistantMessageId, message);
+        return message;
+      } else {
+        this.finishMessage(assistantMessageId, '[request aborted]');
+        this.teamLastSummary = 'research_fast · aborted';
+        return 'Research run aborted.';
+      }
+    } finally {
+      this.state.loading = false;
+      this.state.loadingLabel = '';
+      this.state.loadingSince = null;
+      this.state.requestEstimate = null;
+      this.abortController = null;
+      this.activeAssistantMessageId = null;
+      this.activeOperation = null;
+      this.teamRunSince = null;
+      this.teamRunStrategy = null;
+      this.teamRunTask = null;
+      this.syncTeamRunState();
+      this.scheduleStatePush();
+    }
+  }
+
   private async consumeStream(
     stream: AsyncGenerator<StreamEvent>,
     context: {
@@ -2685,16 +3414,39 @@ export class NativeBridgeController {
 
     if (policy === 'ask' || trustBoundary.requiresApproval || shouldPromptForRisk(this.permissionProfile, risk)) {
       const summary = summarizeToolInput(block.name, input);
-      const detail = trustBoundary.detail ? ` · ${trustBoundary.detail}` : '';
+      const detailParts = [
+        `Risk: ${formatRiskConcerns(risk)}`,
+        trustBoundary.detail ? `Trust boundary: ${trustBoundary.detail}` : null,
+        `Permission profile: ${this.permissionProfile}`,
+      ].filter((part): part is string => Boolean(part));
       const answer = toolContext.askUser
         ? await toolContext.askUser(
-          `Allow ${summary}? (${formatRiskConcerns(risk)}${detail})`,
-          ['Allow once', `Deny (${this.permissionProfile})`],
+          buildChoicePrompt({
+            question: `Allow ${summary}?`,
+            kind: 'confirm',
+            detail: detailParts.join('\n'),
+            submitLabel: 'Resolve tool request',
+            defaultValue: 'deny',
+            options: [
+              {
+                value: 'allow_once',
+                label: 'Allow once',
+                description: 'Run this tool call for the current request only.',
+              },
+              {
+                value: 'deny',
+                label: `Deny (${this.permissionProfile})`,
+                description: 'Block this tool call and keep the current guardrails.',
+                recommended: true,
+                danger: true,
+              },
+            ],
+          }),
         )
-        : 'Deny';
+        : { value: 'deny', source: 'default' as const };
 
       return {
-        allowed: answer.toLowerCase().includes('allow'),
+        allowed: answer.value === 'allow_once',
         reason: `Denied ${block.name}: approval was not granted.`,
       };
     }
@@ -2849,16 +3601,8 @@ export class NativeBridgeController {
             await this.clearPlan();
           },
         },
-        askUser: (question: string, options?: string[]): Promise<string> => {
-          return new Promise<string>((resolve, reject) => {
-            this.pendingAskUser = { resolve, reject };
-            this.state.askUser = {
-              question,
-              options: options ?? [],
-            };
-            this.scheduleStatePush();
-          });
-        },
+        askUser: (input: string | AskUserPrompt, options?: string[]): Promise<AskUserAnswer> =>
+          this.promptUserQuestion(input, options),
         onProgress: (text: string): void => {
           progress += text;
           lastVisibleToolUpdateAt = Date.now();
@@ -2965,7 +3709,20 @@ export class NativeBridgeController {
           input: block.input,
           sessionId: this.state.sessionId,
         });
-        const result = await tool.execute(block.input, toolContext);
+        const result = await this.runWithExecutionLease({
+          resource: this.getToolExecutionResource(block.name),
+          signal: context.signal,
+          onWait: (message) => {
+            syncSyntheticActivity('running', message);
+            this.setToolStatus(
+              context.assistantMessageId,
+              block.id,
+              'running',
+              summarizeToolResult(message),
+            );
+          },
+          operation: () => tool.execute(block.input, toolContext),
+        });
         let workspacePath: string | null = null;
         if (result.metadata && typeof result.metadata === 'object') {
           const metadata = result.metadata as Record<string, unknown>;
@@ -3198,6 +3955,46 @@ export class NativeBridgeController {
     await this.refreshSystemPrompt();
     this.scheduleStatePush();
     void this.persistWorkflowState('permission_profile');
+  }
+
+  private async requestPermissionProfileChange(
+    nextProfile: PermissionProfile,
+    source: 'fire' | 'permissions',
+  ): Promise<boolean> {
+    if (nextProfile !== 'permissionless' || this.permissionProfile === 'permissionless') {
+      await this.setPermissionProfile(nextProfile);
+      return true;
+    }
+
+    const answer = await this.promptForQuestion(buildChoicePrompt({
+      question: 'Switch to permissionless mode?',
+      kind: 'confirm',
+      detail:
+        'This disables normal tool approval prompts for the current session. Hard-blocked shell commands still stay blocked.',
+      submitLabel: 'Apply permission mode',
+      defaultValue: 'cancel',
+      options: [
+        {
+          value: 'permissionless',
+          label: 'Enable permissionless',
+          description: 'Run tools without per-action approval until you switch back.',
+          danger: true,
+        },
+        {
+          value: 'cancel',
+          label: source === 'fire' ? 'Keep current mode' : `Keep ${this.permissionProfile}`,
+          description: 'Stay on the current guardrails and do not change permissions.',
+          recommended: true,
+        },
+      ],
+    }));
+
+    if (answer.value !== 'permissionless') {
+      return false;
+    }
+
+    await this.setPermissionProfile(nextProfile);
+    return true;
   }
 
   private formatPlanSummary(): string {
@@ -3587,11 +4384,7 @@ export class NativeBridgeController {
       availableProviders: this.availableProviders,
       sessionManager: this.sessionManager,
       worktreeManager: this.worktreeManager,
-      executionSchedulerConfig: {
-        providerBudgets: this.config?.agent.provider_budgets,
-        maxParallelWrites: this.config?.agent.max_parallel_writes,
-        pollMs: this.config?.agent.scheduler_poll_ms,
-      },
+      executionSchedulerConfig: this.getExecutionSchedulerConfig(),
       resolveModel: (mode: NamedMode): string => this.getResolvedModeRuntime(mode).model,
     });
   }
@@ -3770,22 +4563,8 @@ export class NativeBridgeController {
     return sessions.find((session) => session.id === reference || session.id.startsWith(reference)) ?? null;
   }
 
-  private async promptForChoice(question: string, options: string[]): Promise<string> {
-    return await new Promise<string>((resolve) => {
-      this.pendingAskUser = {
-        resolve,
-        reject: () => undefined,
-      };
-      this.state.askUser = {
-        question,
-        options,
-      };
-      this.scheduleStatePush();
-    });
-  }
-
-  private async promptForInput(question: string, options: string[] = []): Promise<string> {
-    return this.promptForChoice(question, options);
+  private async promptForQuestion(prompt: AskUserPrompt): Promise<AskUserAnswer> {
+    return this.promptUserQuestion(prompt);
   }
 
   private async resumeSessionById(sessionId: string): Promise<void> {
@@ -3845,10 +4624,25 @@ export class NativeBridgeController {
         return 'No saved sessions yet.';
       }
 
-      const options = sessions.slice(0, 12).map((session) => this.formatSessionListItem(session));
-      const answer = await this.promptForChoice('Choose a session to resume', options);
-      const selectedIndex = options.indexOf(answer);
-      const selected = selectedIndex >= 0 ? sessions[selectedIndex] : null;
+      const answer = await this.promptForQuestionValue(buildInputPrompt({
+        question: 'Which session do you want to resume?',
+        detail: 'Pick a recent session or type an index / session id prefix.',
+        placeholder: 'Type a session number or id prefix',
+        submitLabel: 'Resume session',
+        options: sessions.slice(0, 12).map((session, index) => ({
+          value: String(index + 1),
+          label: `${index + 1}. ${this.formatSessionTitle(session)}`,
+          description: [
+            [session.mode, session.provider, session.model]
+              .filter((part): part is string => Boolean(part))
+              .join(' · ') || null,
+            `${session.entryCount} entries`,
+            session.updatedAt.replace('T', ' ').replace(/\.\d+Z$/, 'Z'),
+            `#${session.id.slice(0, 8)}`,
+          ].filter((part): part is string => Boolean(part)).join(' · '),
+        })),
+      }));
+      const selected = this.resolveSessionReference(sessions, answer);
       if (!selected) {
         return 'Session selection cancelled.';
       }
@@ -3872,6 +4666,17 @@ export class NativeBridgeController {
     }
 
     return 'Usage: /session [list|last|pick|resume <id|index>]';
+  }
+
+  private async runResumeCommand(args: string[]): Promise<string> {
+    const reference = args[0]?.trim().toLowerCase() ?? '';
+    if (!reference || reference === 'last') {
+      return this.runSessionCommand(['last']);
+    }
+    if (reference === 'pick') {
+      return this.runSessionCommand(['pick']);
+    }
+    return this.runSessionCommand(['resume', args[0] ?? '']);
   }
 
   private async runMemoryCommand(args: string[]): Promise<string> {
@@ -5364,7 +6169,10 @@ export class NativeBridgeController {
       cwd,
     });
 
-    const summary = await new VerificationRunner(cwd).run(mode);
+    const summary = await this.runWithExecutionLease({
+      resource: 'verification',
+      operation: () => new VerificationRunner(cwd).run(mode),
+    });
     this.setVerificationState({
       status: summary.status,
       summary: summary.summary,
@@ -5583,7 +6391,10 @@ export class NativeBridgeController {
       return 'Usage: /permissions <plan|ask|workspace-write|permissionless>';
     }
 
-    await this.setPermissionProfile(nextProfile);
+    const changed = await this.requestPermissionProfileChange(nextProfile, 'permissions');
+    if (!changed) {
+      return `Permissions unchanged: ${this.permissionProfile}`;
+    }
     return `Permissions updated: ${nextProfile}`;
   }
 
@@ -6415,6 +7226,20 @@ export class NativeBridgeController {
     return this.createDelegationRuntime().listAvailableModes();
   }
 
+  private classifyExplicitTeamExecution(
+    task: string,
+    strategy: 'parallel' | 'sequential' | 'delegate',
+  ): AutoRouteDecision {
+    const decision = this.classifyJennieAutoRoute(task);
+    if (strategy !== 'parallel') {
+      return {
+        ...decision,
+        executionClass: 'managed',
+      };
+    }
+    return decision;
+  }
+
   private async runTeamCommand(args: string[]): Promise<string> {
     if (args.length === 0 || args[0] === 'status') {
       return this.formatTeamSummary();
@@ -6456,6 +7281,26 @@ export class NativeBridgeController {
     if (this.state.loading || this.abortController) {
       return 'Team run unavailable while another request is active.';
     }
+
+    const decision = this.classifyExplicitTeamExecution(task, strategy);
+    if (decision.executionClass === 'research_fast') {
+      return this.executeResearchFastRun(
+        {
+          id: randomUUID(),
+          role: 'user',
+          content: task,
+          timestamp: Date.now(),
+        },
+        {
+          ...decision,
+          kind: 'team',
+          strategy,
+        },
+        task,
+        options,
+      );
+    }
+
     this.resetEphemeralAgentActivities();
 
     const teamPlan = this.createTeamExecutionPlan(task, strategy);
@@ -7180,7 +8025,13 @@ export class NativeBridgeController {
       todos: this.state.todos.map((item) => ({ ...item })),
       backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
       artifacts: this.state.artifacts.map((artifact) => ({ ...artifact })),
-      askUser: this.state.askUser ? { ...this.state.askUser, options: [...this.state.askUser.options] } : null,
+      askUser: this.state.askUser
+        ? {
+            ...this.state.askUser,
+            validation: this.state.askUser.validation ? { ...this.state.askUser.validation } : null,
+            options: this.state.askUser.options.map((option) => ({ ...option })),
+          }
+        : null,
     };
 
     const serialized = JSON.stringify(nextState);

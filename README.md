@@ -182,7 +182,11 @@ After login, ddudu rechecks local credentials and shows how the current four-mod
 
 ddudu keeps one canonical session and layers provider-specific sessions on top of it.
 
+By default, ddudu stores sessions and operator settings in `~/.ddudu/` so the experience follows you across repositories.
+Project-local `.ddudu/config.yaml` remains available as an explicit override layer when a repo really needs different policy.
+
 - `session list`, `session last`, and `session resume <id>` reopen saved sessions
+- `resume`, `/resume`, and `/session resume` are all supported aliases for reopening saved work
 - `session pick` opens an interactive saved-session picker with Arrow-key selection
 - provider runtimes keep remote session IDs so the harness can `resume` or `hydrate` when context advances
 - delegated execution can spin up isolated git worktrees instead of sharing the parent working tree
@@ -201,10 +205,14 @@ ddudu auth            # show detected auth
 ddudu init            # initialize .ddudu/ in current project
 ddudu doctor          # basic environment check
 ddudu config show     # print merged config
+ddudu config set tools.permission ask      # write global config by default
+ddudu config set --project tools.permission ask  # write a project override
 ddudu session list    # list saved sessions
 ddudu session pick    # choose a saved session interactively
 ddudu session last    # reopen the most recent saved session
 ddudu session resume <id>  # reopen a saved session in the native TUI
+ddudu resume          # quick alias for the latest saved session
+ddudu resume <id>     # quick alias for reopening a specific session
 ```
 
 ## Benchmarks
@@ -238,6 +246,7 @@ The current repository includes early benchmark scaffolding, but the task packs 
 | `/permissions`    | change the active permission profile or configure per-tool, network, and secret trust policies |
 | `/memory`         | read, write, append, or clear scoped memory                                                    |
 | `/session`        | list sessions or resume a saved session                                                        |
+| `/resume`         | quick alias for resuming the last or a specific saved session                                  |
 | `/config`         | show runtime config summary                                                                    |
 | `/help`           | show available commands                                                                        |
 | `/doctor`         | show runtime health and context info                                                           |

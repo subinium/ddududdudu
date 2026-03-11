@@ -18,6 +18,44 @@ export interface ToolDefinition {
   parameters: Record<string, ToolParameter>;
 }
 
+export interface AskUserOption {
+  value: string;
+  label?: string;
+  description?: string;
+  recommended?: boolean;
+  danger?: boolean;
+  shortcut?: string;
+}
+
+export type AskUserQuestionKind = 'input' | 'confirm' | 'single_select' | 'number' | 'path';
+
+export interface AskUserValidation {
+  pattern?: string;
+  minLength?: number;
+  maxLength?: number;
+  message?: string;
+}
+
+export interface AskUserPrompt {
+  question: string;
+  kind?: AskUserQuestionKind;
+  detail?: string;
+  placeholder?: string;
+  submitLabel?: string;
+  allowCustomAnswer?: boolean;
+  required?: boolean;
+  defaultValue?: string;
+  validation?: AskUserValidation;
+  options?: AskUserOption[];
+}
+
+export interface AskUserAnswer {
+  value: string;
+  source: 'choice' | 'custom' | 'default';
+  optionIndex?: number;
+  optionLabel?: string;
+}
+
 export interface ToolContext {
   cwd: string;
   abortSignal?: AbortSignal;
@@ -34,7 +72,7 @@ export interface ToolContext {
   contextSnapshot?: (prompt: string, purpose?: string) => Promise<string>;
   artifacts?: (purpose?: string, limit?: number) => WorkflowArtifact[];
   lsp?: LspManager;
-  askUser?: (question: string, options?: string[]) => Promise<string>;
+  askUser?: (input: string | AskUserPrompt, options?: string[]) => Promise<AskUserAnswer>;
   authToken?: string;
   authBaseUrl?: string;
   delegation?: DelegationRuntime;

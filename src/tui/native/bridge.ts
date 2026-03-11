@@ -72,8 +72,22 @@ const parseCommand = (line: string): NativeBridgeCommand | null => {
     case 'set_model':
       return typeof parsed.model === 'string' ? { type: 'set_model', model: parsed.model } : null;
     case 'answer_ask_user':
-      return typeof parsed.answer === 'string'
-        ? { type: 'answer_ask_user', answer: parsed.answer }
+      return typeof parsed.answer === 'object'
+        && parsed.answer !== null
+        && typeof parsed.answer.value === 'string'
+        && (parsed.answer.source === 'choice' || parsed.answer.source === 'custom' || parsed.answer.source === 'default')
+        ? {
+          type: 'answer_ask_user',
+          answer: {
+            value: parsed.answer.value,
+            source: parsed.answer.source,
+            optionIndex:
+              typeof parsed.answer.optionIndex === 'number' && Number.isFinite(parsed.answer.optionIndex)
+                ? parsed.answer.optionIndex
+                : null,
+            optionLabel: typeof parsed.answer.optionLabel === 'string' ? parsed.answer.optionLabel : null,
+          },
+        }
         : null;
     case 'cycle_mode':
       return parsed.direction === -1 ? { type: 'cycle_mode', direction: -1 } : { type: 'cycle_mode', direction: 1 };

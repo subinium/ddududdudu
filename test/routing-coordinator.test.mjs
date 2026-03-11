@@ -8,14 +8,14 @@ import {
   shouldRunPlanningInterview,
 } from '../dist/tui/native/routing-coordinator.js';
 
-test('classifyJennieAutoRoute returns team routing for mixed planning and execution work', () => {
+test('classifyJennieAutoRoute prefers delegate routing for mixed planning and execution work', () => {
   const decision = classifyJennieAutoRoute(
     'Plan the refactor, inspect the codebase, and implement the runtime fallback fix across the repo',
     ['jennie', 'lisa', 'rosé', 'jisoo'],
   );
 
-  assert.equal(decision.kind, 'team');
-  assert.ok(decision.strategy === 'parallel' || decision.strategy === 'delegate');
+  assert.equal(decision.kind, 'delegate');
+  assert.equal(decision.purpose, 'planning');
 });
 
 test('formatAutoRouteNotice renders delegate and team summaries', () => {
@@ -49,12 +49,22 @@ test('shouldRunPlanningInterview stays off for small direct work and on for ambi
   );
 
   assert.equal(
-    shouldRunPlanningInterview('Refactor the runtime and make it production ready', {
+    shouldRunPlanningInterview('Break this across the repo, inspect the codebase, research the constraints, implement the runtime fix, and review the result before landing it', {
       kind: 'team',
       reason: 'multi-domain request',
       strategy: 'delegate',
     }),
     true,
+  );
+
+  assert.equal(
+    shouldRunPlanningInterview('Implement the runtime fallback fix across the repo with the smallest safe diff', {
+      kind: 'delegate',
+      reason: 'execution should start from the smallest executable unit',
+      purpose: 'execution',
+      preferredMode: 'lisa',
+    }),
+    false,
   );
 });
 
@@ -78,6 +88,8 @@ test('itemized research routes to a parallel team with one worker per subject', 
 
   assert.equal(decision.kind, 'team');
   assert.equal(decision.strategy, 'parallel');
+  assert.equal(decision.executionClass, 'research_fast');
+  assert.equal(shouldRunPlanningInterview('omo/omc/omx를 리서치해줘', decision), false);
 
   const draft = createTeamExecutionPlanDraft(
     'omo/omc/omx를 리서치해줘',

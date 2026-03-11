@@ -35,11 +35,14 @@ At any time, the operator should be able to tell:
 - what is running
 - what is queued
 - what is blocked
+- what resource is the bottleneck when work is waiting
 - what already completed
 - which worker owns which task
 - whether verification has passed
 - whether the harness is waiting on policy or user input
-- which option the harness is asking the user to choose from
+- which kind of answer the harness is asking for
+- which option is selected or recommended by default
+- whether custom input is allowed and why an answer was rejected
 
 If these are unclear, trust collapses even when the underlying system is technically correct.
 
@@ -99,6 +102,7 @@ Examples:
 - raw provider notes
 - long tool histories
 - full injected context dumps
+- repeated persona or model trivia
 - full diffs unless requested
 
 This hierarchy is not cosmetic.
@@ -110,9 +114,29 @@ Different UI regions should carry different classes of information:
 
 - the main transcript should show user-visible answers and high-level progress
 - the side rail should show run status, todos, worker ownership, detached jobs, queue, context, and systems
-- the composer should surface ask-user choices directly instead of hiding them behind a generic prompt
+- the composer should surface typed ask-user questions directly instead of hiding them behind a generic prompt
 
 When these roles blur together, operators lose confidence even if the model is technically still working.
+
+## Ask-User Surface
+
+Interactive questions are part of the control plane too.
+
+A useful ask-user surface should make these visible without forcing the operator to infer them:
+
+- question kind such as confirm, single-select, input, number, or path
+- whether the answer is required
+- default answer or default choice
+- recommended or dangerous options
+- validation expectations
+- whether the submitted answer came from a picked choice or free-form text
+
+This matters most for:
+
+- permission prompts
+- destructive confirmations
+- session and resume pickers
+- clarifying implementation tradeoffs during a run
 
 ## Progress Model
 
@@ -135,11 +159,24 @@ That structure is significantly more trustworthy than generic activity indicator
 - heartbeat summaries when long-running work goes quiet
 - detached job state
 - queue visibility
-- visible ask-user options in the composer
+- typed ask-user prompts in the composer with validation hints and explicit choice metadata
+- numeric shortcuts and default-choice handling for strict confirmations
 - context/system summaries instead of repeated provider trivia
+- running and waiting detail that can reflect scheduler pressure such as search or verification contention
 
 The long-term quality bar is not "more panels".
-It is "less ambiguity about system state".
+It is "less ambiguity about ownership, waiting reason, and completion state".
+
+## Control Bias
+
+The side rail should bias toward execution truth, not model identity.
+
+That means:
+
+- task ownership is more important than which persona label produced it
+- verification state is more important than eloquent intermediate prose
+- wait reasons are more important than a generic spinner
+- one shared context summary is more useful than repeating the same runtime identity in multiple places
 
 ## Design Rule
 

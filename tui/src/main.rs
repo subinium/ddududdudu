@@ -129,11 +129,75 @@ struct NativeLspState {
     connected_labels: Vec<String>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_ask_user_kind() -> String {
+    "input".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAskUserOptionState {
+    value: String,
+    label: String,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    recommended: bool,
+    #[serde(default)]
+    danger: bool,
+    #[serde(default)]
+    shortcut: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativeAskUserValidationState {
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default)]
+    min_length: Option<u64>,
+    #[serde(default)]
+    max_length: Option<u64>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct NativeAskUserState {
     question: String,
-    options: Vec<String>,
+    #[serde(default = "default_ask_user_kind")]
+    kind: String,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    placeholder: Option<String>,
+    #[serde(default)]
+    submit_label: Option<String>,
+    #[serde(default = "default_true")]
+    allow_custom_answer: bool,
+    #[serde(default = "default_true")]
+    required: bool,
+    #[serde(default)]
+    default_value: Option<String>,
+    #[serde(default)]
+    default_option_index: Option<usize>,
+    #[serde(default)]
+    validation: Option<NativeAskUserValidationState>,
+    #[serde(default)]
+    options: Vec<NativeAskUserOptionState>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AskUserAnswerPayload {
+    value: String,
+    source: String,
+    option_index: Option<usize>,
+    option_label: Option<String>,
 }
 
 #[allow(dead_code)]
@@ -307,7 +371,7 @@ enum BridgeCommand {
     SetMode { mode: String },
     CycleMode { direction: i8 },
     SetModel { model: String },
-    AnswerAskUser { answer: String },
+    AnswerAskUser { answer: AskUserAnswerPayload },
 }
 
 #[derive(Debug, Clone)]
@@ -703,7 +767,12 @@ impl App {
                 self.state = state;
 
                 if !was_asking && self.state.ask_user.is_some() {
-                    self.ask_user_selection = 0;
+                    self.ask_user_selection = self
+                        .state
+                        .ask_user
+                        .as_ref()
+                        .and_then(|prompt| prompt.default_option_index)
+                        .unwrap_or(0);
                     self.composer.clear();
                 }
 
@@ -774,6 +843,164 @@ impl App {
             .find(|mode| mode.active)
             .map(|mode| mode.label.clone())
             .unwrap_or_else(|| self.state.mode.to_uppercase())
+    }
+
+    fn ask_user_shortcut_index(
+        &self,
+        prompt: &NativeAskUserState,
+        key: char,
+    ) -> Option<usize> {
+        if prompt.kind != "confirm" && prompt.kind != "single_select" {
+            return None;
+        }
+
+        if let Some(index) = key.to_digit(10) {
+            let resolved = index.saturating_sub(1) as usize;
+            if resolved < prompt.options.len() {
+                return Some(resolved);
+            }
+        }
+
+        let lower = key.to_ascii_lowercase().to_string();
+        prompt.options.iter().enumerate().find_map(|(index, option)| {
+            option
+                .shortcut
+                .as_ref()
+                .filter(|shortcut| shortcut.eq_ignore_ascii_case(&lower))
+                .map(|_| index)
+        })
+    }
+
+    fn send_ask_user_answer(
+        &mut self,
+        value: String,
+        source: &str,
+        option_index: Option<usize>,
+        option_label: Option<String>,
+    ) -> Result<()> {
+        self.bridge.send(BridgeCommand::AnswerAskUser {
+            answer: AskUserAnswerPayload {
+                value,
+                source: source.to_string(),
+                option_index,
+                option_label,
+            },
+        })
+    }
+
+    fn submit_selected_ask_user_choice(
+        &mut self,
+        prompt: &NativeAskUserState,
+        index: usize,
+        source: &str,
+    ) -> Result<()> {
+        let Some(choice) = prompt.options.get(index) else {
+            return Ok(());
+        };
+        self.send_ask_user_answer(
+            choice.value.clone(),
+            source,
+            Some(index),
+            Some(choice.label.clone()),
+        )
+    }
+
+    fn submit_default_ask_user_answer(&mut self, prompt: &NativeAskUserState) -> Result<bool> {
+        if let Some(default_value) = &prompt.default_value {
+            let option_index = prompt
+                .options
+                .iter()
+                .position(|option| option.value == *default_value);
+            let option_label = option_index.and_then(|index| prompt.options.get(index).map(|item| item.label.clone()));
+            self.send_ask_user_answer(
+                default_value.clone(),
+                "default",
+                option_index,
+                option_label,
+            )?;
+            return Ok(true);
+        }
+
+        if let Some(index) = prompt.default_option_index {
+            self.submit_selected_ask_user_choice(prompt, index, "default")?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
+    fn validate_ask_user_input(
+        &self,
+        prompt: &NativeAskUserState,
+        value: &str,
+    ) -> Option<String> {
+        let trimmed = value.trim();
+
+        if prompt.required && trimmed.is_empty() && prompt.default_value.is_none() && prompt.options.is_empty() {
+            return Some("answer required".to_string());
+        }
+
+        if prompt.kind == "number" && !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
+            return Some(
+                prompt
+                    .validation
+                    .as_ref()
+                    .and_then(|validation| validation.message.clone())
+                    .unwrap_or_else(|| "enter a valid number".to_string()),
+            );
+        }
+
+        if prompt.kind == "path" && !trimmed.is_empty() && trimmed.contains('\0') {
+            return Some(
+                prompt
+                    .validation
+                    .as_ref()
+                    .and_then(|validation| validation.message.clone())
+                    .unwrap_or_else(|| "enter a valid path".to_string()),
+            );
+        }
+
+        if let Some(validation) = &prompt.validation {
+            if let Some(min_length) = validation.min_length {
+                if trimmed.len() < min_length as usize {
+                    return Some(
+                        validation
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| format!("enter at least {} characters", min_length)),
+                    );
+                }
+            }
+
+            if let Some(max_length) = validation.max_length {
+                if trimmed.len() > max_length as usize {
+                    return Some(
+                        validation
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| format!("keep the answer under {} characters", max_length)),
+                    );
+                }
+            }
+
+            if let Some(pattern) = &validation.pattern {
+                match regex::Regex::new(pattern) {
+                    Ok(regex) => {
+                        if !regex.is_match(trimmed) {
+                            return Some(
+                                validation
+                                    .message
+                                    .clone()
+                                    .unwrap_or_else(|| "answer format does not match the requirement".to_string()),
+                            );
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+
+        None
     }
 
     fn push_notice(&mut self, text: String, tone: NoticeTone) {
@@ -949,11 +1176,26 @@ impl App {
             .ask_user
             .as_ref()
             .map(|prompt| {
-                if prompt.options.is_empty() {
+                let detail_rows = u16::from(prompt.detail.as_ref().is_some_and(|detail| !detail.trim().is_empty()));
+                let meta_rows = u16::from(
+                    prompt.kind != "input"
+                        || prompt.default_value.is_some()
+                        || prompt.validation.is_some()
+                        || prompt.required,
+                );
+                let placeholder_rows = u16::from(
+                    prompt.allow_custom_answer
+                        && prompt
+                            .placeholder
+                            .as_ref()
+                            .is_some_and(|placeholder| !placeholder.trim().is_empty()),
+                );
+                let option_rows = if prompt.options.is_empty() {
                     0
                 } else {
                     prompt.options.len().min(3) as u16 + 2
-                }
+                };
+                detail_rows + meta_rows + placeholder_rows + option_rows
             })
             .unwrap_or(0);
         let chunks = Layout::default()
@@ -1976,11 +2218,27 @@ impl App {
             .ask_user
             .as_ref()
             .map(|prompt| {
-                if prompt.options.is_empty() {
+                let detail_rows =
+                    usize::from(prompt.detail.as_ref().is_some_and(|detail| !detail.trim().is_empty()));
+                let meta_rows = usize::from(
+                    prompt.kind != "input"
+                        || prompt.default_value.is_some()
+                        || prompt.validation.is_some()
+                        || prompt.required,
+                );
+                let placeholder_rows = usize::from(
+                    prompt.allow_custom_answer
+                        && prompt
+                            .placeholder
+                            .as_ref()
+                            .is_some_and(|placeholder| !placeholder.trim().is_empty()),
+                );
+                let option_rows = if prompt.options.is_empty() {
                     0usize
                 } else {
                     prompt.options.len().min(3) + 1
-                }
+                };
+                detail_rows + meta_rows + placeholder_rows + option_rows
             })
             .unwrap_or(0);
         let footer_rows = 1usize + ask_option_rows;
@@ -2042,14 +2300,85 @@ impl App {
         }
 
         if let Some(prompt) = &self.state.ask_user {
+            if let Some(detail) = &prompt.detail {
+                if !detail.trim().is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            "Context ",
+                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(detail.clone(), Style::default().fg(ACCENT_DIM)),
+                    ]));
+                }
+            }
+
+            let input_kind = match prompt.kind.as_str() {
+                "confirm" => "confirm",
+                "single_select" => "single-select",
+                "number" => "number",
+                "path" => "path",
+                _ => "text",
+            };
+            let meta_parts = [
+                Some(format!("type {input_kind}")),
+                Some(if prompt.required {
+                    "required".to_string()
+                } else {
+                    "optional".to_string()
+                }),
+                prompt.default_value.as_ref().map(|value| format!("default {value}")),
+                prompt
+                    .validation
+                    .as_ref()
+                    .and_then(|validation| validation.message.clone())
+                    .or_else(|| {
+                        prompt.validation.as_ref().map(|validation| {
+                            let mut parts = Vec::new();
+                            if let Some(min_length) = validation.min_length {
+                                parts.push(format!("min {}", min_length));
+                            }
+                            if let Some(max_length) = validation.max_length {
+                                parts.push(format!("max {}", max_length));
+                            }
+                            if validation.pattern.is_some() {
+                                parts.push("pattern".to_string());
+                            }
+                            parts.join(", ")
+                        })
+                    })
+                    .filter(|value| !value.is_empty()),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            if !meta_parts.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Input ",
+                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(meta_parts.join(" · "), Style::default().fg(ACCENT_DIM)),
+                ]));
+            }
+
             if !prompt.options.is_empty() {
                 lines.push(Line::from(vec![
                     Span::styled(
-                        "Options ",
+                        if prompt.allow_custom_answer {
+                            "Suggested answers "
+                        } else {
+                            "Choices "
+                        },
                         Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "↑/↓ choose · Enter accept · type custom answer",
+                        if prompt.kind == "confirm" || prompt.kind == "single_select" {
+                            "↑/↓ choose · 1-9 shortcut · Enter confirm"
+                        } else if prompt.allow_custom_answer {
+                            "↑/↓ choose · Enter use selection · type your own answer"
+                        } else {
+                            "↑/↓ choose · Enter confirm"
+                        },
                         Style::default().fg(ACCENT_DIM),
                     ),
                 ]));
@@ -2075,15 +2404,61 @@ impl App {
                     } else {
                         Style::default().fg(ACCENT_DIM)
                     };
-                    let option_style = if selected {
-                        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+                    let option_color = if option.danger {
+                        ERROR
+                    } else if option.recommended {
+                        SUCCESS
                     } else {
-                        Style::default().fg(FG)
+                        FG
                     };
+                    let option_style = if selected {
+                        Style::default().fg(option_color).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(option_color)
+                    };
+                    let badges = [
+                        option.shortcut.as_ref().map(|value| format!("[{}]", value)),
+                        option.recommended.then(|| "recommended".to_string()),
+                        option.danger.then(|| "danger".to_string()),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" ");
                     lines.push(Line::from(vec![
                         Span::styled(marker, marker_style),
-                        Span::styled(option.clone(), option_style),
+                        Span::styled(option.label.clone(), option_style),
+                        Span::styled(
+                            if badges.is_empty() {
+                                String::new()
+                            } else {
+                                format!("  {badges}")
+                            },
+                            Style::default().fg(ACCENT_DIM),
+                        ),
+                        Span::styled(
+                            option
+                                .description
+                                .as_ref()
+                                .map(|desc| format!("  {desc}"))
+                                .unwrap_or_default(),
+                            Style::default().fg(ACCENT_DIM),
+                        ),
                     ]));
+                }
+            }
+
+            if prompt.allow_custom_answer {
+                if let Some(placeholder) = &prompt.placeholder {
+                    if !placeholder.trim().is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                "Custom answer ",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(placeholder.clone(), Style::default().fg(ACCENT_DIM)),
+                        ]));
+                    }
                 }
             }
         }
@@ -2092,7 +2467,22 @@ impl App {
         if self.state.ask_user.is_some() {
             footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
             footer_spans.push(Span::styled(
-                "Enter send",
+                self.state
+                    .ask_user
+                    .as_ref()
+                    .and_then(|prompt| prompt.submit_label.clone())
+                    .unwrap_or_else(|| {
+                        if self
+                            .state
+                            .ask_user
+                            .as_ref()
+                            .is_some_and(|prompt| prompt.allow_custom_answer)
+                        {
+                            "Enter send".to_string()
+                        } else {
+                            "Enter select".to_string()
+                        }
+                    }),
                 Style::default().fg(ACCENT_DIM),
             ));
         }
@@ -2431,7 +2821,7 @@ impl App {
             return Ok(());
         }
 
-        if let Some(prompt) = &self.state.ask_user {
+        if let Some(prompt) = self.state.ask_user.clone() {
             if matches!(key.code, KeyCode::Up)
                 && composer_empty
                 && !prompt.options.is_empty()
@@ -2450,6 +2840,22 @@ impl App {
                     self.ask_user_selection += 1;
                 }
                 return Ok(());
+            }
+
+            if composer_empty
+                && key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Char(_))
+            {
+                let KeyCode::Char(ch) = key.code else {
+                    unreachable!()
+                };
+                if let Some(index) = self.ask_user_shortcut_index(&prompt, ch) {
+                    self.ask_user_selection = index;
+                    self.submit_selected_ask_user_choice(&prompt, index, "choice")?;
+                    self.composer.clear();
+                    self.clear_context_prefetch();
+                    return Ok(());
+                }
             }
         }
 
@@ -2581,11 +2987,20 @@ impl App {
 
         let trimmed = self.composer.trim();
         if trimmed.is_empty() {
-            if let Some(prompt) = &self.state.ask_user {
-                if let Some(choice) = prompt.options.get(self.ask_user_selection) {
-                    self.bridge.send(BridgeCommand::AnswerAskUser {
-                        answer: choice.clone(),
-                    })?;
+            if let Some(prompt) = self.state.ask_user.clone() {
+                if self.submit_default_ask_user_answer(&prompt)? {
+                    self.composer.clear();
+                    self.clear_context_prefetch();
+                    return Ok(());
+                }
+
+                if let Some(choice_index) = prompt
+                    .default_option_index
+                    .or_else(|| (!prompt.options.is_empty()).then_some(self.ask_user_selection))
+                {
+                    self.submit_selected_ask_user_choice(&prompt, choice_index, "choice")?;
+                } else if !prompt.required {
+                    self.send_ask_user_answer(String::new(), "default", None, None)?;
                 }
             }
             self.composer.clear();
@@ -2593,10 +3008,19 @@ impl App {
             return Ok(());
         }
 
-        if self.state.ask_user.is_some() {
-            self.bridge.send(BridgeCommand::AnswerAskUser {
-                answer: trimmed.clone(),
-            })?;
+        if let Some(prompt) = self.state.ask_user.clone() {
+            if prompt.allow_custom_answer {
+                if let Some(message) = self.validate_ask_user_input(&prompt, &trimmed) {
+                    self.push_notice(message, NoticeTone::Error);
+                    return Ok(());
+                }
+                self.send_ask_user_answer(trimmed.clone(), "custom", None, None)?;
+            } else if let Some(choice_index) = prompt
+                .default_option_index
+                .or_else(|| (!prompt.options.is_empty()).then_some(self.ask_user_selection))
+            {
+                self.submit_selected_ask_user_choice(&prompt, choice_index, "choice")?;
+            }
             self.composer.clear();
             self.clear_context_prefetch();
             return Ok(());

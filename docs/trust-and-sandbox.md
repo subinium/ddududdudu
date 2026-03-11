@@ -86,6 +86,20 @@ It is also:
 - because of which host rule?
 - because of which MCP trust setting?
 
+### 5. Structured approvals
+
+Approval prompts are part of enforcement, not cosmetic UX.
+
+A good harness should surface:
+
+- the action summary
+- the current permission profile
+- the relevant trust-boundary reason
+- the default-deny path
+- which choices are recommended or dangerous
+
+This is especially important when the operator is switching into a more permissive mode or allowing a risky tool call.
+
 ## MCP Trust
 
 MCP should be treated as a first-class trust surface.
@@ -125,6 +139,8 @@ Current `ddudu` supports:
 - host-based network trust
 - protected secret paths and env vars
 - MCP trust tiers
+- structured approval prompts for risky tool calls
+- explicit confirmation before switching into `permissionless`
 
 What it does not yet provide is a full process-level sandbox such as container or VM isolation.
 

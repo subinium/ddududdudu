@@ -50,11 +50,13 @@ The core layers depend on a second ring of systems:
 | --- | --- |
 | Project instructions | repo conventions, build/test commands, domain rules |
 | Tools and MCP | access to repo, shell, web, and external systems |
+| Ask-user protocol | structured operator questions, approvals, defaults, and answer provenance |
 | Git and worktrees | isolation, recovery, safe parallel work |
 | Memory and skills | persistent procedures, reusable knowledge, repeated context |
 | Hooks and briefings | lifecycle automation and context compression |
 | Verifiers | objective pass/fail signals after generation |
 | Background workers | detached and long-running execution |
+| Resource scheduler | provider, search, write, and verification concurrency control |
 
 ## Current ddudu Decomposition
 
@@ -62,9 +64,16 @@ Inside those layers, `ddudu` is currently split into a few explicit runtime boun
 
 - `RequestEngine` owns the direct model loop, tool turns, retries, and provider session handling
 - `RoutingCoordinator` owns direct vs delegate vs team decisions and planning-interview gating
+- `ResearchRuntime` owns lightweight fan-out and synthesis for itemized external research
 - `WorkflowStateStore` owns canonical workflow snapshots, session restore, and mode metadata recovery
 - `TeamExecutionCoordinator` owns team plan materialization, specialist orchestration, and live progress summaries
 - `BackgroundCoordinator` plus the background execution service own detached job lifecycle and the shared foreground/background execution path
+- `NativeBridgeController` remains the adapter that binds UI events to runtime boundaries instead of owning the whole execution model
+
+Under those boundaries, two generic kernels now matter more than mode names:
+
+- `ExecutionScheduler` owns shared concurrency policy across provider calls, search-heavy work, writes, and verification
+- `TeamOrchestrator` owns dependency-aware parallel execution and now schedules newly-ready workers continuously instead of in fixed waves
 
 This matters because orchestration bugs are usually boundary bugs.
 The system becomes easier to reason about once routing, execution, state, and detached lifecycle stop living in one controller file.
@@ -82,6 +91,19 @@ Some boundaries are especially important:
 
 - trust policy belongs in runtime enforcement
 - it should not depend on the model remembering prose
+- execution weight should also belong in policy
+- it should not depend on ad hoc prompt phrasing like "go fast" or "parallelize this"
+
+### Persona vs policy
+
+- mode labels are useful operator shorthand
+- execution policy should still be expressed in generic knobs such as context depth, isolation, concurrency, and verification tier
+
+### Interaction vs prose
+
+- operator questions should be modeled as typed prompt state
+- approval and confirmation should not be hidden inside ad hoc free-form transcript text
+- question kind, validation, defaults, and answer provenance belong to the harness contract, not to UI guesswork
 
 ### Transcript vs artifacts
 
@@ -116,10 +138,14 @@ Common architecture failures:
 - detached jobs
 - verification
 - context selection
+- execution-weight control through scheduler and policy
 - operator-visible worker state
 
 The intent is not to replace provider runtimes.
 The intent is to coordinate them more effectively.
+
+The important bias is not "use more agents".
+It is "start the smallest executable unit that can make progress, then add orchestration only when it increases throughput or trust".
 
 ## Why This Matters
 

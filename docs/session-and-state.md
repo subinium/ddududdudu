@@ -26,6 +26,19 @@ then continuity has to be modeled explicitly rather than inferred from a transcr
 - support detached work, retries, handoffs, and recovery
 - keep work inspectable after the foreground request ends
 
+## Global-First Defaults
+
+Operator state should not feel trapped inside one repository unless the operator explicitly asks for that.
+
+`ddudu` therefore defaults to global-first storage for:
+
+- saved sessions
+- provider auth
+- operator config
+- global memory
+
+Project-local `.ddudu/` files still matter, but as an explicit override or project instruction layer rather than the only place continuity can exist.
+
 ## State Model
 
 ### Canonical session
@@ -74,7 +87,7 @@ At minimum, a harness should model:
 - verification state
 - detached jobs
 - worker activity snapshots
-- pending ask-user state
+- pending ask-user prompt state, including kind, defaults, and validation
 - recent artifacts
 - workspace identity
 
@@ -123,12 +136,14 @@ Common state failures:
 
 Current `ddudu` uses:
 
+- global-first session and config storage under `~/.ddudu/`
 - canonical sessions
 - provider-backed sessions
 - detached background jobs
 - versioned workflow snapshots
 - git worktree isolation where it improves execution safety
 - explicit worktree cleanup after delegated runs
+- structured ask-user state rather than ad hoc terminal prompts
 - resumable checkpoints and handoffs
 
 The design bias is explicit state over transcript reconstruction.

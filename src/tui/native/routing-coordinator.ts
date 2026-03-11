@@ -9,6 +9,7 @@ export interface AutoRouteDecision {
   purpose?: DelegationPurpose;
   preferredMode?: NamedMode;
   strategy?: 'parallel' | 'sequential' | 'delegate';
+  executionClass?: 'managed' | 'research_fast';
   repairAttempt?: number;
 }
 
@@ -32,9 +33,6 @@ export const classifyJennieAutoRoute = (
   const unitCount = allocation?.units.length ?? 0;
   const readOnlyUnits = allocation?.units.filter((unit) => unit.readOnly).length ?? 0;
   const writeUnits = allocation?.units.filter((unit) => !unit.readOnly).length ?? 0;
-  const plannerHeavy =
-    allocation?.units.some((unit) => unit.role === 'planner')
-    && allocation.units.some((unit) => unit.role === 'explorer' || unit.role === 'librarian');
 
   const hasDesign = /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b|(?:디자인|레이아웃|타이포|접근성|색상|인터랙션)/u.test(lower);
   const hasPlanning = /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b|(?:계획|플랜|설계|아키텍처|전략|로드맵|스펙)/u.test(lower);
@@ -46,31 +44,34 @@ export const classifyJennieAutoRoute = (
     /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(lower) ||
     /\b(end-to-end|from scratch|full flow|across the repo|whole project|entire codebase)\b/u.test(lower) ||
     normalized.split(/\n+/u).length > 1;
+  const repoWide =
+    /\b(across the repo|entire repo|whole project|codebase|end-to-end|from scratch|full flow)\b/u.test(lower) ||
+    /(?:전체 프로젝트|코드베이스|엔드투엔드|처음부터|전체 흐름)/u.test(lower) ||
+    normalized.split(/\n+/u).length > 1;
   const purposeCount = [hasDesign, hasPlanning, hasResearch, hasReview, hasExecution].filter(Boolean).length;
+  const shardableResearch = hasResearch && unitCount >= 2 && writeUnits === 0;
+  const managedTeamWorthwhile =
+    explicitTeam ||
+    shardableResearch ||
+    (repoWide && purposeCount >= 3 && unitCount >= 4 && writeUnits >= 1 && readOnlyUnits >= 2);
 
   if (wordCount <= 6 && purposeCount === 0) {
     return { kind: 'direct', reason: 'short direct prompt' };
   }
 
-  if (
-    explicitTeam
-    || (hasResearch && unitCount >= 2 && writeUnits === 0)
-    || (purposeCount >= 2 && multiStep)
-    || (unitCount >= 4 && writeUnits >= 1 && readOnlyUnits >= 2)
-  ) {
+  if (managedTeamWorthwhile) {
     return {
       kind: 'team',
       strategy:
         allocation?.suggestedStrategy
         ?? (explicitTeam || (hasExecution && (hasPlanning || hasResearch || hasReview)) ? 'delegate' : 'parallel'),
+      executionClass: shardableResearch ? 'research_fast' : 'managed',
       reason:
         explicitTeam
           ? 'explicit orchestration request'
-          : hasResearch && unitCount >= 2 && writeUnits === 0
+          : shardableResearch
             ? 'itemized research benefits from parallel comparison'
-          : unitCount >= 4 && writeUnits >= 1 && readOnlyUnits >= 2
-            ? 'specialist split beneficial'
-            : 'multi-domain request',
+            : 'broad repo-scale work benefits from specialist split',
     };
   }
 
@@ -93,18 +94,11 @@ export const classifyJennieAutoRoute = (
   }
 
   if (hasPlanning) {
-    if (plannerHeavy && unitCount >= 3) {
-      return {
-        kind: 'team',
-        strategy: allocation?.suggestedStrategy ?? 'parallel',
-        reason: 'planning requires parallel discovery',
-      };
-    }
     return {
       kind: 'delegate',
       purpose: 'planning',
       preferredMode: 'rosé',
-      reason: 'planning or architecture request',
+      reason: 'planning or architecture request prefers a single coherent owner',
     };
   }
 
@@ -118,19 +112,12 @@ export const classifyJennieAutoRoute = (
   }
 
   if (hasExecution) {
-    if ((multiStep || wordCount >= 18) && unitCount >= 3 && readOnlyUnits >= 1) {
-      return {
-        kind: 'team',
-        strategy: allocation?.suggestedStrategy ?? 'delegate',
-        reason: 'execution benefits from specialist support',
-      };
-    }
-    if (multiStep || wordCount >= 18) {
+    if (multiStep || repoWide || wordCount >= 18) {
       return {
         kind: 'delegate',
         purpose: 'execution',
         preferredMode: 'lisa',
-        reason: 'large implementation request',
+        reason: 'execution should start from the smallest executable unit',
       };
     }
     return { kind: 'direct', reason: 'single execution request' };
@@ -159,6 +146,10 @@ export const shouldRunPlanningInterview = (
     return false;
   }
 
+  if (decision.executionClass === 'research_fast') {
+    return false;
+  }
+
   const normalized = normalizeSingleLine(prompt);
   const lower = normalized.toLowerCase();
   const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
@@ -175,13 +166,12 @@ export const shouldRunPlanningInterview = (
   }
 
   if (decision.kind === 'team') {
-    return !hasExplicitConstraints || !hasExplicitSuccessCriteria;
+    return wordCount >= 16 && (!hasExplicitConstraints || !hasExplicitSuccessCriteria);
   }
 
   return (
     decision.purpose === 'planning'
     || decision.purpose === 'design'
-    || (decision.purpose === 'execution' && (!hasExplicitConstraints || !hasExplicitSuccessCriteria) && wordCount >= 14)
   );
 };
 

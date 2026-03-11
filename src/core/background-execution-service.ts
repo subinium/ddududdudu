@@ -203,6 +203,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
     worktreeManager,
     executionSchedulerConfig: {
       providerBudgets: config.agent.provider_budgets,
+      resourceBudgets: config.agent.resource_budgets,
       maxParallelWrites: config.agent.max_parallel_writes,
       pollMs: config.agent.scheduler_poll_ms,
     },
