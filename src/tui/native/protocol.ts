@@ -229,6 +229,9 @@ export interface NativeTuiState {
 
 export type NativeBridgeEvent =
   | { type: 'state'; state: NativeTuiState }
+  | { type: 'content_delta'; id: string; delta: string }
+  | { type: 'thinking_delta'; id: string; delta: string; isThinking: boolean }
+  | { type: 'stream_end'; id: string }
   | { type: 'fatal'; message: string };
 
 export type NativeBridgeCommand =

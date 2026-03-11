@@ -34,6 +34,7 @@ const PATH: Color = Color::Rgb(241, 250, 140);
 const ORANGE: Color = Color::Rgb(255, 184, 108);
 const PANEL_TOP_PADDING: u16 = 2;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const THINKING_FRAMES: &[&str] = &["◉", "◎", "○", "◎"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
 const SPLASH_FULL: &[&str] = &[
     "      d8b       d8b                d8b                    d8b       d8b                d8b",
@@ -373,8 +374,28 @@ struct NativeTuiState {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BridgeEvent {
-    State { state: NativeTuiState },
-    Fatal { message: String },
+    #[serde(rename = "content_delta")]
+    ContentDelta {
+        id: String,
+        delta: String,
+    },
+    #[serde(rename = "thinking_delta")]
+    ThinkingDelta {
+        id: String,
+        delta: String,
+        #[serde(rename = "isThinking")]
+        is_thinking: bool,
+    },
+    #[serde(rename = "stream_end")]
+    StreamEnd {
+        id: String,
+    },
+    State {
+        state: NativeTuiState,
+    },
+    Fatal {
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -688,6 +709,12 @@ struct App {
     pending_paste: Option<String>,
     fatal_error: Option<String>,
     last_tick: Instant,
+    streaming_message_id: Option<String>,
+    streaming_token_count: usize,
+    streaming_start: Option<Instant>,
+    streaming_cursor_visible: bool,
+    streaming_cursor_tick: Instant,
+    stream_done_at: Option<Instant>,
     next_prefetch_at: Option<Instant>,
     pending_prefetch_input: Option<String>,
     last_prefetched_input: Option<String>,
@@ -759,6 +786,12 @@ impl App {
             pending_paste: None,
             fatal_error: None,
             last_tick: Instant::now(),
+            streaming_message_id: None,
+            streaming_token_count: 0,
+            streaming_start: None,
+            streaming_cursor_visible: true,
+            streaming_cursor_tick: Instant::now(),
+            stream_done_at: None,
             next_prefetch_at: None,
             pending_prefetch_input: None,
             last_prefetched_input: None,
@@ -770,6 +803,55 @@ impl App {
 
     fn on_bridge_event(&mut self, event: BridgeEvent) {
         match event {
+            BridgeEvent::ContentDelta { id, delta } => {
+                if let Some(message) = self.state.messages.iter_mut().find(|msg| msg.id == id) {
+                    message.content.push_str(&delta);
+                }
+
+                if self.streaming_message_id.is_none() {
+                    self.streaming_message_id = Some(id.clone());
+                    self.streaming_start = Some(Instant::now());
+                }
+
+                if !delta.trim().is_empty() {
+                    self.streaming_token_count += delta.split_whitespace().count().max(1);
+                }
+
+                self.streaming_cursor_visible = true;
+                self.stream_done_at = None;
+                if self.auto_scroll {
+                    self.scroll = usize::MAX;
+                }
+                self.dirty = true;
+            }
+            BridgeEvent::ThinkingDelta {
+                id,
+                delta,
+                is_thinking,
+            } => {
+                if let Some(message) = self.state.messages.iter_mut().find(|msg| msg.id == id) {
+                    if is_thinking {
+                        message
+                            .thinking
+                            .get_or_insert_with(String::new)
+                            .push_str(&delta);
+                        message.is_thinking = Some(true);
+                    } else {
+                        message.is_thinking = Some(false);
+                    }
+                }
+                self.stream_done_at = None;
+                self.dirty = true;
+            }
+            BridgeEvent::StreamEnd { id } => {
+                let _matches_stream = self.streaming_message_id.as_deref() == Some(id.as_str());
+                self.streaming_message_id = None;
+                self.streaming_token_count = 0;
+                self.streaming_start = None;
+                self.streaming_cursor_visible = false;
+                self.stream_done_at = Some(Instant::now());
+                self.dirty = true;
+            }
             BridgeEvent::State { state } => {
                 let was_asking = self.state.ask_user.is_some();
                 let previous_mode = self.state.mode.clone();
@@ -1074,12 +1156,18 @@ impl App {
     fn should_animate(&self) -> bool {
         self.state.loading
             || self.state.messages.is_empty()
+            || self.streaming_message_id.is_some()
+            || self
+                .stream_done_at
+                .is_some_and(|done_at| done_at.elapsed() <= Duration::from_millis(1200))
             || !self.notices.is_empty()
             || self.pending_paste.is_some()
     }
 
     fn animation_interval(&self) -> Duration {
-        if self.state.loading {
+        if self.streaming_message_id.is_some() {
+            Duration::from_millis(50)
+        } else if self.state.loading {
             Duration::from_millis(90)
         } else if self.should_animate() {
             Duration::from_millis(140)
@@ -1141,6 +1229,16 @@ impl App {
             if self.last_tick.elapsed() >= animation_interval {
                 self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
                 self.splash_phase = self.splash_phase.wrapping_add(1);
+                if self.streaming_cursor_tick.elapsed() >= Duration::from_millis(500) {
+                    self.streaming_cursor_visible = !self.streaming_cursor_visible;
+                    self.streaming_cursor_tick = Instant::now();
+                }
+                if self
+                    .stream_done_at
+                    .is_some_and(|done_at| done_at.elapsed() > Duration::from_millis(1200))
+                {
+                    self.stream_done_at = None;
+                }
                 self.last_tick = Instant::now();
                 self.dirty = true;
             }
@@ -1340,6 +1438,8 @@ impl App {
             self.fold_tool_calls,
             self.fold_system_messages,
             self.spinner_index,
+            self.streaming_message_id.as_deref(),
+            self.streaming_cursor_visible,
         );
         let height = area.height as usize;
         let max_scroll = lines.len().saturating_sub(height);
@@ -2242,6 +2342,45 @@ impl App {
             spans.push(Span::styled(error, Style::default().fg(ERROR)));
         } else if !self.state.ready {
             spans.push(Span::styled("booting…", Style::default().fg(ACCENT_DIM)));
+        }
+
+        if let Some(started_at) = self.streaming_start {
+            let elapsed = started_at.elapsed().as_secs_f64();
+            let safe_elapsed = elapsed.max(0.001);
+            let tok_per_sec = self.streaming_token_count as f64 / safe_elapsed;
+            if !spans.is_empty() {
+                spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+            }
+            spans.push(Span::styled("⟩ ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                format!("{}", self.streaming_token_count),
+                Style::default().fg(ACCENT),
+            ));
+            spans.push(Span::styled(" tokens · ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                format!("{tok_per_sec:.0}"),
+                Style::default().fg(ACCENT),
+            ));
+            spans.push(Span::styled(" tok/s · ", Style::default().fg(MUTED)));
+            spans.push(Span::styled(
+                format!("{elapsed:.1}s"),
+                Style::default().fg(ACCENT),
+            ));
+        } else if let Some(done_at) = self.stream_done_at {
+            let elapsed = done_at.elapsed();
+            if elapsed <= Duration::from_millis(1200) {
+                let done_style = if elapsed <= Duration::from_millis(350) {
+                    Style::default().fg(ACCENT)
+                } else if elapsed <= Duration::from_millis(800) {
+                    Style::default().fg(ACCENT_DIM)
+                } else {
+                    Style::default().fg(MUTED)
+                };
+                if !spans.is_empty() {
+                    spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+                }
+                spans.push(Span::styled("done", done_style));
+            }
         }
 
         frame.render_widget(
@@ -4974,12 +5113,15 @@ fn build_transcript_lines(
     fold_tool_calls: bool,
     fold_system_messages: bool,
     spinner_index: usize,
+    streaming_message_id: Option<&str>,
+    streaming_cursor_visible: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let width = width.max(10);
     let _ = fold_tool_calls;
 
     for message in messages {
+        let message_start_line = lines.len();
         let mut rendered_any = false;
         let mut first_visual_line = true;
         let (prefix, prefix_style, text_style) = match message.role.as_str() {
@@ -5010,6 +5152,8 @@ fn build_transcript_lines(
             .unwrap_or(false);
         let should_render_thinking = message.role == "assistant"
             && (message.is_thinking.unwrap_or(false) || has_thinking_content);
+        let is_live_streaming = message.is_streaming
+            || streaming_message_id.is_some_and(|streaming_id| streaming_id == message.id.as_str());
 
         if fold_system_messages && message.role == "system" && !message.content.trim().is_empty() {
             let folded = preview_line(&message.content, content_width);
@@ -5031,7 +5175,10 @@ fn build_transcript_lines(
 
                 if should_render_thinking {
                     let thinking_label = if message.is_thinking.unwrap_or(false) {
-                        format!("{} thinking…", SPINNER_FRAMES[spinner_index])
+                        format!(
+                            "{} thinking...",
+                            THINKING_FRAMES[spinner_index % THINKING_FRAMES.len()]
+                        )
                     } else {
                         "thought".to_string()
                     };
@@ -5127,6 +5274,26 @@ fn build_transcript_lines(
                         rendered_any = true;
                     }
                 }
+
+                if is_live_streaming && streaming_cursor_visible {
+                    if lines.len() > message_start_line {
+                        if let Some(last_line) = lines.last_mut() {
+                            last_line.spans.push(Span::styled(
+                                "▌",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ));
+                        }
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), prefix_style),
+                            Span::styled(
+                                "▌",
+                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
+                    rendered_any = true;
+                }
             } else {
                 for raw_line in message.content.split('\n') {
                     let wrapped = wrap_plain(raw_line, content_width);
@@ -5164,7 +5331,10 @@ fn build_transcript_lines(
 
         if message.is_streaming {
             let indicator = if message.is_thinking.unwrap_or(false) {
-                format!("{} thinking…", SPINNER_FRAMES[spinner_index])
+                format!(
+                    "{} thinking...",
+                    THINKING_FRAMES[spinner_index % THINKING_FRAMES.len()]
+                )
             } else {
                 format!("{} writing…", SPINNER_FRAMES[spinner_index])
             };

@@ -974,6 +974,7 @@ export class NativeBridgeController {
   private flushTimer: NodeJS.Timeout | null = null;
   private stateVersion = 0;
   private lastEmittedStateVersion = -1;
+  private lastFlushTime = 0;
   private backgroundJobPollTimer: NodeJS.Timeout | null = null;
   private idleWarmupTimer: NodeJS.Timeout | null = null;
   private teamRunSince: number | null = null;
@@ -3151,23 +3152,41 @@ export class NativeBridgeController {
     let done = false;
     let continueWithTools = false;
 
+    let thinkingEndSignaled = false;
+
     for await (const event of stream) {
       if (context.signal.aborted) {
         break;
       }
 
       if (event.type === 'thinking') {
-        thinkingText += event.thinking ?? '';
-        this.updateMessageThinking(context.assistantMessageId, thinkingText, true);
+        const delta = event.thinking ?? '';
+        thinkingText += delta;
+        const msg = this.state.messages.find((m) => m.id === context.assistantMessageId);
+        if (msg) {
+          msg.thinking = thinkingText;
+          msg.isThinking = true;
+        }
+        this.emit({ type: 'thinking_delta', id: context.assistantMessageId, delta, isThinking: true });
         continue;
       }
 
       if (event.type === 'text') {
-        if (thinkingText) {
-          this.updateMessageThinking(context.assistantMessageId, thinkingText, false);
+        if (thinkingText && !thinkingEndSignaled) {
+          thinkingEndSignaled = true;
+          const msg = this.state.messages.find((m) => m.id === context.assistantMessageId);
+          if (msg) {
+            msg.isThinking = false;
+          }
+          this.emit({ type: 'thinking_delta', id: context.assistantMessageId, delta: '', isThinking: false });
         }
-        fullText += event.text ?? '';
-        this.updateMessage(context.assistantMessageId, fullText);
+        const delta = event.text ?? '';
+        fullText += delta;
+        const msg = this.state.messages.find((m) => m.id === context.assistantMessageId);
+        if (msg) {
+          msg.content = fullText;
+        }
+        this.emit({ type: 'content_delta', id: context.assistantMessageId, delta });
         continue;
       }
 
@@ -3232,14 +3251,20 @@ export class NativeBridgeController {
         }
 
         fullText = event.fullText ?? fullText;
+        this.emit({ type: 'stream_end', id: context.assistantMessageId });
         this.finishMessage(context.assistantMessageId, fullText);
         done = true;
         break;
       }
 
       if (event.type === 'error') {
+        this.emit({ type: 'stream_end', id: context.assistantMessageId });
         throw event.error ?? new Error('Streaming request failed.');
       }
+    }
+
+    if (!done && !continueWithTools) {
+      this.emit({ type: 'stream_end', id: context.assistantMessageId });
     }
 
     return {
@@ -7360,6 +7385,7 @@ export class NativeBridgeController {
     };
 
     this.lastEmittedStateVersion = this.stateVersion;
+    this.lastFlushTime = Date.now();
 
     this.emit({
       type: 'state',
@@ -7374,9 +7400,15 @@ export class NativeBridgeController {
       return;
     }
 
+    const elapsed = Date.now() - this.lastFlushTime;
+    if (elapsed >= 50) {
+      this.emitStateNow();
+      return;
+    }
+
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.emitStateNow();
-    }, 16);
+    }, 50);
   }
 }
