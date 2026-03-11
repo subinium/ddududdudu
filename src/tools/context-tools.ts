@@ -712,10 +712,20 @@ export const repoMapTool: Tool = {
 export const symbolSearchTool: Tool = {
   definition: {
     name: 'symbol_search',
-    description: 'Search likely symbol definitions such as functions, classes, interfaces, and structs.',
+    description:
+      'Find where a function, class, interface, type, or variable is defined. Use this when you know the symbol name and need its declaration site. ' +
+      'Default mode ("scan") returns a flat list of matching definition lines across the project. ' +
+      'Set mode to "resolve" for a precise, LSP-backed lookup with changed-file bias and results grouped by file — ' +
+      'use "resolve" when you need the exact definition of a specific identifier. ' +
+      'Do NOT use this tool for finding usages/call-sites — use reference_search instead.',
     parameters: {
       query: { type: 'string', description: 'Symbol name or partial name to search for.', required: true },
       path: { type: 'string', description: 'Base path for searching.' },
+      mode: {
+        type: 'string',
+        description: 'Search mode. "scan" (default): broad regex scan for definition patterns. "resolve": precise LSP-backed lookup with changed-file bias, grouped by file.',
+        enum: ['scan', 'resolve'],
+      },
       max_results: { type: 'number', description: 'Maximum results to return.' },
     },
   },
@@ -728,21 +738,75 @@ export const symbolSearchTool: Tool = {
       typeof args.path === 'string' && args.path.trim().length > 0
         ? resolve(ctx.cwd, args.path)
         : ctx.cwd;
+    const mode = args.mode === 'resolve' ? 'resolve' : 'scan';
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
-        : 60;
+        : mode === 'resolve' ? 8 : 60;
 
     try {
       const lspResult = await tryLspDefinitionSearch(args.query.trim(), rootPath, maxResults, ctx);
+
+      // --- resolve mode: grouped output with changed-file bias ---
+      if (mode === 'resolve') {
+        if (lspResult) {
+          return {
+            output: lspResult.output,
+            metadata: { root: rootPath, count: lspResult.count, source: 'lsp', mode },
+          };
+        }
+
+        const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+        const patterns = SYMBOL_PATTERNS(args.query.trim());
+        const changedFiles = new Set(await getChangedFiles(rootPath));
+        const matches: Array<{ path: string; line: string; score: number }> = [];
+
+        for (const filePath of files) {
+          const text = await readTextFile(filePath);
+          if (!text) {
+            continue;
+          }
+
+          const relPath = normalizePath(relative(rootPath, filePath));
+          const lines = text.split('\n');
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            if (!patterns.some((pattern) => pattern.test(line))) {
+              continue;
+            }
+
+            let score = changedFiles.has(relPath) ? 8 : 3;
+            if (line.includes(args.query.trim())) {
+              score += 3;
+            }
+            if (relPath.toLowerCase().includes(args.query.trim().toLowerCase())) {
+              score += 2;
+            }
+
+            matches.push({
+              path: relPath,
+              line: `${relPath}:${index + 1}: ${line.trim()}`,
+              score,
+            });
+          }
+        }
+
+        const output = renderGroupedMatches(matches, maxResults, 3);
+        return {
+          output,
+          metadata: {
+            root: rootPath,
+            count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
+            mode,
+          },
+        };
+      }
+
+      // --- scan mode (default): flat list ---
       if (lspResult) {
         return {
           output: lspResult.output,
-          metadata: {
-            root: rootPath,
-            count: lspResult.count,
-            source: 'lsp',
-          },
+          metadata: { root: rootPath, count: lspResult.count, source: 'lsp', mode },
         };
       }
 
@@ -776,10 +840,7 @@ export const symbolSearchTool: Tool = {
 
       return {
         output: results.join('\n'),
-        metadata: {
-          root: rootPath,
-          count: results.length,
-        },
+        metadata: { root: rootPath, count: results.length, mode },
       };
     } catch (error: unknown) {
       return {
@@ -793,11 +854,21 @@ export const symbolSearchTool: Tool = {
 export const referenceSearchTool: Tool = {
   definition: {
     name: 'reference_search',
-    description: 'Search for cross-file references and usages of a symbol or identifier.',
+    description:
+      'Find where a symbol is used across the codebase (imports, calls, assignments, type references). ' +
+      'Use this when you need to understand the impact of changing a function, type, or variable. ' +
+      'Default output is a flat scored list of matching lines. ' +
+      'Set group_by_file to true to aggregate results by file and find the hotspot files with the most references — ' +
+      'useful before refactoring to see which files will be affected. ' +
+      'Do NOT use this for finding definitions — use symbol_search instead.',
     parameters: {
       query: { type: 'string', description: 'Identifier or symbol reference to search for.', required: true },
       path: { type: 'string', description: 'Base path for searching.' },
-      max_results: { type: 'number', description: 'Maximum lines to return.' },
+      group_by_file: {
+        type: 'boolean',
+        description: 'When true, aggregate results by file and show the top hotspot files with representative lines. Default: false.',
+      },
+      max_results: { type: 'number', description: 'Maximum lines (or files when group_by_file) to return.' },
     },
   },
   async execute(args, ctx) {
@@ -809,20 +880,33 @@ export const referenceSearchTool: Tool = {
       typeof args.path === 'string' && args.path.trim().length > 0
         ? resolve(ctx.cwd, args.path)
         : ctx.cwd;
+    const groupByFile = args.group_by_file === true;
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
-        : 80;
+        : groupByFile ? 8 : 80;
 
     try {
       const lspMatches = await tryLspReferenceSearch(args.query.trim(), rootPath, maxResults, ctx);
       if (lspMatches && lspMatches.length > 0) {
+        if (groupByFile) {
+          return {
+            output: renderGroupedMatches(lspMatches, maxResults, 3),
+            metadata: {
+              root: rootPath,
+              count: Math.min(new Set(lspMatches.map((match) => match.path)).size, maxResults),
+              source: 'lsp',
+              groupByFile,
+            },
+          };
+        }
         return {
           output: lspMatches.map((entry) => entry.line).join('\n'),
           metadata: {
             root: rootPath,
             count: Math.min(lspMatches.length, maxResults),
             source: 'lsp',
+            groupByFile,
           },
         };
       }
@@ -830,7 +914,7 @@ export const referenceSearchTool: Tool = {
       const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
       const pattern = buildReferencePattern(args.query);
       const changedFiles = new Set(await getChangedFiles(rootPath));
-      const scored: Array<{ score: number; line: string }> = [];
+      const matches: Array<{ path: string; score: number; line: string }> = [];
 
       for (const filePath of files) {
         const text = await readTextFile(filePath);
@@ -846,29 +930,48 @@ export const referenceSearchTool: Tool = {
             continue;
           }
 
-          let score = changedFiles.has(relPath) ? 4 : 0;
-          if (!isDefinitionLine(args.query, line)) {
+          const skipDefinition = groupByFile && isDefinitionLine(args.query, line);
+          if (skipDefinition) {
+            continue;
+          }
+
+          let score = changedFiles.has(relPath) ? (groupByFile ? 5 : 4) : (groupByFile ? 2 : 0);
+          if (!groupByFile && !isDefinitionLine(args.query, line)) {
             score += 3;
           }
           if (line.includes(args.query.trim())) {
             score += 1;
           }
 
-          scored.push({
+          matches.push({
+            path: relPath,
             score,
             line: `${relPath}:${index + 1}: ${line.trim()}`,
           });
         }
       }
 
-      scored.sort((a, b) => b.score - a.score || a.line.localeCompare(b.line));
-      const output = scored.slice(0, maxResults).map((entry) => entry.line).join('\n');
+      if (groupByFile) {
+        const output = renderGroupedMatches(matches, maxResults, 3);
+        return {
+          output,
+          metadata: {
+            root: rootPath,
+            count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
+            groupByFile,
+          },
+        };
+      }
+
+      matches.sort((a, b) => b.score - a.score || a.line.localeCompare(b.line));
+      const output = matches.slice(0, maxResults).map((entry) => entry.line).join('\n');
 
       return {
         output,
         metadata: {
           root: rootPath,
-          count: Math.min(scored.length, maxResults),
+          count: Math.min(matches.length, maxResults),
+          groupByFile,
         },
       };
     } catch (error: unknown) {
@@ -880,185 +983,38 @@ export const referenceSearchTool: Tool = {
   },
 };
 
+/** @deprecated Merged into symbolSearchTool with mode="resolve". Kept as alias for backward compatibility. */
 export const definitionSearchTool: Tool = {
+  ...symbolSearchTool,
   definition: {
+    ...symbolSearchTool.definition,
     name: 'definition_search',
-    description: 'Find likely symbol definitions with exact identifier and changed-file bias.',
-    parameters: {
-      query: { type: 'string', description: 'Identifier or symbol name to resolve.', required: true },
-      path: { type: 'string', description: 'Base path for searching.' },
-      max_results: { type: 'number', description: 'Maximum files to return.' },
-    },
+    description: 'Alias for symbol_search with mode="resolve". Prefer symbol_search directly.',
   },
   async execute(args, ctx) {
-    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
-      return { output: 'Missing required argument: query', isError: true };
-    }
-
-    const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
-    const maxResults =
-      typeof args.max_results === 'number' && Number.isFinite(args.max_results)
-        ? Math.max(1, Math.floor(args.max_results))
-        : 8;
-
-    try {
-      const lspResult = await tryLspDefinitionSearch(args.query.trim(), rootPath, maxResults, ctx);
-      if (lspResult) {
-        return {
-          output: lspResult.output,
-          metadata: {
-            root: rootPath,
-            count: lspResult.count,
-            source: 'lsp',
-          },
-        };
-      }
-
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
-      const patterns = SYMBOL_PATTERNS(args.query.trim());
-      const changedFiles = new Set(await getChangedFiles(rootPath));
-      const matches: Array<{ path: string; line: string; score: number }> = [];
-
-      for (const filePath of files) {
-        const text = await readTextFile(filePath);
-        if (!text) {
-          continue;
-        }
-
-        const relPath = normalizePath(relative(rootPath, filePath));
-        const lines = text.split('\n');
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = lines[index];
-          if (!patterns.some((pattern) => pattern.test(line))) {
-            continue;
-          }
-
-          let score = changedFiles.has(relPath) ? 8 : 3;
-          if (line.includes(args.query.trim())) {
-            score += 3;
-          }
-          if (relPath.toLowerCase().includes(args.query.trim().toLowerCase())) {
-            score += 2;
-          }
-
-          matches.push({
-            path: relPath,
-            line: `${relPath}:${index + 1}: ${line.trim()}`,
-            score,
-          });
-        }
-      }
-
-      const output = renderGroupedMatches(matches, maxResults, 3);
-      return {
-        output,
-        metadata: {
-          root: rootPath,
-          count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
-        },
-      };
-    } catch (error: unknown) {
-      return {
-        output: error instanceof Error ? error.message : String(error),
-        isError: true,
-      };
-    }
+    return symbolSearchTool.execute({ ...args, mode: 'resolve' }, ctx);
   },
 };
 
+/** @deprecated Merged into referenceSearchTool with group_by_file=true. Kept as alias for backward compatibility. */
 export const referenceHotspotsTool: Tool = {
+  ...referenceSearchTool,
   definition: {
+    ...referenceSearchTool.definition,
     name: 'reference_hotspots',
-    description: 'Aggregate reference hits by file to find the most relevant implementation hotspots.',
-    parameters: {
-      query: { type: 'string', description: 'Identifier or symbol reference to search for.', required: true },
-      path: { type: 'string', description: 'Base path for searching.' },
-      max_results: { type: 'number', description: 'Maximum files to return.' },
-    },
+    description: 'Alias for reference_search with group_by_file=true. Prefer reference_search directly.',
   },
   async execute(args, ctx) {
-    if (typeof args.query !== 'string' || args.query.trim().length === 0) {
-      return { output: 'Missing required argument: query', isError: true };
-    }
-
-    const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
-    const maxResults =
-      typeof args.max_results === 'number' && Number.isFinite(args.max_results)
-        ? Math.max(1, Math.floor(args.max_results))
-        : 8;
-
-    try {
-      const lspMatches = await tryLspReferenceSearch(args.query.trim(), rootPath, maxResults, ctx);
-      if (lspMatches && lspMatches.length > 0) {
-        return {
-          output: renderGroupedMatches(lspMatches, maxResults, 3),
-          metadata: {
-            root: rootPath,
-            count: Math.min(new Set(lspMatches.map((match) => match.path)).size, maxResults),
-            source: 'lsp',
-          },
-        };
-      }
-
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
-      const pattern = buildReferencePattern(args.query);
-      const changedFiles = new Set(await getChangedFiles(rootPath));
-      const matches: Array<{ path: string; line: string; score: number }> = [];
-
-      for (const filePath of files) {
-        const text = await readTextFile(filePath);
-        if (!text) {
-          continue;
-        }
-
-        const relPath = normalizePath(relative(rootPath, filePath));
-        const lines = text.split('\n');
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = lines[index];
-          if (!pattern.test(line) || isDefinitionLine(args.query, line)) {
-            continue;
-          }
-
-          let score = changedFiles.has(relPath) ? 5 : 2;
-          if (line.includes(args.query.trim())) {
-            score += 1;
-          }
-
-          matches.push({
-            path: relPath,
-            line: `${relPath}:${index + 1}: ${line.trim()}`,
-            score,
-          });
-        }
-      }
-
-      const output = renderGroupedMatches(matches, maxResults, 3);
-      return {
-        output,
-        metadata: {
-          root: rootPath,
-          count: Math.min(new Set(matches.map((match) => match.path)).size, maxResults),
-        },
-      };
-    } catch (error: unknown) {
-      return {
-        output: error instanceof Error ? error.message : String(error),
-        isError: true,
-      };
-    }
+    return referenceSearchTool.execute({ ...args, group_by_file: true }, ctx);
   },
 };
 
 export const changedFilesTool: Tool = {
   definition: {
     name: 'changed_files',
-    description: 'List changed files in the current git worktree to bias retrieval toward active edits.',
+    description:
+      'List files with uncommitted changes (staged + unstaged) in the current git worktree. ' +
+      'Use this to scope edits to files the user is actively working on, or to check what has been modified before committing.',
     parameters: {
       path: { type: 'string', description: 'Base path for the git worktree.' },
     },
@@ -1090,7 +1046,11 @@ export const changedFilesTool: Tool = {
 export const codebaseSearchTool: Tool = {
   definition: {
     name: 'codebase_search',
-    description: 'Search the codebase semantically by scoring files and lines against a natural-language query.',
+    description:
+      'Search the codebase with a natural-language query when you do not know the exact text to find. ' +
+      'Scores files and lines by keyword overlap, path relevance, and changed-file recency. ' +
+      'Use this for exploratory questions like "where is auth handled" or "find error boundary logic". ' +
+      'For exact text or regex matches, use grep instead. For ranking which files matter most for a task, use file_importance.',
     parameters: {
       query: { type: 'string', description: 'Natural-language query or keywords.', required: true },
       path: { type: 'string', description: 'Base path for searching.' },
@@ -1194,7 +1154,10 @@ export const codebaseSearchTool: Tool = {
 export const fileImportanceTool: Tool = {
   definition: {
     name: 'file_importance',
-    description: 'Rank the files most likely to matter for the current request using changed-file, path, line-match, and LSP signals.',
+    description:
+      'Rank which files matter most for the current task using changed-file recency, path matching, line-match density, and LSP definition/reference signals. ' +
+      'Use this at the start of a task to decide which files to read first. ' +
+      'Unlike codebase_search (which returns matching lines), this returns a ranked file list with reason annotations.',
     parameters: {
       query: { type: 'string', description: 'Natural-language request or keyword set.', required: true },
       path: { type: 'string', description: 'Base path for ranking.' },

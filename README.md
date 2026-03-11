@@ -93,10 +93,8 @@ If only one provider is authenticated, ddudu still keeps the four-mode surface a
 | `grep`               | search file contents                                      |
 | `glob`               | match paths by pattern                                    |
 | `repo_map`           | render a compact repository tree                          |
-| `symbol_search`      | find likely symbol definitions                            |
-| `definition_search`  | resolve likely symbol definitions with LSP/heuristics     |
-| `reference_search`   | find likely cross-file references and usages              |
-| `reference_hotspots` | group likely implementation hotspots by file              |
+| `symbol_search`      | find symbol definitions; `mode: "resolve"` for precise LSP-backed lookup |
+| `reference_search`   | find cross-file references and usages; `group_by_file: true` for hotspot aggregation |
 | `changed_files`      | list git-changed files for active-context retrieval       |
 | `file_importance`    | rank likely relevant files for the current request        |
 | `codebase_search`    | score files and lines against a natural-language query    |

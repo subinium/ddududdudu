@@ -156,7 +156,10 @@ export const globTool: Tool = {
 export const grepTool: Tool = {
   definition: {
     name: 'grep',
-    description: 'Search file contents using a regular expression.',
+    description:
+      'Search file contents for exact text or regex patterns. Use this when you know the specific string, identifier, or pattern to find. ' +
+      'Returns matching lines with file paths and line numbers. ' +
+      'For broad natural-language queries where you do not know the exact text, use codebase_search instead.',
     parameters: {
       pattern: { type: 'string', description: 'Regular expression pattern.', required: true },
       path: { type: 'string', description: 'Base path for searching.' },

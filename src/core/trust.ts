@@ -288,9 +288,7 @@ export const analyzeToolRisk = (
     name === 'docs_lookup' ||
     name === 'repo_map' ||
     name === 'symbol_search' ||
-    name === 'definition_search' ||
     name === 'reference_search' ||
-    name === 'reference_hotspots' ||
     name === 'changed_files' ||
     name === 'file_importance' ||
     name === 'codebase_search' ||

@@ -239,9 +239,7 @@ const PARALLEL_SAFE_TOOL_NAMES = new Set([
   'glob',
   'repo_map',
   'symbol_search',
-  'definition_search',
   'reference_search',
-  'reference_hotspots',
   'changed_files',
   'file_importance',
   'codebase_search',
@@ -254,9 +252,7 @@ const SEARCH_RESOURCE_TOOL_NAMES = new Set([
   'glob',
   'repo_map',
   'symbol_search',
-  'definition_search',
   'reference_search',
-  'reference_hotspots',
   'changed_files',
   'file_importance',
   'codebase_search',
@@ -719,7 +715,7 @@ const summarizeToolInput = (name: string, input: Record<string, unknown>): strin
     }
     case 'definition_search': {
       const query = previewText(readString(input.query), 48);
-      return query ? `definition ${query}` : 'definition search';
+      return query ? `resolve ${query}` : 'definition resolve';
     }
     case 'file_importance': {
       const query = previewText(readString(input.query), 48);
