@@ -108,7 +108,9 @@ context의 품질이 양보다 중요하다.
 
 확신이 없을 때는 더 강한 증거를 가진 더 좁은 context를 선호한다.
 
-## Compaction 규칙
+## Compaction
+
+### 설계 원칙
 
 좋은 compaction이 보존하는 것:
 
@@ -123,6 +125,21 @@ context의 품질이 양보다 중요하다.
 - 낮은 엔트로피의 transcript 패러프레이즈
 
 타입이 있는 artifact는 서술적 요약이 아닌 운영적 의미를 보존하기 때문에 여기서 특히 가치 있다.
+
+### 2단계 파이프라인
+
+`ddudu` compaction은 2단계로 실행된다:
+
+1. **Prune** — 대화를 역순으로 순회하며 최근 N턴을 보호하고, 오래된 tool output을 상태 라인만 남기고 공격적으로 축소한다. 이 단계는 무료(순수 문자열 조작)이며 summarizer가 효율적으로 처리할 수 있는 크기로 대화를 줄인다.
+2. **LLM 요약** — 축소된 대화를 활성 모델에 구조화된 템플릿과 함께 전송한다. 모델은 Goal, Instructions, Discoveries, Accomplished, In Progress, Remaining, Relevant Files, Active Context 섹션을 가진 요약을 생성한다.
+
+결과에는 다음 에이전트가 기존 작업을 중복하지 않고 이어서 진행하도록 안내하는 continuation 헤더가 접두사로 붙는다.
+
+provider가 인증되지 않았거나 LLM 호출이 실패하면, 시스템이 절대 깨지지 않도록 레거시 string-clip 방식으로 자동 폴백된다.
+
+### LLM 기반인 이유
+
+String-clipping compaction(220자 메시지 절단)은 context 품질을 파괴한다. 핵심 결정, 파일 경로, 진행 상태가 유실된다. LLM 기반 compaction은 다른 에이전트가 실제로 이어서 작업할 수 있는 구조화된 문서를 생성하며, opencode와 Codex CLI가 compaction을 처리하는 방식과 유사하다.
 
 ## 실행 형태 우선 검색
 
@@ -166,7 +183,9 @@ prompt가 주로 레포 외부의 비교, 리서치, 사실 확인을 요청할 
 - 작업 유형별 request snapshot
 - 외부 리서치를 위한 경량 snapshot
 - 명확한 직접, 위임, 팀, 리서치 케이스에 대한 route-before-snapshot
-- compaction과 provider `resume` 및 `hydrate`
+- 2단계 LLM 기반 compaction (prune 후 구조화된 요약)
+- delta streaming 파이프라인 (전체 상태 JSON 대신 ~80바이트 이벤트)으로 실시간 피드백
+- session 연속성을 위한 provider `resume` 및 `hydrate`
 
 주요 튜닝 포인트는 더 이상 "prompt를 더 추가"가 아니다.
 "더 나은 context를 선택"하는 것이다.

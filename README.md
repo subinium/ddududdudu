@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.5.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.5.1-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
@@ -28,7 +28,9 @@
 - Isolated delegated runs with git worktrees for provider-backed agent sessions
 - Workflow state with todos, permission profiles, remote provider session state, detached background jobs, and automatic verification
 - Sidebar rails for git status, subagents, detached background work, MCP servers, and LSP status
-- Context compaction, handoff, briefing, drift checking, and repair escalation
+- LLM-powered context compaction with structured handoff (Goal, Decisions, Progress, Files) and automatic prune-before-summarize
+- Delta streaming pipeline with ~80-byte events, blinking cursor, live token counter, and thinking breathing animation
+- Muted inline tool call rendering and color-coded context meter in the footer bar
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 - Per-session cost budget tracking with configurable warning thresholds and hard-stop enforcement
 - Scored memory promotion pipeline with confidence metadata, Jaccard dedupe, and merge
@@ -265,7 +267,7 @@ Task packs and the full comparison workflow are still being refined.
 | Command           | Purpose                                                                                        |
 | ----------------- | ---------------------------------------------------------------------------------------------- |
 | `/clear`          | clear the current transcript                                                                   |
-| `/compact`        | compact canonical context                                                                      |
+| `/compact`        | LLM-summarized context compaction with structured handoff                                      |
 | `/mode`           | switch active mode                                                                             |
 | `/model`          | switch the current mode's model                                                                |
 | `/plan`           | show the shared execution plan                                                                 |

@@ -164,9 +164,14 @@ UI의 각 영역은 서로 다른 종류의 정보를 담아야 한다:
 - 엄격한 확인을 위한 숫자 단축키와 기본 선택 처리
 - 반복되는 provider 정보 대신 context/시스템 요약
 - 검색 또는 검증 경합 같은 스케줄러 압력을 반영할 수 있는 실행 및 대기 세부 정보
+- transcript에서 muted 스타일의 인라인 tool call 렌더링 (✓/✗/spinner 상태 아이콘, opencode의 `text-weak` 패턴과 유사)
+- footer 바의 색상 코딩된 context 미터 (일반 → 60%에서 주황 → 80%에서 빨강)
+- 즉각적인 시각 피드백을 위한 delta streaming 파이프라인 (~80바이트 이벤트, 깜빡이는 커서, 실시간 토큰 카운터)
+- dimmed reasoning 텍스트와 함께하는 thinking breathing 애니메이션
 
 비어 있는 sidebar 섹션 (유휴 worker, 빈 todo 보드)은 장식적 밀도를 줄이기 위해 숨긴다.
 Git status (브랜치, 변경된 파일, staged/unstaged 수)는 이제 first-class sidebar 섹션으로 표시된다.
+sidebar context rail은 footprint 퍼센트, 시각적 미터 바, 토큰 수를 표시한다.
 
 장기적인 품질 기준은 "더 많은 패널"이 아니다.
 "ownership, 대기 이유, 완료 상태에 대한 모호함 감소"다.

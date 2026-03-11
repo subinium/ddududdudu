@@ -108,7 +108,9 @@ Prefer:
 
 When in doubt, prefer narrower context with stronger evidence.
 
-## Compaction Rule
+## Compaction
+
+### Design Rule
 
 Good compaction preserves:
 
@@ -123,6 +125,21 @@ Bad compaction preserves:
 - low-entropy transcript paraphrases
 
 Typed artifacts are especially valuable here because they preserve operational meaning rather than narrative summary.
+
+### Two-Phase Pipeline
+
+`ddudu` compaction runs in two phases:
+
+1. **Prune** — walk backwards through the conversation, protect the most recent N turns, and aggressively clip old tool outputs down to their status lines. This phase is free (pure string manipulation) and reduces the conversation to a size the summarizer can process efficiently.
+2. **LLM summarize** — send the pruned conversation to the active model with a structured template. The model produces a summary with explicit sections: Goal, Instructions, Discoveries, Accomplished, In Progress, Remaining, Relevant Files, Active Context.
+
+The result is prefixed with a continuation header that tells the next agent to build on existing work rather than duplicate it.
+
+If no provider is authenticated or the LLM call fails, compaction falls back to a legacy string-clip approach so the system never breaks.
+
+### Why LLM-Powered
+
+String-clipping compaction (220-character message truncation) destroys context quality. Key decisions, file paths, and progress state are lost. LLM-powered compaction produces a structured document that another agent can actually continue from, similar to how opencode and Codex CLI handle compaction.
 
 ## Execution-Shape-First Retrieval
 
@@ -166,7 +183,9 @@ Current `ddudu` leans on:
 - task-type-specific request snapshots
 - lightweight snapshots for external research
 - route-before-snapshot for obvious direct, delegation, team, and research cases
-- compaction plus provider `resume` and `hydrate`
+- two-phase LLM-powered compaction (prune then structured summary)
+- delta streaming pipeline (~80-byte events instead of full-state JSON) for real-time feedback
+- provider `resume` and `hydrate` for session continuity
 
 The main tuning surface is no longer "add more prompt".
 It is "select better context".

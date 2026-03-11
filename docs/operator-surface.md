@@ -164,9 +164,14 @@ That structure is significantly more trustworthy than generic activity indicator
 - numeric shortcuts and default-choice handling for strict confirmations
 - context/system summaries instead of repeated provider trivia
 - running and waiting detail that can reflect scheduler pressure such as search or verification contention
+- muted inline tool call rendering in the transcript (✓/✗/spinner status icons in dim style, matching the opencode `text-weak` pattern)
+- color-coded context meter in the footer bar (normal → orange at 60% → red at 80%)
+- delta streaming pipeline for immediate visual feedback (~80-byte events, blinking cursor, live token counter)
+- thinking breathing animation with dimmed reasoning text
 
 Empty sidebar sections (idle workers, empty todo board) are hidden to reduce decorative density.
 Git status (branch, changed files, staged/unstaged counts) now appears as a first-class sidebar section.
+The sidebar context rail shows footprint percentage, a visual meter bar, and token counts.
 
 The long-term quality bar is not "more panels".
 It is "less ambiguity about ownership, waiting reason, and completion state".
