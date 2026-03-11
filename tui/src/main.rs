@@ -2765,6 +2765,21 @@ impl App {
                 Style::default().fg(ACCENT_DIM),
             ));
         }
+        if self.state.context_percent > 0.0 {
+            footer_spans.push(Span::styled("  ", Style::default()));
+            let pct = (self.state.context_percent * 100.0) as u8;
+            let meter_color = if pct >= 80 {
+                ERROR
+            } else if pct >= 60 {
+                ORANGE
+            } else {
+                MUTED
+            };
+            footer_spans.push(Span::styled(
+                format!("ctx {pct}%"),
+                Style::default().fg(meter_color),
+            ));
+        }
         lines.push(Line::from(footer_spans));
 
         frame.render_widget(
@@ -5327,6 +5342,35 @@ fn build_transcript_lines(
                     }
                 }
             }
+        }
+
+        if !message.tool_calls.is_empty() {
+            for tc in &message.tool_calls {
+                let status_icon = match tc.status.as_str() {
+                    "ok" => "✓",
+                    "error" => "✗",
+                    "running" => SPINNER_FRAMES[spinner_index % SPINNER_FRAMES.len()],
+                    _ => "·",
+                };
+                let status_color = match tc.status.as_str() {
+                    "error" => ERROR,
+                    "running" => ACCENT_DIM,
+                    _ => TOOL_MUTED,
+                };
+                let summary = preview_line(&tc.summary, content_width.saturating_sub(4));
+                let tool_line = vec![
+                    Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
+                    Span::styled(summary, Style::default().fg(TOOL_MUTED)),
+                ];
+                append_guttered_span_lines(
+                    &mut lines,
+                    vec![tool_line],
+                    "│ ",
+                    Style::default().fg(ACCENT_DIM),
+                    &mut first_visual_line,
+                );
+            }
+            rendered_any = true;
         }
 
         if message.is_streaming {

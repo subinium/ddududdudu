@@ -31,7 +31,7 @@ import {
   formatArtifactForHandoff,
   formatArtifactForInspector,
 } from '../../core/artifacts.js';
-import { CompactionEngine, type CompactionMessage } from '../../core/compaction.js';
+import { CompactionEngine, type CompactionMessage, type CompactionSummarizer } from '../../core/compaction.js';
 import { DriftDetector } from '../../core/drift-detector.js';
 import { EpistemicStateManager } from '../../core/epistemic-state.js';
 import { formatBriefing, generateBriefing, loadBriefing, saveBriefing } from '../../core/briefing.js';
@@ -7051,6 +7051,46 @@ export class NativeBridgeController {
     return runInitSummaryCommand();
   }
 
+  private createCompactionSummarizer(): CompactionSummarizer | undefined {
+    const runtime = this.getResolvedModeRuntime(this.currentMode);
+    const auth = this.availableProviders.get(runtime.provider);
+    if (!auth) {
+      return undefined;
+    }
+
+    const client = createClient(runtime.provider, auth.token, auth.tokenType);
+    const model = runtime.model;
+
+    return async (systemPrompt: string, userMessage: string): Promise<string> => {
+      const apiMessages: ApiMessage[] = [{ role: 'user', content: userMessage }];
+      let result = '';
+
+      for await (const event of client.stream(apiMessages, {
+        systemPrompt,
+        model,
+        maxTokens: 4096,
+        cwd: process.cwd(),
+      })) {
+        if (event.type === 'text') {
+          result += event.text ?? '';
+          continue;
+        }
+        if (event.type === 'done') {
+          result = event.fullText ?? result;
+          if (event.usage) {
+            this.tokenCounter.addUsage(event.usage.input ?? 0, event.usage.output ?? 0);
+          }
+          break;
+        }
+        if (event.type === 'error') {
+          throw event.error ?? new Error('Compaction summarization failed.');
+        }
+      }
+
+      return result;
+    };
+  }
+
   private async compactContext(notice?: string, instructions?: string): Promise<void> {
     const messages = buildCompactionMessages(this.state.messages, this.getCompactionBuildOptions());
     if (messages.length === 0) {
@@ -7058,8 +7098,20 @@ export class NativeBridgeController {
       return;
     }
 
+    const prevLoading = this.state.loading;
+    const prevLabel = this.state.loadingLabel;
+    this.state.loading = true;
+    this.state.loadingLabel = 'Compacting context...';
+    this.scheduleStatePush();
+
     try {
-      const compacted = await this.compactionEngine.compact(messages, instructions);
+      const summarizer = this.createCompactionSummarizer();
+      const compacted = await this.compactionEngine.compact(messages, {
+        instructions,
+        summarizer,
+        preserveRecentTurns: this.config?.compaction.preserve_recent_turns ?? 5,
+      });
+
       this.state.messages = [
         {
           id: randomUUID(),
@@ -7070,7 +7122,9 @@ export class NativeBridgeController {
         {
           id: randomUUID(),
           role: 'assistant',
-          content: 'Context compacted. Ready to continue.',
+          content: summarizer
+            ? '────── Context compacted (LLM-summarized) ──────'
+            : '────── Context compacted ──────',
           timestamp: Date.now(),
         },
       ];
@@ -7097,6 +7151,10 @@ export class NativeBridgeController {
       this.scheduleStatePush();
     } catch (error: unknown) {
       this.appendSystemMessage(`Compaction failed: ${serializeError(error)}`);
+    } finally {
+      this.state.loading = prevLoading;
+      this.state.loadingLabel = prevLabel;
+      this.scheduleStatePush();
     }
   }
 
