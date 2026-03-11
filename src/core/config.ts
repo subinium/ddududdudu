@@ -6,6 +6,7 @@ import { parseYaml } from '../utils/yaml.js';
 
 import {
   type ChecksConfig,
+  type CostBudgetConfig,
   type ContextBudgetConfig,
   type DduduConfig,
   type DduduConfigOverride,
@@ -112,6 +113,10 @@ const DEFAULT_CONFIG: DduduConfig = {
     auto_detect: true,
     warn_at: 0.8,
   } as ContextBudgetConfig,
+  cost_budget: {
+    maxPerSessionUsd: undefined,
+    warningThreshold: 0.8,
+  } as CostBudgetConfig,
   tools: {
     permission: 'auto' as const,
     toolbox_dirs: [],

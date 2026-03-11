@@ -145,13 +145,15 @@ Today `ddudu` does a minimal promotion pass after successful verified applies:
 
 This is intentionally conservative.
 
-## Proposed Promotion 2.0
+## Promotion 2.0
 
-The next step should treat promotion as a scored pipeline rather than a hard-coded append.
+Promotion is now a scored pipeline rather than a hard-coded append.
+
+Implementation: `src/core/memory-promotion.ts`
 
 ### Candidate extraction
 
-For each successful run, derive candidate records from:
+For each successful run, the system derives candidate records from:
 
 - verification summary
 - changed files
@@ -161,34 +163,50 @@ For each successful run, derive candidate records from:
 
 ### Scoring dimensions
 
-Each candidate should be scored on:
+Each candidate is scored on five dimensions with weighted composite:
 
-- stability: is this likely to stay true?
-- reuse: will future tasks benefit from retrieving it?
-- specificity: is it concrete enough to act on?
-- verification: was it confirmed by checks or just inferred?
-- novelty: is it already represented in memory?
+| Dimension | Weight | Signal |
+| --- | --- | --- |
+| stability | 0.25 | verification passed AND content references specific files/patterns |
+| reuse | 0.30 | content describes a convention, build command, or architectural rule |
+| specificity | 0.15 | content contains file paths, command names, or concrete values |
+| verification | 0.20 | 1.0 if passed, 0.3 if skipped, 0.0 if failed |
+| novelty | 0.10 | 1.0 if no existing entry has >60% text overlap |
 
 ### Promotion decision
 
-Example rule:
+The composite score drives the promotion target:
 
-- promote to `semantic` when stability + verification + reuse are high
-- promote to `procedural` when the output encodes a reusable sequence
-- promote to `episodic` when the result is useful context but not a stable rule
-- keep in `working` when it is still in-flight or uncertain
+- `promote_semantic` when composite >= 0.7 AND stability >= 0.6 AND verification >= 0.5
+- `promote_procedural` when composite >= 0.6 AND content has command/workflow patterns
+- `promote_episodic` when composite >= 0.4 AND composite < 0.7
+- `keep_working` when verification < 0.3 (unverified)
+- `discard` when composite < 0.3
+
+### Confidence metadata
+
+Promoted entries now carry YAML frontmatter with confidence metadata:
+
+```yaml
+---
+confidence: 0.85
+sourceRunId: "abc123"
+promotedAt: "2026-03-11T12:00:00Z"
+score: { stability: 0.9, reuse: 0.8, specificity: 0.7, verification: 1, novelty: 0.6, composite: 0.82 }
+---
+```
+
+This metadata is optional and additive — existing memory files without frontmatter continue to work unchanged.
 
 ## Dedupe And Merge
 
 Memory quality degrades quickly without dedupe.
 
-Promotion 2.0 should therefore support:
+The promotion pipeline supports:
 
-- fuzzy dedupe by normalized text and file overlap
-- merge-on-similarity for repeated procedures
-- replacement when a new verified rule supersedes an older weak one
-
-Without this, memory turns into append-only clutter.
+- fuzzy dedupe by Jaccard similarity on normalized word sets (duplicate threshold: >0.7 overlap)
+- merge-on-similarity for entries with 0.5-0.7 overlap, preferring more specific content
+- replacement when a candidate scores higher than an existing entry older than 7 days
 
 ## Failure Modes
 
@@ -231,18 +249,19 @@ Effect:
 
 ## ddudu Implementation Notes
 
-Current implementation already supports:
+Current implementation supports:
 
 - scoped memory files
 - purpose-aware memory selection
 - basic semantic/procedural promotion after verified apply
+- scored promotion candidates (Promotion 2.0)
+- Jaccard-based dedupe and merge policy
+- confidence metadata as YAML frontmatter on promoted entries
 
 What it does not yet provide:
 
-- scored promotion candidates
-- dedupe or merge policy
-- memory confidence metadata
 - a memory inspector that explains why an entry was promoted
+- automatic wiring of the scored pipeline into the verification flow (wiring pending)
 
 ## Design Rule
 

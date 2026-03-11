@@ -5,6 +5,13 @@ export interface TokenUsage {
   estimatedCost: number;
 }
 
+export interface BudgetEvent {
+  kind: 'warning' | 'exceeded';
+  currentCostUsd: number;
+  budgetMaxUsd: number;
+  percentUsed: number;
+}
+
 const MODEL_CONTEXT_LIMITS: { [model: string]: number } = {
   'claude-sonnet-4-6': 1000000,
   'claude-opus-4-6': 200000,
@@ -49,10 +56,31 @@ const DEFAULT_CONTEXT_LIMIT = 128000;
 const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/g;
 
 export class TokenCounter {
+  private static readonly COST_PER_1K_INPUT: Record<string, number> = {
+    'claude-opus-4-20250514': 0.015,
+    'claude-sonnet-4-20250514': 0.003,
+    'gpt-4.1': 0.002,
+    'gemini-2.5-pro': 0.00125,
+    default: 0.003,
+  };
+
+  private static readonly COST_PER_1K_OUTPUT: Record<string, number> = {
+    'claude-opus-4-20250514': 0.075,
+    'claude-sonnet-4-20250514': 0.015,
+    'gpt-4.1': 0.008,
+    'gemini-2.5-pro': 0.01,
+    default: 0.015,
+  };
+
   private model: string;
   private inputTokens: number;
   private outputTokens: number;
   private lastRequestInput = 0;
+  private budgetMaxUsd: number | null = null;
+  private warningThreshold = 0.8;
+  private budgetCallbacks: Array<(event: BudgetEvent) => void> = [];
+  private hasWarnedBudget = false;
+  private hasExceededBudget = false;
 
   public constructor(model: string) {
     this.model = model;
@@ -90,6 +118,7 @@ export class TokenCounter {
     this.inputTokens += inp;
     this.outputTokens += out;
     this.lastRequestInput = inp;
+    this.emitBudgetEventsIfNeeded();
   }
 
   public getUsage(): TokenUsage {
@@ -136,8 +165,99 @@ export class TokenCounter {
     return this.getUsagePercent() > 0.8;
   }
 
+  public setBudget(maxCostUsd: number): void {
+    this.budgetMaxUsd = Math.max(0, maxCostUsd);
+    this.hasWarnedBudget = false;
+    this.hasExceededBudget = false;
+    this.emitBudgetEventsIfNeeded();
+  }
+
+  public clearBudget(): void {
+    this.budgetMaxUsd = null;
+    this.hasWarnedBudget = false;
+    this.hasExceededBudget = false;
+  }
+
+  public isOverBudget(): boolean {
+    if (this.budgetMaxUsd === null) {
+      return false;
+    }
+
+    return this.getEstimatedCostUsd() > this.budgetMaxUsd;
+  }
+
+  public shouldWarnBudget(): boolean {
+    if (this.budgetMaxUsd === null || this.budgetMaxUsd <= 0) {
+      return false;
+    }
+
+    return this.getEstimatedCostUsd() / this.budgetMaxUsd >= this.warningThreshold;
+  }
+
+  public getRemainingBudgetUsd(): number | null {
+    if (this.budgetMaxUsd === null) {
+      return null;
+    }
+
+    const remaining = this.budgetMaxUsd - this.getEstimatedCostUsd();
+    return Number(Math.max(0, remaining).toFixed(6));
+  }
+
+  public getEstimatedCostUsd(): number {
+    const inputRate =
+      TokenCounter.COST_PER_1K_INPUT[this.model] ?? TokenCounter.COST_PER_1K_INPUT.default;
+    const outputRate =
+      TokenCounter.COST_PER_1K_OUTPUT[this.model] ?? TokenCounter.COST_PER_1K_OUTPUT.default;
+
+    const inputCost = (this.inputTokens / 1_000) * inputRate;
+    const outputCost = (this.outputTokens / 1_000) * outputRate;
+
+    return Number((inputCost + outputCost).toFixed(6));
+  }
+
+  public onBudgetEvent(callback: (event: BudgetEvent) => void): void {
+    this.budgetCallbacks.push(callback);
+  }
+
   public reset(): void {
     this.inputTokens = 0;
     this.outputTokens = 0;
+    this.hasWarnedBudget = false;
+    this.hasExceededBudget = false;
+  }
+
+  private emitBudgetEventsIfNeeded(): void {
+    if (this.budgetMaxUsd === null || this.budgetMaxUsd <= 0) {
+      return;
+    }
+
+    const currentCostUsd = this.getEstimatedCostUsd();
+    const percentUsed = currentCostUsd / this.budgetMaxUsd;
+
+    if (!this.hasWarnedBudget && percentUsed >= this.warningThreshold) {
+      this.hasWarnedBudget = true;
+      this.emitBudgetEvent({
+        kind: 'warning',
+        currentCostUsd,
+        budgetMaxUsd: this.budgetMaxUsd,
+        percentUsed,
+      });
+    }
+
+    if (!this.hasExceededBudget && percentUsed > 1) {
+      this.hasExceededBudget = true;
+      this.emitBudgetEvent({
+        kind: 'exceeded',
+        currentCostUsd,
+        budgetMaxUsd: this.budgetMaxUsd,
+        percentUsed,
+      });
+    }
+  }
+
+  private emitBudgetEvent(event: BudgetEvent): void {
+    for (const callback of this.budgetCallbacks) {
+      callback(event);
+    }
   }
 }

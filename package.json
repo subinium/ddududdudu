@@ -1,6 +1,6 @@
 {
   "name": "ddududdudu",
-  "version": "0.4.2",
+  "version": "0.5.0",
   "description": "AI coding harness with a native Rust TUI",
   "type": "module",
   "engines": {
@@ -19,8 +19,12 @@
     "dev": "node --watch scripts/transpile-runner.cjs",
     "install:global": "node scripts/install-global.cjs",
     "start": "node dist/index.js",
-    "lint": "node scripts/transpile-runner.cjs --noEmit",
+    "typecheck": "node scripts/transpile-runner.cjs --noEmit",
+    "lint:biome": "biome check src/",
+    "format": "biome format --write src/",
+    "format:check": "biome format src/",
     "test": "npm run build && node scripts/run-node-tests.cjs",
+    "test:coverage": "npm run build && c8 node scripts/run-node-tests.cjs",
     "bench:run": "node bench/run.mjs",
     "bench:report": "node bench/report.mjs",
     "clean": "rm -rf dist",
@@ -46,9 +50,7 @@
     "@ai-sdk/openai": "^3.0.41",
     "@anthropic-ai/claude-agent-sdk": "^0.2.71",
     "@openai/codex-sdk": "^0.111.0",
-    "@types/js-yaml": "^4.0.9",
     "ai": "^6.0.116",
-    "bash-language-server": "^5.6.0",
     "chalk": "^5.6.2",
     "cli-highlight": "^2.1.11",
     "js-yaml": "^4.1.1",
@@ -57,15 +59,21 @@
     "slice-ansi": "^8.0.0",
     "string-width": "^8.2.0",
     "strip-ansi": "^7.2.0",
-    "typescript-language-server": "^5.1.3",
-    "vscode-langservers-extracted": "^4.10.0",
     "wrap-ansi": "^10.0.0",
     "yaml": "^2.7.0",
-    "yaml-language-server": "^1.21.0",
     "zod": "^4.3.6"
   },
+  "optionalDependencies": {
+    "bash-language-server": "^5.6.0",
+    "typescript-language-server": "^5.1.3",
+    "vscode-langservers-extracted": "^4.10.0",
+    "yaml-language-server": "^1.21.0"
+  },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.6",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0",
+    "c8": "^11.0.0",
     "typescript": "^5.7.0"
   }
 }

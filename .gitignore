@@ -1,7 +1,11 @@
 # Build output
 dist/
+dist */
 tui/target/
 tsconfig.tsbuildinfo
+
+# Coverage
+coverage/
 
 # Dependencies
 node_modules/

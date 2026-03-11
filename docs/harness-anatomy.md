@@ -57,6 +57,8 @@ The core layers depend on a second ring of systems:
 | Verifiers | objective pass/fail signals after generation |
 | Background workers | detached and long-running execution |
 | Resource scheduler | provider, search, write, and verification concurrency control |
+| Cost budget | per-session cost tracking, warning thresholds, hard-stop enforcement |
+| Benchmarks | parallel task execution, multi-model comparison, failure categorization |
 
 ## Current ddudu Decomposition
 

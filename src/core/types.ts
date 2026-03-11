@@ -95,6 +95,7 @@ export interface PresetConfig {
   git_checkpoint?: boolean;
   drift_check?: boolean;
   context_budget?: ContextBudgetConfigOverride;
+  cost_budget?: CostBudgetConfigOverride;
   tools?: ToolsConfigOverride;
   mcp?: McpConfigOverride;
   skills?: SkillsConfigOverride;
@@ -114,6 +115,7 @@ export interface DduduConfig {
   git_checkpoint: boolean;
   drift_check: boolean;
   context_budget: ContextBudgetConfig;
+  cost_budget: CostBudgetConfig;
   tools: ToolsConfig;
   mcp: McpConfig;
   skills: SkillsConfig;
@@ -174,6 +176,7 @@ export interface DduduConfigOverride {
   git_checkpoint?: boolean;
   drift_check?: boolean;
   context_budget?: ContextBudgetConfigOverride;
+  cost_budget?: CostBudgetConfigOverride;
   tools?: ToolsConfigOverride;
   mcp?: McpConfigOverride;
   skills?: SkillsConfigOverride;
@@ -297,6 +300,11 @@ export interface ContextBudgetConfig {
   warn_at: number;
 }
 
+export interface CostBudgetConfig {
+  maxPerSessionUsd?: number;
+  warningThreshold?: number;
+}
+
 export interface ToolsConfigOverride {
   permission?: ToolPermission;
   toolbox_dirs?: string[];
@@ -331,4 +339,9 @@ export interface ChecksConfigOverride {
 export interface ContextBudgetConfigOverride {
   auto_detect?: boolean;
   warn_at?: number;
+}
+
+export interface CostBudgetConfigOverride {
+  maxPerSessionUsd?: number;
+  warningThreshold?: number;
 }

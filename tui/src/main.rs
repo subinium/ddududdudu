@@ -7,11 +7,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use crossterm::execute;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
-    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
+use crossterm::execute;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -21,16 +21,17 @@ use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-const BG: Color = Color::Black;
-const FG: Color = Color::Rgb(250, 246, 248);
-const ACCENT: Color = Color::Rgb(247, 167, 187);
-const ACCENT_DIM: Color = Color::Rgb(190, 120, 140);
-const SUCCESS: Color = Color::Rgb(80, 220, 120);
-const ERROR: Color = Color::Rgb(255, 90, 110);
-const MUTED: Color = Color::Rgb(128, 96, 108);
-const TOOL_MUTED: Color = Color::Rgb(144, 140, 146);
-const LINK: Color = Color::Rgb(132, 203, 255);
-const PATH: Color = Color::Rgb(255, 208, 120);
+const BG: Color = Color::Rgb(18, 18, 24);
+const FG: Color = Color::Rgb(248, 248, 242);
+const ACCENT: Color = Color::Rgb(247, 167, 187); // #F7A7BB original ddudu pink
+const ACCENT_DIM: Color = Color::Rgb(160, 110, 125);
+const SUCCESS: Color = Color::Rgb(80, 250, 123);
+const ERROR: Color = Color::Rgb(255, 85, 85);
+const MUTED: Color = Color::Rgb(110, 100, 105);
+const TOOL_MUTED: Color = Color::Rgb(110, 100, 105);
+const LINK: Color = Color::Rgb(139, 233, 253);
+const PATH: Color = Color::Rgb(241, 250, 140);
+const ORANGE: Color = Color::Rgb(255, 184, 108);
 const PANEL_TOP_PADDING: u16 = 2;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
@@ -279,6 +280,17 @@ struct NativeArtifactState {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct NativeGitState {
+    branch: Option<String>,
+    changed_file_count: u64,
+    staged_file_count: u64,
+    has_uncommitted: bool,
+    changed_files: Vec<String>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct NativeWorkspaceState {
     label: String,
     path: String,
@@ -348,6 +360,7 @@ struct NativeTuiState {
     agent_activities: Vec<NativeAgentActivityState>,
     background_jobs: Vec<NativeBackgroundJobState>,
     artifacts: Vec<NativeArtifactState>,
+    git: Option<NativeGitState>,
     workspace: Option<NativeWorkspaceState>,
     verification: Option<NativeVerificationState>,
     error: Option<String>,
@@ -605,9 +618,9 @@ impl BridgeClient {
                             let decoded = if payload.starts_with('{') {
                                 payload.to_owned()
                             } else {
-                                let bytes = BASE64_STANDARD
-                                    .decode(payload)
-                                    .map_err(|error| anyhow!("failed to decode bridge event: {error}"))?;
+                                let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
+                                    anyhow!("failed to decode bridge event: {error}")
+                                })?;
                                 String::from_utf8(bytes).map_err(|error| {
                                     anyhow!("failed to decode bridge event utf8: {error}")
                                 })?
@@ -721,6 +734,7 @@ impl App {
                 agent_activities: Vec::new(),
                 background_jobs: Vec::new(),
                 artifacts: Vec::new(),
+                git: None,
                 workspace: None,
                 verification: None,
                 error: None,
@@ -763,7 +777,11 @@ impl App {
                     .iter()
                     .map(|job| (job.id.clone(), job.status.clone()))
                     .collect::<std::collections::HashMap<_, _>>();
-                let previous_verification = self.state.verification.as_ref().map(|item| item.status.clone());
+                let previous_verification = self
+                    .state
+                    .verification
+                    .as_ref()
+                    .map(|item| item.status.clone());
                 self.state = state;
 
                 if !was_asking && self.state.ask_user.is_some() {
@@ -783,7 +801,10 @@ impl App {
                 {
                     let mode_label = self.current_mode_label();
                     self.push_notice(
-                        format!("{} · {} · {}", mode_label, self.state.provider, self.state.model),
+                        format!(
+                            "{} · {} · {}",
+                            mode_label, self.state.provider, self.state.model
+                        ),
                         NoticeTone::Info,
                     );
                 }
@@ -794,13 +815,19 @@ impl App {
                     if matches!(previous.map(|value| value.as_str()), Some("running"))
                         && job.status == "done"
                     {
-                        pending_notices.push((format!("{} finished", job.label), NoticeTone::Success));
-                    } else if matches!(previous.map(|value| value.as_str()), Some("running" | "done"))
-                        && job.status == "cancelled"
+                        pending_notices
+                            .push((format!("{} finished", job.label), NoticeTone::Success));
+                    } else if matches!(
+                        previous.map(|value| value.as_str()),
+                        Some("running" | "done")
+                    ) && job.status == "cancelled"
                     {
-                        pending_notices.push((format!("{} cancelled", job.label), NoticeTone::Info));
-                    } else if matches!(previous.map(|value| value.as_str()), Some("running" | "done"))
-                        && job.status == "error"
+                        pending_notices
+                            .push((format!("{} cancelled", job.label), NoticeTone::Info));
+                    } else if matches!(
+                        previous.map(|value| value.as_str()),
+                        Some("running" | "done")
+                    ) && job.status == "error"
                     {
                         pending_notices.push((format!("{} failed", job.label), NoticeTone::Error));
                     }
@@ -809,12 +836,20 @@ impl App {
                     self.push_notice(text, tone);
                 }
 
-                let current_verification = self.state.verification.as_ref().map(|item| item.status.clone());
+                let current_verification = self
+                    .state
+                    .verification
+                    .as_ref()
+                    .map(|item| item.status.clone());
                 if previous_verification.as_deref() != current_verification.as_deref() {
                     if let Some(status) = current_verification.as_deref() {
                         match status {
-                            "passed" => self.push_notice("verification passed".to_string(), NoticeTone::Success),
-                            "failed" => self.push_notice("verification failed".to_string(), NoticeTone::Error),
+                            "passed" => self.push_notice(
+                                "verification passed".to_string(),
+                                NoticeTone::Success,
+                            ),
+                            "failed" => self
+                                .push_notice("verification failed".to_string(), NoticeTone::Error),
                             _ => {}
                         }
                     }
@@ -845,11 +880,7 @@ impl App {
             .unwrap_or_else(|| self.state.mode.to_uppercase())
     }
 
-    fn ask_user_shortcut_index(
-        &self,
-        prompt: &NativeAskUserState,
-        key: char,
-    ) -> Option<usize> {
+    fn ask_user_shortcut_index(&self, prompt: &NativeAskUserState, key: char) -> Option<usize> {
         if prompt.kind != "confirm" && prompt.kind != "single_select" {
             return None;
         }
@@ -862,13 +893,17 @@ impl App {
         }
 
         let lower = key.to_ascii_lowercase().to_string();
-        prompt.options.iter().enumerate().find_map(|(index, option)| {
-            option
-                .shortcut
-                .as_ref()
-                .filter(|shortcut| shortcut.eq_ignore_ascii_case(&lower))
-                .map(|_| index)
-        })
+        prompt
+            .options
+            .iter()
+            .enumerate()
+            .find_map(|(index, option)| {
+                option
+                    .shortcut
+                    .as_ref()
+                    .filter(|shortcut| shortcut.eq_ignore_ascii_case(&lower))
+                    .map(|_| index)
+            })
     }
 
     fn send_ask_user_answer(
@@ -911,7 +946,8 @@ impl App {
                 .options
                 .iter()
                 .position(|option| option.value == *default_value);
-            let option_label = option_index.and_then(|index| prompt.options.get(index).map(|item| item.label.clone()));
+            let option_label = option_index
+                .and_then(|index| prompt.options.get(index).map(|item| item.label.clone()));
             self.send_ask_user_answer(
                 default_value.clone(),
                 "default",
@@ -929,14 +965,14 @@ impl App {
         Ok(false)
     }
 
-    fn validate_ask_user_input(
-        &self,
-        prompt: &NativeAskUserState,
-        value: &str,
-    ) -> Option<String> {
+    fn validate_ask_user_input(&self, prompt: &NativeAskUserState, value: &str) -> Option<String> {
         let trimmed = value.trim();
 
-        if prompt.required && trimmed.is_empty() && prompt.default_value.is_none() && prompt.options.is_empty() {
+        if prompt.required
+            && trimmed.is_empty()
+            && prompt.default_value.is_none()
+            && prompt.options.is_empty()
+        {
             return Some("answer required".to_string());
         }
 
@@ -974,12 +1010,9 @@ impl App {
 
             if let Some(max_length) = validation.max_length {
                 if trimmed.len() > max_length as usize {
-                    return Some(
-                        validation
-                            .message
-                            .clone()
-                            .unwrap_or_else(|| format!("keep the answer under {} characters", max_length)),
-                    );
+                    return Some(validation.message.clone().unwrap_or_else(|| {
+                        format!("keep the answer under {} characters", max_length)
+                    }));
                 }
             }
 
@@ -987,12 +1020,9 @@ impl App {
                 match regex::Regex::new(pattern) {
                     Ok(regex) => {
                         if !regex.is_match(trimmed) {
-                            return Some(
-                                validation
-                                    .message
-                                    .clone()
-                                    .unwrap_or_else(|| "answer format does not match the requirement".to_string()),
-                            );
+                            return Some(validation.message.clone().unwrap_or_else(|| {
+                                "answer format does not match the requirement".to_string()
+                            }));
                         }
                     }
                     Err(_) => {}
@@ -1090,8 +1120,9 @@ impl App {
             return Ok(());
         }
 
-        self.bridge
-            .send(BridgeCommand::PrefetchContext { content: content.clone() })?;
+        self.bridge.send(BridgeCommand::PrefetchContext {
+            content: content.clone(),
+        })?;
         self.last_prefetched_input = Some(content);
         Ok(())
     }
@@ -1164,7 +1195,8 @@ impl App {
         };
         let show_sidebar = root.len() > 1;
         let main = root[0];
-        let queue_height = if !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none() {
+        let queue_height = if !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none()
+        {
             let visible = self.state.queued_prompts.len().min(3);
             let more_row = usize::from(self.state.queued_prompts.len() > visible);
             (visible + more_row + 1) as u16
@@ -1176,7 +1208,12 @@ impl App {
             .ask_user
             .as_ref()
             .map(|prompt| {
-                let detail_rows = u16::from(prompt.detail.as_ref().is_some_and(|detail| !detail.trim().is_empty()));
+                let detail_rows = u16::from(
+                    prompt
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| !detail.trim().is_empty()),
+                );
                 let meta_rows = u16::from(
                     prompt.kind != "input"
                         || prompt.default_value.is_some()
@@ -1285,7 +1322,7 @@ impl App {
     fn draw_sidebar_divider(&self, frame: &mut Frame, x: u16, area: Rect) {
         for row in area.top()..area.bottom() {
             frame.buffer_mut().cell_mut((x, row)).map(|cell| {
-                cell.set_symbol("│").set_fg(ACCENT_DIM).set_bg(BG);
+                cell.set_symbol("│").set_fg(MUTED).set_bg(BG);
             });
         }
     }
@@ -1330,10 +1367,10 @@ impl App {
     fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
         let inner = top_padded_rect(
             Rect {
-            x: area.x + 2,
-            y: area.y,
-            width: area.width.saturating_sub(2),
-            height: area.height,
+                x: area.x + 2,
+                y: area.y,
+                width: area.width.saturating_sub(2),
+                height: area.height,
             },
             PANEL_TOP_PADDING,
         );
@@ -1343,15 +1380,25 @@ impl App {
         lines.push(sidebar_header("Run"));
         push_sidebar_rail_item(
             &mut lines,
-            if self.state.loading { SPINNER_FRAMES[self.spinner_index] } else { "·" },
-            if self.state.loading { ACCENT } else { ACCENT_DIM },
+            if self.state.loading {
+                SPINNER_FRAMES[self.spinner_index]
+            } else {
+                "·"
+            },
+            if self.state.loading {
+                ACCENT
+            } else {
+                ACCENT_DIM
+            },
             run_title,
             run_detail,
             FG,
             ACCENT_DIM,
         );
         lines.push(Line::from(Span::raw("")));
+        self.render_sidebar_git_tab(&mut lines);
         let mut item_index = 0usize;
+        lines.push(Line::from(Span::raw("")));
         self.render_sidebar_plan_tab(&mut lines, &mut item_index);
         lines.push(Line::from(Span::raw("")));
         self.render_sidebar_jobs_tab(&mut lines, &mut item_index);
@@ -1366,15 +1413,16 @@ impl App {
         );
     }
 
-    fn render_sidebar_jobs_tab(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        item_index: &mut usize,
-    ) {
+    fn render_sidebar_jobs_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
+        if self.state.agent_activities.is_empty()
+            && self.state.background_jobs.is_empty()
+            && !self.state.loading
+        {
+            return;
+        }
+
         let active_job = active_sidebar_job(&self.state);
-        let mut has_activity = false;
         if !self.state.agent_activities.is_empty() {
-            has_activity = true;
             lines.push(sidebar_header("Workers"));
             push_sidebar_rail_item(
                 lines,
@@ -1402,7 +1450,11 @@ impl App {
             } else {
                 match (&item.mode, &item.purpose) {
                     (Some(mode), Some(purpose)) => {
-                        format!("{} · {}", title_case_label(mode), display_purpose_role(purpose))
+                        format!(
+                            "{} · {}",
+                            title_case_label(mode),
+                            display_purpose_role(purpose)
+                        )
                     }
                     (Some(mode), None) => title_case_label(mode),
                     (None, Some(purpose)) => display_purpose_role(purpose),
@@ -1419,9 +1471,11 @@ impl App {
                 title
             };
             let linked_detail = match item.detail.as_ref() {
-                Some(detail) if !detail.trim().is_empty() => {
-                    Some(format!("{} · {}", worker_status_word(&item.status), preview_line(detail, 18)))
-                }
+                Some(detail) if !detail.trim().is_empty() => Some(format!(
+                    "{} · {}",
+                    worker_status_word(&item.status),
+                    preview_line(detail, 18)
+                )),
                 _ => Some(worker_status_word(&item.status).to_string()),
             };
             push_sidebar_selectable_item(
@@ -1432,7 +1486,11 @@ impl App {
                 preview_line(&title, 28),
                 linked_detail
                     .map(|detail| preview_line(&detail, 28))
-                    .or_else(|| item.workspace_path.as_ref().map(|path| preview_line(path, 28))),
+                    .or_else(|| {
+                        item.workspace_path
+                            .as_ref()
+                            .map(|path| preview_line(path, 28))
+                    }),
                 FG,
                 ACCENT_DIM,
             );
@@ -1443,7 +1501,6 @@ impl App {
         }
 
         if !self.state.background_jobs.is_empty() {
-            has_activity = true;
             if !self.state.agent_activities.is_empty() {
                 lines.push(Line::from(Span::raw("")));
             }
@@ -1475,39 +1532,25 @@ impl App {
                 checklist_progress(&job.checklist)
                     .or_else(|| job.detail.clone())
                     .map(|detail| preview_line(&detail, 28))
-                    .or_else(|| job.detail
-                        .as_ref()
-                        .map(|detail| preview_line(detail, 28)))
-                    .or_else(|| job.result_preview.as_ref().map(|detail| preview_line(detail, 28)))
-                    .or_else(|| job.workspace_path.as_ref().map(|path| preview_line(path, 28))),
+                    .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
+                    .or_else(|| {
+                        job.result_preview
+                            .as_ref()
+                            .map(|detail| preview_line(detail, 28))
+                    })
+                    .or_else(|| {
+                        job.workspace_path
+                            .as_ref()
+                            .map(|path| preview_line(path, 28))
+                    }),
                 FG,
                 ACCENT_DIM,
             );
             *item_index += 1;
         }
-
-        if !has_activity {
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "nothing running".to_string(),
-                Some(if self.state.loading {
-                    "foreground request still running".to_string()
-                } else {
-                    "idle".to_string()
-                }),
-                FG,
-                ACCENT_DIM,
-            );
-        }
     }
 
-    fn render_sidebar_plan_tab(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        item_index: &mut usize,
-    ) {
+    fn render_sidebar_plan_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
         lines.push(sidebar_header("Current Run"));
         let run_title = if let Some(job) = active_sidebar_job(&self.state) {
             job.prompt_preview
@@ -1521,7 +1564,11 @@ impl App {
         };
         let run_detail = if let Some(job) = active_sidebar_job(&self.state) {
             {
-                let blocked = job.checklist.iter().filter(|item| item.status == "blocked").count();
+                let blocked = job
+                    .checklist
+                    .iter()
+                    .filter(|item| item.status == "blocked")
+                    .count();
                 let mut parts = Vec::new();
                 if let Some(strategy) = &job.strategy {
                     parts.push(strategy.clone());
@@ -1538,7 +1585,7 @@ impl App {
                     Some(parts.join(" · "))
                 }
             }
-                .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
+            .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
         } else if let Some(workspace) = &self.state.workspace {
             Some(preview_line(&workspace.label, 28))
         } else if self.state.loading {
@@ -1548,13 +1595,7 @@ impl App {
             None
         };
         push_sidebar_rail_item(
-            lines,
-            "·",
-            ACCENT_DIM,
-            run_title,
-            run_detail,
-            FG,
-            ACCENT_DIM,
+            lines, "·", ACCENT_DIM, run_title, run_detail, FG, ACCENT_DIM,
         );
         if let Some(verification) = &self.state.verification {
             let (marker, color) = match verification.status.as_str() {
@@ -1596,7 +1637,8 @@ impl App {
                             .strategy
                             .as_ref()
                             .map(|strategy| format!("{strategy}")),
-                        (worker_count > 0).then(|| format!("{} workers", format_count(worker_count as u64))),
+                        (worker_count > 0)
+                            .then(|| format!("{} workers", format_count(worker_count as u64))),
                         checklist_progress(&active_job.checklist),
                     ]
                     .into_iter()
@@ -1611,7 +1653,12 @@ impl App {
             for (index, item) in active_job.checklist.iter().enumerate().take(6) {
                 let (marker, color) = checklist_status_marker(&item.status, self.spinner_index);
                 let title = if let Some(owner) = &item.owner {
-                    format!("{}. {} · {}", index + 1, item.label, preview_line(owner, 10))
+                    format!(
+                        "{}. {} · {}",
+                        index + 1,
+                        item.label,
+                        preview_line(owner, 10)
+                    )
                 } else {
                     format!("{}. {}", index + 1, item.label)
                 };
@@ -1668,7 +1715,11 @@ impl App {
                 .count();
             let total = self.state.todos.len();
             let todo_summary = [
-                Some(format!("{}/{} done", format_count(completed as u64), format_count(total as u64))),
+                Some(format!(
+                    "{}/{} done",
+                    format_count(completed as u64),
+                    format_count(total as u64)
+                )),
                 (in_progress > 0).then(|| format!("{} active", format_count(in_progress as u64))),
             ]
             .into_iter()
@@ -1705,26 +1756,10 @@ impl App {
                 );
                 *item_index += 1;
             }
-        } else if active_sidebar_job(&self.state).is_none() {
-            lines.push(Line::from(Span::raw("")));
-            lines.push(sidebar_header("Todo Board"));
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "todo board empty".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
         }
     }
 
-    fn render_sidebar_context_tab(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        item_index: &mut usize,
-    ) {
+    fn render_sidebar_context_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
         lines.push(sidebar_header("Context"));
         if !self.state.ready {
             push_sidebar_rail_item(
@@ -1799,11 +1834,7 @@ impl App {
         }
     }
 
-    fn render_sidebar_systems_tab(
-        &self,
-        lines: &mut Vec<Line<'static>>,
-        item_index: &mut usize,
-    ) {
+    fn render_sidebar_systems_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
         lines.push(sidebar_header("Systems"));
         push_sidebar_rail_item(
             lines,
@@ -1845,15 +1876,9 @@ impl App {
                 );
             } else {
                 let title = if mcp.connected_servers > 0 {
-                    format!(
-                        "MCP {} active",
-                        format_count(mcp.connected_servers)
-                    )
+                    format!("MCP {} active", format_count(mcp.connected_servers))
                 } else {
-                    format!(
-                        "MCP {} configured",
-                        format_count(mcp.configured_servers)
-                    )
+                    format!("MCP {} configured", format_count(mcp.configured_servers))
                 };
                 let detail = if mcp.connected_servers > 0 {
                     Some(format!(
@@ -1870,8 +1895,16 @@ impl App {
                 push_sidebar_selectable_item(
                     lines,
                     *item_index == self.sidebar_selection,
-                    if mcp.connected_servers > 0 { "◎" } else { "○" },
-                    if mcp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                    if mcp.connected_servers > 0 {
+                        "◎"
+                    } else {
+                        "○"
+                    },
+                    if mcp.connected_servers > 0 {
+                        ACCENT
+                    } else {
+                        ACCENT_DIM
+                    },
                     title,
                     detail,
                     FG,
@@ -1919,8 +1952,16 @@ impl App {
                 push_sidebar_selectable_item(
                     lines,
                     *item_index == self.sidebar_selection,
-                    if lsp.connected_servers > 0 { "◎" } else { "○" },
-                    if lsp.connected_servers > 0 { ACCENT } else { ACCENT_DIM },
+                    if lsp.connected_servers > 0 {
+                        "◎"
+                    } else {
+                        "○"
+                    },
+                    if lsp.connected_servers > 0 {
+                        ACCENT
+                    } else {
+                        ACCENT_DIM
+                    },
                     title,
                     detail,
                     FG,
@@ -1938,6 +1979,62 @@ impl App {
                 FG,
                 ACCENT_DIM,
             );
+        }
+    }
+
+    fn render_sidebar_git_tab(&self, lines: &mut Vec<Line<'static>>) {
+        let Some(git) = &self.state.git else {
+            return;
+        };
+
+        lines.push(sidebar_header("Git"));
+
+        let branch_name = git.branch.as_deref().unwrap_or("detached");
+        let branch_display = preview_line(branch_name, 24);
+        push_sidebar_rail_item(lines, "⎇", ACCENT, branch_display, None, FG, ACCENT_DIM);
+
+        if git.changed_file_count > 0 || git.staged_file_count > 0 {
+            let marker = if git.has_uncommitted { "●" } else { "○" };
+            let color = if git.has_uncommitted { ORANGE } else { MUTED };
+            let title =
+                if git.staged_file_count > 0 && git.changed_file_count > git.staged_file_count {
+                    format!(
+                        "{} staged · {} unstaged",
+                        format_count(git.staged_file_count),
+                        format_count(git.changed_file_count - git.staged_file_count)
+                    )
+                } else if git.staged_file_count > 0 {
+                    format!("{} staged", format_count(git.staged_file_count))
+                } else {
+                    format!("{} changed", format_count(git.changed_file_count))
+                };
+            push_sidebar_rail_item(lines, marker, color, title, None, FG, ACCENT_DIM);
+
+            for file in git.changed_files.iter().take(5) {
+                let display_name = file.rsplit('/').next().unwrap_or(file);
+                push_sidebar_rail_item(
+                    lines,
+                    "·",
+                    MUTED,
+                    preview_line(display_name, 28),
+                    Some(preview_line(file, 28)),
+                    PATH,
+                    MUTED,
+                );
+            }
+            if git.changed_files.len() > 5 {
+                push_sidebar_rail_item(
+                    lines,
+                    "·",
+                    MUTED,
+                    format!("… +{} more", git.changed_files.len() - 5),
+                    None,
+                    MUTED,
+                    MUTED,
+                );
+            }
+        } else {
+            push_sidebar_rail_item(lines, "✓", SUCCESS, "clean".to_string(), None, MUTED, MUTED);
         }
     }
 
@@ -1999,8 +2096,7 @@ impl App {
         let plan_len = self.state.todos.iter().take(10).count();
         let jobs_len = self.state.agent_activities.iter().take(4).count()
             + self.state.background_jobs.iter().take(4).count();
-        let context_len = 1
-            + usize::from(self.state.request_estimate.is_some());
+        let context_len = 1 + usize::from(self.state.request_estimate.is_some());
         match tab {
             SidebarTab::Plan => 0,
             SidebarTab::Jobs => plan_len,
@@ -2036,12 +2132,10 @@ impl App {
                 NoticeTone::Error => ERROR,
             };
             frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        preview_line(&notice.text, width.saturating_sub(4) as usize),
-                        Style::default().fg(FG),
-                    )),
-                ]))
+                Paragraph::new(Text::from(vec![Line::from(Span::styled(
+                    preview_line(&notice.text, width.saturating_sub(4) as usize),
+                    Style::default().fg(FG),
+                ))]))
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
@@ -2054,7 +2148,11 @@ impl App {
     }
 
     fn render_inspector(&self, frame: &mut Frame, inspector: &InspectorState) {
-        let area = centered_rect(72, frame.area().height.saturating_sub(6).min(24), frame.area());
+        let area = centered_rect(
+            72,
+            frame.area().height.saturating_sub(6).min(24),
+            frame.area(),
+        );
         frame.render_widget(Clear, area);
         let inner = Rect {
             x: area.x + 1,
@@ -2077,7 +2175,12 @@ impl App {
         let footer = inspector
             .footer
             .as_ref()
-            .map(|footer| Line::from(Span::styled(footer.clone(), Style::default().fg(ACCENT_DIM))))
+            .map(|footer| {
+                Line::from(Span::styled(
+                    footer.clone(),
+                    Style::default().fg(ACCENT_DIM),
+                ))
+            })
             .unwrap_or_else(|| Line::from(Span::raw("")));
 
         let mut content = vec![Line::from(Span::styled(
@@ -2119,7 +2222,10 @@ impl App {
                 ));
             }
             spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            spans.push(Span::styled("Esc interrupt", Style::default().fg(ACCENT_DIM)));
+            spans.push(Span::styled(
+                "Esc interrupt",
+                Style::default().fg(ACCENT_DIM),
+            ));
         } else if let Some(prompt) = &self.state.ask_user {
             spans.push(Span::styled(
                 "ask",
@@ -2140,26 +2246,42 @@ impl App {
     }
 
     fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 || self.state.queued_prompts.is_empty() || self.state.ask_user.is_some() {
+        if area.height == 0 || self.state.queued_prompts.is_empty() || self.state.ask_user.is_some()
+        {
             return;
         }
 
         let mut lines = vec![Line::from(vec![
-            Span::styled("Queue ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(
-                format!("{} waiting", format_count(self.state.queued_prompts.len() as u64)),
+                "Queue ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "{} waiting",
+                    format_count(self.state.queued_prompts.len() as u64)
+                ),
                 Style::default().fg(ACCENT_DIM),
             ),
         ])];
 
         let preview_rows = self.state.queued_prompts.len().min(3);
-        for (index, prompt) in self.state.queued_prompts.iter().take(preview_rows).enumerate() {
+        for (index, prompt) in self
+            .state
+            .queued_prompts
+            .iter()
+            .take(preview_rows)
+            .enumerate()
+        {
             let marker = format!("{:>2}. ", index + 1);
             let marker_width = marker.width();
             lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(ACCENT_DIM)),
                 Span::styled(
-                    preview_line(prompt, area.width.saturating_sub(marker_width as u16) as usize),
+                    preview_line(
+                        prompt,
+                        area.width.saturating_sub(marker_width as u16) as usize,
+                    ),
                     Style::default().fg(FG),
                 ),
             ]));
@@ -2218,8 +2340,12 @@ impl App {
             .ask_user
             .as_ref()
             .map(|prompt| {
-                let detail_rows =
-                    usize::from(prompt.detail.as_ref().is_some_and(|detail| !detail.trim().is_empty()));
+                let detail_rows = usize::from(
+                    prompt
+                        .detail
+                        .as_ref()
+                        .is_some_and(|detail| !detail.trim().is_empty()),
+                );
                 let meta_rows = usize::from(
                     prompt.kind != "input"
                         || prompt.default_value.is_some()
@@ -2249,7 +2375,8 @@ impl App {
         );
         let max_visible = inner
             .height
-            .saturating_sub((footer_rows + usize::from(paste_visible)) as u16) as usize;
+            .saturating_sub((footer_rows + usize::from(paste_visible)) as u16)
+            as usize;
         let start = metrics
             .lines
             .len()
@@ -2276,7 +2403,10 @@ impl App {
                     format!("{} Lines", format_count(line_count as u64)),
                     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 ),
-                Span::styled("] Enter insert · Esc cancel", Style::default().fg(ACCENT_DIM)),
+                Span::styled(
+                    "] Enter insert · Esc cancel",
+                    Style::default().fg(ACCENT_DIM),
+                ),
             ]));
         }
 
@@ -2326,7 +2456,10 @@ impl App {
                 } else {
                     "optional".to_string()
                 }),
-                prompt.default_value.as_ref().map(|value| format!("default {value}")),
+                prompt
+                    .default_value
+                    .as_ref()
+                    .map(|value| format!("default {value}")),
                 prompt
                     .validation
                     .as_ref()
@@ -2412,7 +2545,9 @@ impl App {
                         FG
                     };
                     let option_style = if selected {
-                        Style::default().fg(option_color).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(option_color)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(option_color)
                     };
@@ -2513,12 +2648,15 @@ impl App {
             let height = min(items.len().max(1), 10) as u16;
             let area = centered_rect(
                 72,
-                height.saturating_add(3).min(body_area.height.saturating_sub(1)),
+                height
+                    .saturating_add(3)
+                    .min(body_area.height.saturating_sub(1)),
                 body_area,
             );
             return Some((
                 area,
-                items.into_iter()
+                items
+                    .into_iter()
                     .take(10)
                     .map(|item| Suggestion {
                         kind: SuggestionKind::Slash,
@@ -2822,30 +2960,21 @@ impl App {
         }
 
         if let Some(prompt) = self.state.ask_user.clone() {
-            if matches!(key.code, KeyCode::Up)
-                && composer_empty
-                && !prompt.options.is_empty()
-            {
+            if matches!(key.code, KeyCode::Up) && composer_empty && !prompt.options.is_empty() {
                 if self.ask_user_selection > 0 {
                     self.ask_user_selection -= 1;
                 }
                 return Ok(());
             }
 
-            if matches!(key.code, KeyCode::Down)
-                && composer_empty
-                && !prompt.options.is_empty()
-            {
+            if matches!(key.code, KeyCode::Down) && composer_empty && !prompt.options.is_empty() {
                 if self.ask_user_selection + 1 < prompt.options.len() {
                     self.ask_user_selection += 1;
                 }
                 return Ok(());
             }
 
-            if composer_empty
-                && key.modifiers.is_empty()
-                && matches!(key.code, KeyCode::Char(_))
-            {
+            if composer_empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Char(_)) {
                 let KeyCode::Char(ch) = key.code else {
                     unreachable!()
                 };
@@ -3151,7 +3280,9 @@ impl App {
             PaletteAction::SwitchTab(tab) => self.set_sidebar_tab(tab),
             PaletteAction::OpenTarget(target) => self.open_sidebar_target(target)?,
             PaletteAction::OpenContext => self.open_context_inspector(),
-            PaletteAction::OpenDiff(cwd) => self.open_diff_viewer(cwd, "Workspace Diff".to_string())?,
+            PaletteAction::OpenDiff(cwd) => {
+                self.open_diff_viewer(cwd, "Workspace Diff".to_string())?
+            }
         }
         Ok(())
     }
@@ -3178,7 +3309,12 @@ impl App {
                 }
                 KeyCode::Char('v') => match &inspector.kind {
                     InspectorKind::Job(job_id) => {
-                        if let Some(job) = self.state.background_jobs.iter().find(|item| item.id == *job_id) {
+                        if let Some(job) = self
+                            .state
+                            .background_jobs
+                            .iter()
+                            .find(|item| item.id == *job_id)
+                        {
                             open_diff = Some((
                                 job.workspace_path.clone(),
                                 format!("Job Diff · {}", preview_line(&job.label, 24)),
@@ -3301,9 +3437,16 @@ impl App {
                         .map(|mode| title_case_label(mode))
                         .unwrap_or_else(|| "n/a".to_string())
                 ),
-                format!("purpose: {}", item.purpose.clone().unwrap_or_else(|| "general".to_string())),
+                format!(
+                    "purpose: {}",
+                    item.purpose
+                        .clone()
+                        .unwrap_or_else(|| "general".to_string())
+                ),
                 format!("updated: {}", item.updated_at),
-                item.detail.clone().unwrap_or_else(|| "detail: n/a".to_string()),
+                item.detail
+                    .clone()
+                    .unwrap_or_else(|| "detail: n/a".to_string()),
                 item.workspace_path
                     .as_ref()
                     .map(|path| format!("workspace: {path}"))
@@ -3330,7 +3473,10 @@ impl App {
                         .map(|mode| title_case_label(mode))
                         .unwrap_or_else(|| "n/a".to_string())
                 ),
-                format!("purpose: {}", job.purpose.clone().unwrap_or_else(|| "general".to_string())),
+                format!(
+                    "purpose: {}",
+                    job.purpose.clone().unwrap_or_else(|| "general".to_string())
+                ),
                 format!("started: {}", job.started_at),
                 format!("updated: {}", job.updated_at),
                 job.detail
@@ -3346,7 +3492,10 @@ impl App {
                     .map(|path| format!("workspace: {path}"))
                     .unwrap_or_else(|| "workspace: n/a".to_string()),
             ],
-            footer: Some("r retry · p promote · c cancel · l logs · o result · v diff · Esc close".to_string()),
+            footer: Some(
+                "r retry · p promote · c cancel · l logs · o result · v diff · Esc close"
+                    .to_string(),
+            ),
             scroll: 0,
             kind: InspectorKind::Job(job.id.clone()),
         })
@@ -3356,11 +3505,7 @@ impl App {
         let prompt = self.state.queued_prompts.get(index)?;
         Some(InspectorState {
             title: format!("Queue {}", index + 1),
-            body: vec![
-                "queued prompt".to_string(),
-                String::new(),
-                prompt.clone(),
-            ],
+            body: vec!["queued prompt".to_string(), String::new(), prompt.clone()],
             footer: Some("r run · p promote · d drop · Esc close".to_string()),
             scroll: 0,
             kind: InspectorKind::Queue(index),
@@ -3374,7 +3519,10 @@ impl App {
             body: vec![
                 format!("status: {}", item.status),
                 format!("step: {}", item.step),
-                format!("owner: {}", item.owner.clone().unwrap_or_else(|| "n/a".to_string())),
+                format!(
+                    "owner: {}",
+                    item.owner.clone().unwrap_or_else(|| "n/a".to_string())
+                ),
                 format!("id: {}", item.id),
                 format!("updated: {}", item.updated_at),
             ],
@@ -3447,7 +3595,10 @@ impl App {
         Some(InspectorState {
             title: format!("MCP Server · {server}"),
             body: vec![
-                format!("status: {}", if connected { "connected" } else { "configured" }),
+                format!(
+                    "status: {}",
+                    if connected { "connected" } else { "configured" }
+                ),
                 format!("server: {server}"),
             ],
             footer: Some("Esc close".to_string()),
@@ -3479,7 +3630,10 @@ impl App {
         Some(InspectorState {
             title: format!("LSP Server · {server}"),
             body: vec![
-                format!("status: {}", if connected { "connected" } else { "available" }),
+                format!(
+                    "status: {}",
+                    if connected { "connected" } else { "available" }
+                ),
                 format!("server: {server}"),
             ],
             footer: Some("Esc close".to_string()),
@@ -3488,8 +3642,17 @@ impl App {
         })
     }
 
-    fn build_tool_inspector(&self, message_index: usize, tool_index: usize) -> Option<InspectorState> {
-        let tool = self.state.messages.get(message_index)?.tool_calls.get(tool_index)?;
+    fn build_tool_inspector(
+        &self,
+        message_index: usize,
+        tool_index: usize,
+    ) -> Option<InspectorState> {
+        let tool = self
+            .state
+            .messages
+            .get(message_index)?
+            .tool_calls
+            .get(tool_index)?;
         let mut body = vec![
             format!("status: {}", tool.status),
             format!("tool: {}", tool.name),
@@ -3547,7 +3710,10 @@ impl App {
                     body: body.lines().map(|line| line.to_string()).collect(),
                     footer: Some("Esc close · ↑↓ scroll · v close".to_string()),
                     scroll,
-                    kind: InspectorKind::Diff { title: "Workspace Diff".to_string(), cwd },
+                    kind: InspectorKind::Diff {
+                        title: "Workspace Diff".to_string(),
+                        cwd,
+                    },
                 })
             }
         };
@@ -3649,7 +3815,8 @@ fn pad_art_lines(lines: &[&str]) -> Vec<String> {
         .max()
         .unwrap_or(0);
 
-    lines.iter()
+    lines
+        .iter()
         .map(|line| {
             let pad = max_width.saturating_sub(UnicodeWidthStr::width(*line));
             format!("{line}{}", " ".repeat(pad))
@@ -3678,9 +3845,7 @@ fn shimmer_centered_line(
     for (index, grapheme) in graphemes.iter().enumerate() {
         let distance = (index as isize - sweep).abs();
         let style = if distance <= 1 {
-            Style::default()
-                .fg(highlight)
-                .add_modifier(Modifier::BOLD)
+            Style::default().fg(highlight).add_modifier(Modifier::BOLD)
         } else if distance <= 4 {
             Style::default().fg(base).add_modifier(Modifier::BOLD)
         } else {
@@ -3706,12 +3871,7 @@ fn build_welcome_lines(width: usize, phase: usize) -> Vec<Line<'static>> {
     lines.push(Line::from(Span::raw("")));
     for (index, line) in art.into_iter().enumerate() {
         lines.push(shimmer_centered_line(
-            &line,
-            width,
-            phase,
-            index,
-            ACCENT,
-            FG,
+            &line, width, phase, index, ACCENT, FG,
         ));
     }
 
@@ -3736,7 +3896,11 @@ fn preview_line(text: &str, max_width: usize) -> String {
         return normalized;
     }
 
-    normalized.chars().take(max_width.saturating_sub(1)).collect::<String>() + "…"
+    normalized
+        .chars()
+        .take(max_width.saturating_sub(1))
+        .collect::<String>()
+        + "…"
 }
 
 fn format_count(value: u64) -> String {
@@ -3759,10 +3923,22 @@ fn checklist_progress(checklist: &[NativeJobChecklistItem]) -> Option<String> {
     }
 
     let total = checklist.len();
-    let completed = checklist.iter().filter(|item| item.status == "completed").count();
-    let active = checklist.iter().filter(|item| item.status == "in_progress").count();
-    let blocked = checklist.iter().filter(|item| item.status == "blocked").count();
-    let failed = checklist.iter().filter(|item| item.status == "error").count();
+    let completed = checklist
+        .iter()
+        .filter(|item| item.status == "completed")
+        .count();
+    let active = checklist
+        .iter()
+        .filter(|item| item.status == "in_progress")
+        .count();
+    let blocked = checklist
+        .iter()
+        .filter(|item| item.status == "blocked")
+        .count();
+    let failed = checklist
+        .iter()
+        .filter(|item| item.status == "error")
+        .count();
 
     let summary = [
         Some(format!("{completed}/{total} done")),
@@ -3800,7 +3976,12 @@ fn active_sidebar_job<'a>(state: &'a NativeTuiState) -> Option<&'a NativeBackgro
         .background_jobs
         .iter()
         .find(|job| job.status == "running" && !job.checklist.is_empty())
-        .or_else(|| state.background_jobs.iter().find(|job| !job.checklist.is_empty()))
+        .or_else(|| {
+            state
+                .background_jobs
+                .iter()
+                .find(|job| !job.checklist.is_empty())
+        })
 }
 
 fn worker_status_word(status: &str) -> &'static str {
@@ -3815,7 +3996,10 @@ fn worker_status_word(status: &str) -> &'static str {
     }
 }
 
-fn worker_pool_summary(state: &NativeTuiState, active_job: Option<&NativeBackgroundJobState>) -> Option<String> {
+fn worker_pool_summary(
+    state: &NativeTuiState,
+    active_job: Option<&NativeBackgroundJobState>,
+) -> Option<String> {
     if state.agent_activities.is_empty() {
         return None;
     }
@@ -3891,7 +4075,12 @@ fn synthetic_foreground_checklist(
                 .detail
                 .as_ref()
                 .map(|detail| preview_line(detail, 28))
-                .or_else(|| activity.workspace_path.as_ref().map(|path| preview_line(path, 28)));
+                .or_else(|| {
+                    activity
+                        .workspace_path
+                        .as_ref()
+                        .map(|path| preview_line(path, 28))
+                });
             (preview_line(&activity.label, 28), status, color, detail)
         })
         .collect();
@@ -4030,7 +4219,10 @@ fn display_model_name(model: &str) -> String {
 fn build_mode_badge_spans(state: &NativeTuiState) -> Vec<Span<'static>> {
     if let Some(mode) = state.modes.iter().find(|mode| mode.active) {
         return vec![
-            Span::styled("● ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "● ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 title_case_label(&mode.label),
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
@@ -4038,7 +4230,10 @@ fn build_mode_badge_spans(state: &NativeTuiState) -> Vec<Span<'static>> {
             Span::styled(" (", Style::default().fg(ACCENT_DIM)),
             Span::styled(mode.tagline.clone(), Style::default().fg(FG)),
             Span::styled(" - ", Style::default().fg(ACCENT_DIM)),
-            Span::styled(display_model_name(&mode.model), Style::default().fg(ACCENT_DIM)),
+            Span::styled(
+                display_model_name(&mode.model),
+                Style::default().fg(ACCENT_DIM),
+            ),
             Span::styled(")", Style::default().fg(ACCENT_DIM)),
         ];
     }
@@ -4098,10 +4293,10 @@ fn current_run_summary(state: &NativeTuiState) -> (String, Option<String>) {
 
 fn sidebar_header(title: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled("• ", Style::default().fg(ACCENT)),
+        Span::styled("• ", Style::default().fg(MUTED)),
         Span::styled(
             title.to_string(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ),
     ])
 }
@@ -4140,10 +4335,7 @@ fn push_sidebar_selectable_item(
 ) {
     let selected_style = Style::default();
     lines.push(Line::from(vec![
-        Span::styled(
-            format!("{marker} "),
-            selected_style.fg(marker_color),
-        ),
+        Span::styled(format!("{marker} "), selected_style.fg(marker_color)),
         Span::styled(title, selected_style.fg(title_color)),
     ]));
 
@@ -4168,22 +4360,26 @@ fn render_inspector_line(raw: &str, width: usize) -> Line<'static> {
         Style::default().fg(FG)
     };
 
-    Line::from(Span::styled(
-        preview_line(raw, width.max(1)),
-        style,
-    ))
+    Line::from(Span::styled(preview_line(raw, width.max(1)), style))
 }
 
 fn context_meter(percent: f64, width: usize) -> String {
     let width = width.max(4);
     let filled = ((percent.clamp(0.0, 1.0)) * width as f64).round() as usize;
     let filled = filled.min(width);
-    format!("{}{}", "■".repeat(filled), "·".repeat(width.saturating_sub(filled)))
+    format!(
+        "{}{}",
+        "■".repeat(filled),
+        "·".repeat(width.saturating_sub(filled))
+    )
 }
 
 fn looks_like_path_token(token: &str) -> bool {
     let trimmed = token.trim_matches(|ch: char| {
-        matches!(ch, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':')
+        matches!(
+            ch,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
     });
     if trimmed.is_empty() {
         return false;
@@ -4198,7 +4394,10 @@ fn looks_like_path_token(token: &str) -> bool {
 
 fn looks_like_url_token(token: &str) -> bool {
     let trimmed = token.trim_matches(|ch: char| {
-        matches!(ch, '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':')
+        matches!(
+            ch,
+            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
     });
 
     trimmed.starts_with("http://") || trimmed.starts_with("https://")
@@ -4264,9 +4463,7 @@ fn push_token_run(runs: &mut Vec<(Style, String)>, base_style: Style, token: &st
     }
 
     let style = if looks_like_url_token(token) {
-        Style::default()
-            .fg(LINK)
-            .add_modifier(Modifier::UNDERLINED)
+        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
     } else if looks_like_path_token(token) {
         Style::default().fg(PATH)
     } else {
@@ -4326,17 +4523,11 @@ fn parse_markdown_link(text: &str) -> Option<(usize, Vec<(Style, String)>)> {
     let target_style = if looks_like_path_token(target) {
         Style::default().fg(PATH)
     } else {
-        Style::default()
-            .fg(LINK)
-            .add_modifier(Modifier::UNDERLINED)
+        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
     };
 
     let mut runs = Vec::new();
-    push_plain_runs(
-        &mut runs,
-        label,
-        target_style.add_modifier(Modifier::BOLD),
-    );
+    push_plain_runs(&mut runs, label, target_style.add_modifier(Modifier::BOLD));
     if !target.is_empty() && target != label {
         push_run(&mut runs, Style::default().fg(MUTED), " ");
         push_run(&mut runs, target_style, "<");
@@ -4623,10 +4814,8 @@ fn render_markdown_table_block(
 
     let max_total = width.saturating_sub(overhead);
     while widths.iter().sum::<usize>() > max_total {
-        let Some((largest_index, largest_width)) = widths
-            .iter()
-            .enumerate()
-            .max_by_key(|(_, width)| **width)
+        let Some((largest_index, largest_width)) =
+            widths.iter().enumerate().max_by_key(|(_, width)| **width)
         else {
             break;
         };
@@ -4682,7 +4871,10 @@ fn render_assistant_markdown_line(
     }
 
     if *in_code_block {
-        return wrap_styled_runs(vec![(Style::default().fg(SUCCESS), raw_line.to_string())], width);
+        return wrap_styled_runs(
+            vec![(Style::default().fg(SUCCESS), raw_line.to_string())],
+            width,
+        );
     }
 
     if raw_line.trim().is_empty() {
@@ -4733,9 +4925,7 @@ fn render_assistant_markdown_line(
 
     if let Some((marker, rest)) = parse_ordered_list_prefix(trimmed_start) {
         let mut runs = vec![(
-            Style::default()
-                .fg(ACCENT)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             format!("{marker}. "),
         )];
         runs.extend(parse_inline_markdown_runs(rest, base));
@@ -4815,7 +5005,10 @@ fn build_transcript_lines(
             let folded = preview_line(&message.content, width.saturating_sub(prefix_width));
             lines.push(Line::from(vec![
                 Span::styled(prefix.to_string(), prefix_style),
-                Span::styled(format!("{folded}  [folded]"), Style::default().fg(TOOL_MUTED)),
+                Span::styled(
+                    format!("{folded}  [folded]"),
+                    Style::default().fg(TOOL_MUTED),
+                ),
             ]));
             rendered_any = true;
         } else if !message.content.trim().is_empty() || message.tool_calls.is_empty() {

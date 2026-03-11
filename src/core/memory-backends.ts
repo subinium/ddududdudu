@@ -3,13 +3,14 @@ import { dirname } from 'node:path';
 
 import { loadConfigForCwd } from './config.js';
 import { getDduduPaths } from './dirs.js';
+import type { MemoryEntryMetadata } from './memory-promotion.js';
 import type { MemoryScope } from './memory.js';
 
 export interface MemoryBackend {
   readonly name: string;
   loadScopes(cwd: string, scopes: MemoryScope[]): Promise<Array<{ scope: MemoryScope; content: string }>>;
   save(cwd: string, scope: MemoryScope, content: string): Promise<void>;
-  append(cwd: string, scope: MemoryScope, entry: string): Promise<void>;
+  append(cwd: string, scope: MemoryScope, entry: string, metadata?: MemoryEntryMetadata): Promise<void>;
   clear(cwd: string, scope: MemoryScope): Promise<void>;
 }
 
@@ -53,6 +54,35 @@ const ensureMemoryDir = async (filePath: string): Promise<void> => {
   await mkdir(dirname(filePath), { recursive: true });
 };
 
+const quoteYamlString = (value: string): string => {
+  return `"${value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+};
+
+const formatScoreInline = (score: MemoryEntryMetadata['score']): string => {
+  return [
+    `stability: ${score.stability}`,
+    `reuse: ${score.reuse}`,
+    `specificity: ${score.specificity}`,
+    `verification: ${score.verification}`,
+    `novelty: ${score.novelty}`,
+    `composite: ${score.composite}`,
+  ].join(', ');
+};
+
+const formatMetadataFrontmatter = (metadata: MemoryEntryMetadata): string => {
+  const sourceRunIdLine = metadata.sourceRunId
+    ? `sourceRunId: ${quoteYamlString(metadata.sourceRunId)}\n`
+    : '';
+
+  return [
+    '---',
+    `confidence: ${metadata.confidence}`,
+    `${sourceRunIdLine}promotedAt: ${quoteYamlString(metadata.promotedAt)}`,
+    `score: { ${formatScoreInline(metadata.score)} }`,
+    '---',
+  ].join('\n');
+};
+
 class FileMemoryBackend implements MemoryBackend {
   public readonly name = 'file';
 
@@ -74,10 +104,16 @@ class FileMemoryBackend implements MemoryBackend {
     await writeFile(memoryPath, content, 'utf8');
   }
 
-  public async append(cwd: string, scope: MemoryScope, entry: string): Promise<void> {
+  public async append(
+    cwd: string,
+    scope: MemoryScope,
+    entry: string,
+    metadata?: MemoryEntryMetadata,
+  ): Promise<void> {
     const memoryPath = getMemoryPath(cwd, scope);
     const timestamp = new Date().toISOString();
-    const formattedEntry = `## Entry — ${timestamp}\n${entry}\n\n`;
+    const frontmatter = metadata ? `${formatMetadataFrontmatter(metadata)}\n` : '';
+    const formattedEntry = `## Entry — ${timestamp}\n${frontmatter}${entry}\n\n`;
 
     await ensureMemoryDir(memoryPath);
     await appendFile(memoryPath, formattedEntry, 'utf8');

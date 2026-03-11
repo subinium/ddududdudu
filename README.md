@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.4.2-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.5.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
@@ -30,6 +30,9 @@
 - Sidebar rails for subagents, detached background work, MCP servers, and LSP status
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
+- Per-session cost budget tracking with configurable warning thresholds and hard-stop enforcement
+- Scored memory promotion pipeline with confidence metadata, Jaccard dedupe, and merge
+- Parallel benchmarking with multi-model comparison, failure categorization, and cost tracking
 
 ## Design Notes
 
@@ -217,9 +220,33 @@ ddudu resume <id>     # quick alias for reopening a specific session
 
 ## Benchmarks
 
-WIP.
+The benchmark system runs harness tasks against configurable task packs and produces structured JSONL reports.
 
-The current repository includes early benchmark scaffolding, but the task packs and comparison workflow are not stable enough to treat as a polished public feature yet.
+```bash
+# Run benchmarks with default settings
+node bench/run.mjs --tasks bench/tasks.example.yaml
+
+# Parallel execution with concurrency control
+node bench/run.mjs --tasks bench/tasks.yaml --concurrency 5
+
+# Multi-model comparison
+node bench/run.mjs --tasks bench/tasks.yaml --models claude-opus-4-6,gpt-5.4
+
+# Resume an interrupted run (skips completed tasks)
+node bench/run.mjs --tasks bench/tasks.yaml --resume --output bench/results/run-prev.jsonl
+
+# Generate a report
+node bench/report.mjs bench/results/run-*.jsonl
+```
+
+Reports include:
+
+- per-difficulty pass rate breakdown
+- failure mode categorization (timeout, crash, setup-failed, verification-failed, wrong-output)
+- cost tracking (estimated USD per task and total)
+- multi-model side-by-side comparison when multiple models are present
+
+Task packs and the full comparison workflow are still being refined.
 
 ## TUI Shortcuts
 

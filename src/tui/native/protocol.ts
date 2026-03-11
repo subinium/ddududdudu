@@ -65,6 +65,14 @@ export interface NativeLspState {
   connectedLabels: string[];
 }
 
+export interface NativeGitState {
+  branch: string | null;
+  changedFileCount: number;
+  stagedFileCount: number;
+  hasUncommitted: boolean;
+  changedFiles: string[];
+}
+
 export interface NativeAskUserOptionState {
   value: string;
   label: string;
@@ -198,6 +206,7 @@ export interface NativeTuiState {
   providers: NativeProviderState[];
   mcp: NativeMcpState | null;
   lsp: NativeLspState | null;
+  git: NativeGitState | null;
   messages: NativeMessageState[];
   askUser: NativeAskUserState | null;
   slashCommands: NativeSlashCommand[];

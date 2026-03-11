@@ -212,14 +212,24 @@ const hasMatchingFiles = async (
   }
 };
 
+const commandExistsCache = new Map<string, { result: boolean; timestamp: number }>();
+const COMMAND_CACHE_TTL_MS = 60_000;
+
 const commandExists = async (spec: LspServerSpec): Promise<boolean> => {
+  const cached = commandExistsCache.get(spec.command);
+  if (cached && Date.now() - cached.timestamp < COMMAND_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
   try {
     await execFileAsync(spec.command, spec.checkArgs, {
       encoding: 'utf8',
       timeout: 5_000,
     });
+    commandExistsCache.set(spec.command, { result: true, timestamp: Date.now() });
     return true;
   } catch {
+    commandExistsCache.set(spec.command, { result: false, timestamp: Date.now() });
     return false;
   }
 };
@@ -648,19 +658,21 @@ export class LspManager {
   }
 
   public async refresh(rootPath: string = this.rootCwd): Promise<void> {
-    const nextAvailable = new Map<string, LspServerSpec>();
-    for (const spec of SERVER_SPECS) {
-      const [hasCommand, hasFiles] = await Promise.all([
-        commandExists(spec),
-        hasMatchingFiles(rootPath, new Set(spec.extensions)),
-      ]);
-      if (hasCommand && hasFiles) {
-        nextAvailable.set(spec.id, spec);
-      }
-    }
+    const results = await Promise.all(
+      SERVER_SPECS.map(async (spec) => {
+        const [hasCommand, hasFiles] = await Promise.all([
+          commandExists(spec),
+          hasMatchingFiles(rootPath, new Set(spec.extensions)),
+        ]);
+        return { spec, available: hasCommand && hasFiles };
+      }),
+    );
+
     this.availableSpecs.clear();
-    for (const [id, spec] of nextAvailable.entries()) {
-      this.availableSpecs.set(id, spec);
+    for (const { spec, available } of results) {
+      if (available) {
+        this.availableSpecs.set(spec.id, spec);
+      }
     }
   }
 

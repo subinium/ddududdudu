@@ -1,14 +1,9 @@
-import { randomUUID } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
-import { resolve } from 'node:path';
-
 export interface ExecutionSchedulerConfig {
   providerBudgets: Record<string, number>;
   resourceBudgets: Record<string, number>;
   maxParallelWrites: number;
-  pollMs: number;
-  staleMs: number;
+  pollMs?: number;
+  staleMs?: number;
 }
 
 export interface ExecutionLease {
@@ -46,98 +41,169 @@ const normalizeProviderKey = (provider: string): string => {
   return provider;
 };
 
-const slug = (value: string): string =>
+const normalizeResourceKey = (value: string): string =>
   value
     .trim()
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '') || 'default';
 
-const sleep = async (ms: number, signal?: AbortSignal): Promise<void> => {
-  if (signal?.aborted) {
-    throw new Error('Execution acquisition aborted.');
+const EXECUTION_ABORT_MESSAGE = 'Execution acquisition aborted.';
+
+interface WaitEntry {
+  resolve: () => void;
+  reject: (error: Error) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+}
+
+class InMemorySemaphore {
+  private current = 0;
+
+  private readonly capacity: number;
+
+  private readonly waitQueue: WaitEntry[] = [];
+
+  public constructor(capacity: number) {
+    this.capacity = Math.max(1, capacity);
   }
 
-  await new Promise<void>((resolvePromise, reject) => {
-    const timer = setTimeout(() => {
-      signal?.removeEventListener('abort', onAbort);
-      resolvePromise();
-    }, ms);
+  public isSaturated(): boolean {
+    return this.current >= this.capacity;
+  }
 
-    const onAbort = (): void => {
-      clearTimeout(timer);
-      reject(new Error('Execution acquisition aborted.'));
+  public async acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) {
+      throw new Error(EXECUTION_ABORT_MESSAGE);
+    }
+
+    if (!this.isSaturated()) {
+      this.current += 1;
+      return this.createRelease();
+    }
+
+    return new Promise<() => void>((resolve, reject) => {
+      const entry: WaitEntry = {
+        resolve: () => {
+          this.current += 1;
+          if (entry.signal && entry.onAbort) {
+            entry.signal.removeEventListener('abort', entry.onAbort);
+          }
+          resolve(this.createRelease());
+        },
+        reject: (error: Error) => {
+          if (entry.signal && entry.onAbort) {
+            entry.signal.removeEventListener('abort', entry.onAbort);
+          }
+          reject(error);
+        },
+      };
+
+      if (signal) {
+        const onAbort = (): void => {
+          const index = this.waitQueue.indexOf(entry);
+          if (index >= 0) {
+            this.waitQueue.splice(index, 1);
+          }
+          entry.reject(new Error(EXECUTION_ABORT_MESSAGE));
+        };
+
+        entry.signal = signal;
+        entry.onAbort = onAbort;
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      this.waitQueue.push(entry);
+    });
+  }
+
+  private createRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) {
+        return;
+      }
+      released = true;
+      this.release();
     };
-
-    signal?.addEventListener('abort', onAbort, { once: true });
-  });
-};
-
-const leaseBaseDir = (): string => resolve(homedir(), '.ddudu', 'runtime', 'leases');
-
-const isStaleLease = async (leasePath: string, staleMs: number): Promise<boolean> => {
-  try {
-    const info = await stat(leasePath);
-    return Date.now() - info.mtimeMs > staleMs;
-  } catch {
-    return false;
   }
-};
 
-const writeLeaseMetadata = async (leasePath: string): Promise<void> => {
-  await writeFile(
-    resolve(leasePath, 'meta.json'),
-    JSON.stringify(
-      {
-        pid: process.pid,
-        createdAt: Date.now(),
-      },
-      null,
-      2,
-    ),
-    'utf8',
-  );
+  private release(): void {
+    this.current = Math.max(0, this.current - 1);
+    const next = this.waitQueue.shift();
+    if (next) {
+      next.resolve();
+    }
+  }
+}
+
+const throwAbortError = (signal: AbortSignal | undefined, message: string, error: unknown): never => {
+  if (signal?.aborted) {
+    throw new Error(message);
+  }
+
+  if (error instanceof Error && error.message === EXECUTION_ABORT_MESSAGE) {
+    throw new Error(message);
+  }
+
+  throw error;
 };
 
 export class ExecutionScheduler {
+  private readonly providerSemaphores = new Map<string, InMemorySemaphore>();
+
+  private readonly resourceSemaphores = new Map<string, InMemorySemaphore>();
+
+  private readonly writeSemaphore: InMemorySemaphore;
+
   private readonly config: ExecutionSchedulerConfig;
 
   public constructor(config: Partial<ExecutionSchedulerConfig> = {}) {
-    this.config = {
-      providerBudgets: {
-        ...DEFAULT_PROVIDER_BUDGETS,
-        ...(config.providerBudgets ?? {}),
-      },
-      resourceBudgets: {
-        ...DEFAULT_RESOURCE_BUDGETS,
-        ...(config.resourceBudgets ?? {}),
-      },
-      maxParallelWrites: Math.max(1, config.maxParallelWrites ?? 4),
-      pollMs: Math.max(25, config.pollMs ?? 125),
-      staleMs: Math.max(5_000, config.staleMs ?? 10 * 60_000),
-    };
+    this.config = deriveExecutionSchedulerConfig(config);
+    this.writeSemaphore = new InMemorySemaphore(this.config.maxParallelWrites);
   }
 
   public async acquire(options: ExecutionAcquireOptions): Promise<ExecutionLease> {
-    const releases: Array<() => Promise<void>> = [];
+    const releases: Array<() => void> = [];
 
     try {
       if (options.provider) {
-        const providerRelease = await this.acquireProviderSlot(
-          normalizeProviderKey(options.provider),
-          options.signal,
-          options.onWait,
-        );
+        const providerKey = normalizeProviderKey(options.provider);
+        const providerSemaphore = this.getProviderSemaphore(providerKey);
+        if (providerSemaphore.isSaturated()) {
+          options.onWait?.(`waiting for ${providerKey} provider slot`);
+        }
+        const providerRelease = await providerSemaphore
+          .acquire(options.signal)
+          .catch((error: unknown) =>
+            throwAbortError(options.signal, `Provider slot acquisition aborted for ${providerKey}.`, error),
+          );
         releases.push(providerRelease);
       }
 
       if (options.resource) {
-        const resourceRelease = await this.acquireResourceSlot(options.resource, options.signal, options.onWait);
+        const resourceKey = normalizeResourceKey(options.resource);
+        const resourceSemaphore = this.getResourceSemaphore(resourceKey, options.resource);
+        if (resourceSemaphore.isSaturated()) {
+          options.onWait?.(`waiting for ${resourceKey} slot`);
+        }
+        const resourceRelease = await resourceSemaphore
+          .acquire(options.signal)
+          .catch((error: unknown) =>
+            throwAbortError(options.signal, `Resource slot acquisition aborted for ${resourceKey}.`, error),
+          );
         releases.push(resourceRelease);
       }
 
       if (options.writeKey) {
-        const writeRelease = await this.acquireWriteSlot(options.writeKey, options.signal, options.onWait);
+        if (this.writeSemaphore.isSaturated()) {
+          options.onWait?.('waiting for write workspace slot');
+        }
+        const writeRelease = await this.writeSemaphore
+          .acquire(options.signal)
+          .catch((error: unknown) =>
+            throwAbortError(options.signal, `Write slot acquisition aborted for ${options.writeKey}.`, error),
+          );
         releases.push(writeRelease);
       }
 
@@ -146,7 +212,7 @@ export class ExecutionScheduler {
           while (releases.length > 0) {
             const release = releases.pop();
             if (release) {
-              await release();
+              release();
             }
           }
         },
@@ -155,99 +221,35 @@ export class ExecutionScheduler {
       while (releases.length > 0) {
         const release = releases.pop();
         if (release) {
-          await release().catch(() => undefined);
+          try {
+            release();
+          } catch {}
         }
       }
       throw error;
     }
   }
 
-  private async acquireProviderSlot(
-    provider: string,
-    signal?: AbortSignal,
-    onWait?: (message: string) => void,
-  ): Promise<() => Promise<void>> {
-    const capacity = Math.max(1, this.config.providerBudgets[provider] ?? 2);
-    return this.acquireSlotGroup({
-      dir: resolve(leaseBaseDir(), 'providers', slug(provider)),
-      capacity,
-      signal,
-      onWait,
-      waitMessage: `waiting for ${provider} provider slot`,
-      abortMessage: `Provider slot acquisition aborted for ${provider}.`,
-    });
-  }
-
-  private async acquireWriteSlot(
-    writeKey: string,
-    signal?: AbortSignal,
-    onWait?: (message: string) => void,
-  ): Promise<() => Promise<void>> {
-    const repoKey = slug(writeKey);
-    return this.acquireSlotGroup({
-      dir: resolve(leaseBaseDir(), 'writes', repoKey),
-      capacity: this.config.maxParallelWrites,
-      signal,
-      onWait,
-      waitMessage: 'waiting for write workspace slot',
-      abortMessage: `Write slot acquisition aborted for ${writeKey}.`,
-    });
-  }
-
-  private async acquireResourceSlot(
-    resource: string,
-    signal?: AbortSignal,
-    onWait?: (message: string) => void,
-  ): Promise<() => Promise<void>> {
-    const resourceKey = slug(resource);
-    const capacity = Math.max(
-      1,
-      this.config.resourceBudgets[resourceKey] ?? this.config.resourceBudgets[resource] ?? 2,
-    );
-    return this.acquireSlotGroup({
-      dir: resolve(leaseBaseDir(), 'resources', resourceKey),
-      capacity,
-      signal,
-      onWait,
-      waitMessage: `waiting for ${resourceKey} slot`,
-      abortMessage: `Resource slot acquisition aborted for ${resourceKey}.`,
-    });
-  }
-
-  private async acquireSlotGroup(input: {
-    dir: string;
-    capacity: number;
-    signal?: AbortSignal;
-    onWait?: (message: string) => void;
-    waitMessage: string;
-    abortMessage: string;
-  }): Promise<() => Promise<void>> {
-    await mkdir(input.dir, { recursive: true });
-
-    while (true) {
-      if (input.signal?.aborted) {
-        throw new Error(input.abortMessage);
-      }
-
-      for (let index = 0; index < input.capacity; index += 1) {
-        const slotDir = resolve(input.dir, `slot-${index + 1}`);
-        try {
-          await mkdir(slotDir);
-          await writeLeaseMetadata(slotDir);
-          return async () => {
-            await rm(slotDir, { recursive: true, force: true });
-          };
-        } catch {
-          if (await isStaleLease(slotDir, this.config.staleMs)) {
-            await rm(slotDir, { recursive: true, force: true }).catch(() => undefined);
-            continue;
-          }
-        }
-      }
-
-      input.onWait?.(input.waitMessage);
-      await sleep(this.config.pollMs, input.signal);
+  private getProviderSemaphore(provider: string): InMemorySemaphore {
+    let semaphore = this.providerSemaphores.get(provider);
+    if (!semaphore) {
+      const capacity = Math.max(1, this.config.providerBudgets[provider] ?? 2);
+      semaphore = new InMemorySemaphore(capacity);
+      this.providerSemaphores.set(provider, semaphore);
     }
+    return semaphore;
+  }
+
+  private getResourceSemaphore(resourceKey: string, originalResource: string): InMemorySemaphore {
+    let semaphore = this.resourceSemaphores.get(resourceKey);
+    if (!semaphore) {
+      const normalizedBudget = this.config.resourceBudgets[resourceKey];
+      const originalBudget = this.config.resourceBudgets[originalResource];
+      const capacity = Math.max(1, normalizedBudget ?? originalBudget ?? 2);
+      semaphore = new InMemorySemaphore(capacity);
+      this.resourceSemaphores.set(resourceKey, semaphore);
+    }
+    return semaphore;
   }
 }
 
@@ -256,16 +258,22 @@ export const deriveExecutionSchedulerConfig = (input: {
   resourceBudgets?: Record<string, number> | undefined;
   maxParallelWrites?: number | undefined;
   pollMs?: number | undefined;
-}): ExecutionSchedulerConfig => ({
-  providerBudgets: {
-    ...DEFAULT_PROVIDER_BUDGETS,
-    ...(input.providerBudgets ?? {}),
-  },
-  resourceBudgets: {
-    ...DEFAULT_RESOURCE_BUDGETS,
-    ...(input.resourceBudgets ?? {}),
-  },
-  maxParallelWrites: Math.max(1, input.maxParallelWrites ?? 4),
-  pollMs: Math.max(25, input.pollMs ?? 125),
-  staleMs: 10 * 60_000,
-});
+  staleMs?: number | undefined;
+}): ExecutionSchedulerConfig => {
+  const capacity = Math.max(
+    1,
+    input.maxParallelWrites ?? 4,
+  );
+
+  return {
+    providerBudgets: {
+      ...DEFAULT_PROVIDER_BUDGETS,
+      ...(input.providerBudgets ?? {}),
+    },
+    resourceBudgets: {
+      ...DEFAULT_RESOURCE_BUDGETS,
+      ...(input.resourceBudgets ?? {}),
+    },
+    maxParallelWrites: capacity,
+  };
+};

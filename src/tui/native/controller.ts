@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile, spawn } from 'node:child_process';
 import { basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,7 +44,15 @@ import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
 import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
-import { appendMemory, clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
+import { clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
+import { getMemoryBackend } from '../../core/memory-backends.js';
+import {
+  decidePromotion,
+  dedupeAgainstExisting,
+  scoreCandidate,
+  type MemoryEntryMetadata,
+  type PromotionCandidate,
+} from '../../core/memory-promotion.js';
 import { resolveModeBinding, type HarnessProviderName } from '../../core/mode-resolution.js';
 import { loadOrchestratorPrompt, loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
@@ -130,6 +138,7 @@ import {
 import { WorkflowStateStore, type WorkflowStateSource } from './workflow-state-store.js';
 import type {
   NativeBridgeEvent,
+  NativeGitState,
   NativeLspState,
   NativeMessageState,
   NativeMcpState,
@@ -140,6 +149,36 @@ import type {
   NativeVerificationState,
   NativeWorkspaceState,
 } from './protocol.js';
+import {
+  formatArtifactSummary as formatArtifactSummaryCommand,
+  formatConfigSummary as formatConfigSummaryCommand,
+  formatContextSummary as formatContextSummaryCommand,
+  formatDoctorSummary as formatDoctorSummaryCommand,
+  formatMemorySummary as formatMemorySummaryCommand,
+  formatPlanSummary as formatPlanSummaryCommand,
+  formatSkillSummary as formatSkillSummaryCommand,
+  loadSkillSummary as loadSkillSummaryCommand,
+  parseMemoryScope as parseMemoryScopeCommand,
+  runBriefingCommand as runBriefingCommandCommand,
+  runCheckpointCommand as runCheckpointCommandCommand,
+  runDriftCommand as runDriftCommandCommand,
+  runForkCommand as runForkCommandCommand,
+  runHandoffCommand as runHandoffCommandCommand,
+  runHookCommand as runHookCommandCommand,
+  runInitSummary as runInitSummaryCommand,
+  runJobsCommand as runJobsCommandCommand,
+  runMcpCommand as runMcpCommandCommand,
+  runMemoryCommand as runMemoryCommandCommand,
+  runPermissionsCommand as runPermissionsCommandCommand,
+  runQueueCommand as runQueueCommandCommand,
+  runResumeCommand as runResumeCommandCommand,
+  runReviewSummary as runReviewSummaryCommand,
+  runSessionCommand as runSessionCommandCommand,
+  runSlashDispatch,
+  runTeamCommand as runTeamCommandCommand,
+  runTodoCommand as runTodoCommandCommand,
+  runUndoCommand as runUndoCommandCommand,
+} from './commands/index.js';
 
 interface ProviderCredentials {
   token: string;
@@ -183,9 +222,10 @@ type AskUserResolver = {
 const execFileAsync = promisify(execFile);
 
 const MAX_TOOL_TURNS_FALLBACK = 25;
+const SYSTEM_PROMPT_CACHE_TTL_MS = 30_000;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.4.2';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.5.0';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
@@ -223,6 +263,13 @@ const SEARCH_RESOURCE_TOOL_NAMES = new Set([
   'docs_lookup',
   'web_search',
   'web_fetch',
+]);
+const FILE_MUTATION_TOOL_NAMES = new Set([
+  'write_file',
+  'edit_file',
+  'patch_apply',
+  'write',
+  'edit',
 ]);
 
 const normalizeToolName = (name: string): string => name.trim().toLowerCase();
@@ -872,6 +919,7 @@ export class NativeBridgeController {
     providers: [],
     mcp: null,
     lsp: null,
+    git: null,
     messages: [],
     askUser: null,
     slashCommands: SLASH_COMMANDS.map((item) => ({
@@ -924,6 +972,8 @@ export class NativeBridgeController {
   private queuedPrompts: string[] = [];
   private pendingAskUser: AskUserResolver | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
+  private stateVersion = 0;
+  private lastEmittedStateVersion = -1;
   private backgroundJobPollTimer: NodeJS.Timeout | null = null;
   private idleWarmupTimer: NodeJS.Timeout | null = null;
   private teamRunSince: number | null = null;
@@ -948,12 +998,17 @@ export class NativeBridgeController {
   private readonly teamRunIsolatedNotes: string[] = [];
   private readonly selectedMemoryCache = new Map<string, TimedCacheEntry<string>>();
   private readonly promptContextCache = new Map<string, TimedCacheEntry<string>>();
+  private cachedSystemPrompt: string | null = null;
+  private cachedSystemPromptInputHash: string | null = null;
+  private memoryVersion = 0;
   private changedFilesCache: TimedCacheEntry<string[]> | null = null;
+  private gitStateCache: TimedCacheEntry<NativeGitState> | null = null;
+  private gitStateRefreshInFlight = false;
   private briefingCache: TimedCacheEntry<{
     artifactDir: string | null;
     briefing: { summary: string; nextSteps: string[] } | null;
   }> | null = null;
-  private lastEmittedStateSerialized: string | null = null;
+
 
   public constructor(emit: EmitFn) {
     this.emit = emit;
@@ -961,6 +1016,7 @@ export class NativeBridgeController {
 
   public async boot(): Promise<void> {
     this.config = await loadConfig();
+    this.applyCostBudgetConfig();
     this.currentMode = clampMode(this.config.mode);
     this.state.mode = this.currentMode;
     this.permissionProfile = normalizePermissionProfile(this.config.tools.permission);
@@ -1039,6 +1095,7 @@ export class NativeBridgeController {
     this.scheduleIdleWarmup();
     this.state.ready = true;
     this.emitStateNow();
+    this.refreshGitStateAsync();
     void this.refreshLspInBackground();
   }
 
@@ -1202,6 +1259,7 @@ export class NativeBridgeController {
 
   private invalidateDerivedCaches(options: {
     changedFiles?: boolean;
+    git?: boolean;
     briefing?: boolean;
     memory?: boolean;
     promptContext?: boolean;
@@ -1209,15 +1267,31 @@ export class NativeBridgeController {
     if (options.changedFiles) {
       this.changedFilesCache = null;
     }
+    if (options.changedFiles || options.git) {
+      this.gitStateCache = null;
+      this.refreshGitStateAsync();
+    }
     if (options.briefing) {
       this.briefingCache = null;
     }
     if (options.memory) {
       this.selectedMemoryCache.clear();
+      this.memoryVersion += 1;
+      this.cachedSystemPromptInputHash = null;
     }
     if (options.promptContext || options.changedFiles || options.briefing || options.memory) {
       this.promptContextCache.clear();
     }
+  }
+
+  private applyCostBudgetConfig(): void {
+    const maxPerSessionUsd = this.config?.cost_budget?.maxPerSessionUsd;
+    if (typeof maxPerSessionUsd === 'number') {
+      this.tokenCounter.setBudget(maxPerSessionUsd);
+      return;
+    }
+
+    this.tokenCounter.clearBudget();
   }
 
   private buildPromptContextCacheKey(
@@ -1407,130 +1481,41 @@ export class NativeBridgeController {
   }
 
   public async runSlashCommand(command: string): Promise<void> {
-    const trimmed = command.trim();
-    if (!trimmed) {
-      return;
-    }
-
-    const [head, ...rest] = trimmed.split(/\s+/);
-
-    switch (head) {
-      case '/clear':
-        this.clearMessages();
-        return;
-      case '/fire':
-        this.toggleFire();
-        return;
-      case '/mode': {
-        const mode = rest[0];
-        if (mode && (mode === 'jennie' || mode === 'lisa' || mode === 'rosé' || mode === 'jisoo')) {
-          this.setMode(mode);
-        } else {
-          this.appendSystemMessage('Use /mode <jennie|lisa|rosé|jisoo>.');
-        }
-        return;
-      }
-      case '/model': {
-        const model = rest[0];
-        if (model) {
-          this.setModel(model);
-        } else {
-          this.appendSystemMessage(`Current models: ${this.state.models.join(', ')}`);
-        }
-        return;
-      }
-      case '/compact':
-        await this.compactContext();
-        return;
-      case '/help':
-        this.appendSystemMessage(
-          'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /resume, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
-        );
-        return;
-      case '/plan':
-        this.appendSystemMessage(this.formatPlanSummary());
-        return;
-      case '/todo':
-        this.appendSystemMessage(await this.runTodoCommand(rest));
-        return;
-      case '/permissions':
-        this.appendSystemMessage(await this.runPermissionsCommand(rest));
-        return;
-      case '/config':
-        this.appendSystemMessage(this.formatConfigSummary());
-        return;
-      case '/doctor':
-        this.appendSystemMessage(this.formatDoctorSummary());
-        return;
-      case '/context':
-        this.appendSystemMessage(await this.formatContextSummary());
-        return;
-      case '/review':
-        this.appendSystemMessage(await this.runReviewSummary());
-        return;
-      case '/queue':
-        this.appendSystemMessage(await this.runQueueCommand(rest));
-        return;
-      case '/jobs':
-        this.appendSystemMessage(await this.runJobsCommand(rest));
-        return;
-      case '/artifacts':
-        this.appendSystemMessage(this.formatArtifactSummary());
-        return;
-      case '/checkpoint':
-        this.appendSystemMessage(await this.runCheckpointCommand(rest.join(' ')));
-        return;
-      case '/undo':
-        this.appendSystemMessage(await this.runUndoCommand());
-        return;
-      case '/handoff':
-        this.appendSystemMessage(await this.runHandoffCommand(rest.join(' ')));
-        return;
-      case '/fork':
-        this.appendSystemMessage(await this.runForkCommand(rest.join(' ')));
-        return;
-      case '/briefing':
-        this.appendSystemMessage(await this.runBriefingCommand());
-        return;
-      case '/drift':
-        this.appendSystemMessage(await this.runDriftCommand());
-        return;
-      case '/session':
-        this.appendSystemMessage(await this.runSessionCommand(rest));
-        return;
-      case '/resume':
-        this.appendSystemMessage(await this.runResumeCommand(rest));
-        return;
-      case '/memory':
-        this.appendSystemMessage(await this.runMemoryCommand(rest));
-        return;
-      case '/skill':
-        if (rest.length === 0) {
-          this.appendSystemMessage(await this.formatSkillSummary());
-        } else {
-          this.appendSystemMessage(await this.loadSkillSummary(rest.join(' ')));
-        }
-        return;
-      case '/mcp':
-        this.appendSystemMessage(await this.runMcpCommand(rest));
-        return;
-      case '/hook':
-        this.appendSystemMessage(await this.runHookCommand(rest));
-        return;
-      case '/team':
-        this.appendSystemMessage(await this.runTeamCommand(rest));
-        return;
-      case '/init':
-        this.appendSystemMessage(await this.runInitSummary());
-        return;
-      case '/quit':
-      case '/exit':
-        this.appendSystemMessage('Use /quit from the native TUI directly to exit.');
-        return;
-      default:
-        this.appendSystemMessage(`Unknown command: ${trimmed}`);
-        return;
-    }
+    await runSlashDispatch(command, {
+      clearMessages: () => this.clearMessages(),
+      toggleFire: () => this.toggleFire(),
+      setMode: (mode) => this.setMode(mode),
+      setModel: (model) => this.setModel(model),
+      compactContext: () => this.compactContext(),
+      appendSystemMessage: (message) => this.appendSystemMessage(message),
+      formatPlanSummary: () => this.formatPlanSummary(),
+      runTodoCommand: (args) => this.runTodoCommand(args),
+      runPermissionsCommand: (args) => this.runPermissionsCommand(args),
+      formatConfigSummary: () => this.formatConfigSummary(),
+      formatDoctorSummary: () => this.formatDoctorSummary(),
+      formatContextSummary: () => this.formatContextSummary(),
+      runReviewSummary: () => this.runReviewSummary(),
+      runQueueCommand: (args) => this.runQueueCommand(args),
+      runJobsCommand: (args) => this.runJobsCommand(args),
+      formatArtifactSummary: () => this.formatArtifactSummary(),
+      runCheckpointCommand: (message) => this.runCheckpointCommand(message),
+      runUndoCommand: () => this.runUndoCommand(),
+      runHandoffCommand: (goal) => this.runHandoffCommand(goal),
+      runForkCommand: (name) => this.runForkCommand(name),
+      runBriefingCommand: () => this.runBriefingCommand(),
+      runDriftCommand: () => this.runDriftCommand(),
+      runSessionCommand: (args) => this.runSessionCommand(args),
+      runResumeCommand: (args) => this.runResumeCommand(args),
+      runMemoryCommand: (args) => this.runMemoryCommand(args),
+      formatSkillSummary: () => this.formatSkillSummary(),
+      loadSkillSummary: (name) => this.loadSkillSummary(name),
+      runMcpCommand: (args) => this.runMcpCommand(args),
+      runHookCommand: (args) => this.runHookCommand(args),
+      runTeamCommand: (args) => this.runTeamCommand(args),
+      runInitSummary: () => this.runInitSummary(),
+      models: this.state.models,
+    });
+    this.refreshGitStateAsync();
   }
 
   public cycleMode(direction: 1 | -1 = 1): void {
@@ -1736,6 +1721,18 @@ export class NativeBridgeController {
       });
 
       const maxToolTurns = this.config?.agent.max_turns ?? MAX_TOOL_TURNS_FALLBACK;
+      if (this.tokenCounter.isOverBudget()) {
+        this.appendSystemMessage(
+          '[budget] Session cost limit exceeded. Use /fire or increase cost_budget.maxPerSessionUsd in config.',
+        );
+        return;
+      }
+      if (this.tokenCounter.shouldWarnBudget()) {
+        const remaining = this.tokenCounter.getRemainingBudgetUsd();
+        this.appendSystemMessage(
+          `[budget] Warning: ${remaining !== null ? `$${remaining.toFixed(4)}` : 'unknown'} remaining in session budget.`,
+        );
+      }
       const result = await this.requestEngine.run(
         {
           client: this.activeClient,
@@ -3278,6 +3275,7 @@ export class NativeBridgeController {
     }
 
     this.config = await loadConfig();
+    this.applyCostBudgetConfig();
     this.scheduleStatePush();
   }
 
@@ -3287,6 +3285,7 @@ export class NativeBridgeController {
   ): Promise<void> {
     await setDduduConfigValue(process.cwd(), keyPath, nextValues);
     this.config = await loadConfig();
+    this.applyCostBudgetConfig();
     this.scheduleStatePush();
   }
 
@@ -3772,6 +3771,10 @@ export class NativeBridgeController {
           sessionId: this.state.sessionId,
         });
 
+        if (!result.isError && FILE_MUTATION_TOOL_NAMES.has(normalizeToolName(block.name))) {
+          this.invalidateDerivedCaches({ changedFiles: true, git: true });
+        }
+
         results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
@@ -3818,6 +3821,13 @@ export class NativeBridgeController {
   }
 
   private async refreshSystemPrompt(): Promise<void> {
+    const inputHash = this.systemPromptInputHash();
+    if (this.cachedSystemPromptInputHash === inputHash && this.cachedSystemPrompt !== null) {
+      this.systemPrompt = this.cachedSystemPrompt;
+      this.syncUsageState();
+      return;
+    }
+
     const runtime = this.getResolvedModeRuntime();
     const mode = runtime.mode;
     const model = runtime.model;
@@ -3864,13 +3874,34 @@ export class NativeBridgeController {
       this.state.contextPreview = null;
 
       this.systemPrompt = prompt;
+      this.cachedSystemPrompt = prompt;
+      this.cachedSystemPromptInputHash = inputHash;
     } catch {
       this.systemPrompt = buildFallbackSystemPrompt(mode, model, provider);
+      this.cachedSystemPrompt = this.systemPrompt;
+      this.cachedSystemPromptInputHash = inputHash;
       this.orchestratorPrompt = null;
       this.state.contextPreview = null;
     }
 
     this.syncUsageState();
+  }
+
+  private systemPromptInputHash(): string {
+    const runtime = this.getResolvedModeRuntime();
+    const skillNames = Array.from(this.loadedSkills.keys()).sort();
+    const ttlBucket = Math.floor(Date.now() / SYSTEM_PROMPT_CACHE_TTL_MS);
+    const raw = JSON.stringify({
+      mode: this.currentMode,
+      model: runtime.model,
+      provider: runtime.provider,
+      permissionProfile: this.permissionProfile,
+      skills: skillNames,
+      memoryVersion: this.memoryVersion,
+      ttlBucket,
+    });
+
+    return createHash('sha256').update(raw).digest('hex');
   }
 
   private getSystemMemoryScopes(mode: NamedMode = this.currentMode): MemoryScope[] {
@@ -3997,15 +4028,139 @@ export class NativeBridgeController {
     return true;
   }
 
-  private formatPlanSummary(): string {
-    if (this.todos.length === 0) {
-      return 'plan: none';
-    }
+  private getSessionCommandDeps() {
+    return {
+      sessionManager: this.sessionManager,
+      state: this.state,
+      currentMode: this.currentMode,
+      getCurrentProvider: () => this.getCurrentProvider(),
+      getCurrentModel: () => this.getCurrentModel(),
+      formatSessionSummary: () => this.formatSessionSummary(),
+      formatSessionListItem: (session: SessionListItem) => this.formatSessionListItem(session),
+      formatSessionTitle: (session: SessionListItem) => this.formatSessionTitle(session),
+      resolveSessionReference: (sessions: SessionListItem[], reference: string) => this.resolveSessionReference(sessions, reference),
+      resumeSessionById: (sessionId: string) => this.resumeSessionById(sessionId),
+      promptForQuestionValue: (prompt: AskUserPrompt) => this.promptUserQuestionValue(prompt),
+      seedSessionMessages: (sessionId: string, messages: NativeMessageState[]) => this.seedSessionMessages(sessionId, messages),
+      restoreEpistemicState: () => this.restoreEpistemicState(),
+      appendSystemMessage: (message: string) => this.appendSystemMessage(message),
+      persistWorkflowState: (reason: string) => this.persistWorkflowState(reason),
+      compactionEngine: this.compactionEngine,
+      toCompactionMessages,
+      remoteSessionsClear: () => this.remoteSessions.clear(),
+      updateRemoteSessionState: () => this.updateRemoteSessionState(),
+      scheduleStatePush: () => this.scheduleStatePush(),
+      getSessionArtifactDirectory: () => this.getSessionArtifactDirectory(),
+      invalidateDerivedCaches: (flags: { briefing?: boolean }) => this.invalidateDerivedCaches(flags),
+      epistemicState: this.epistemicState,
+    };
+  }
 
-    return [
-      'plan:',
-      ...this.todos.map((item, index) => `${index + 1}. [${item.status}] ${item.step}${item.owner ? ` · ${item.owner}` : ''}`),
-    ].join('\n');
+  private getMemoryCommandDeps() {
+    return {
+      parseMemoryScope: (value: string | undefined) => this.parseMemoryScope(value),
+      formatMemorySummary: () => this.formatMemorySummary(),
+      invalidateDerivedCaches: (flags: { memory?: boolean }) => this.invalidateDerivedCaches(flags),
+      refreshSystemPrompt: () => this.refreshSystemPrompt(),
+      scheduleStatePush: () => this.scheduleStatePush(),
+    };
+  }
+
+  private getWorkspaceCommandDeps() {
+    return {
+      todos: this.todos,
+      artifacts: this.artifacts,
+      queuedPrompts: this.queuedPrompts,
+      permissionProfile: this.permissionProfile,
+      config: this.config,
+      state: this.state,
+      abortController: this.abortController,
+      backgroundJobStore: this.backgroundJobStore,
+      formatToolPolicySummary: () => this.formatToolPolicySummary(),
+      formatNetworkTrustSummary: () => this.formatNetworkTrustSummary(),
+      formatSecretTrustSummary: () => this.formatSecretTrustSummary(),
+      addStringListConfigValue: (path: string, value: string) => this.addStringListConfigValue(path, value),
+      removeStringListConfigValue: (path: string, value: string) => this.removeStringListConfigValue(path, value),
+      setStringListConfigValue: (path: string, values: string[]) => this.setStringListConfigValue(path, values),
+      scheduleStatePush: () => this.scheduleStatePush(),
+      setConfiguredToolPolicy: (name: string, policy: 'inherit' | 'allow' | 'ask' | 'deny') => this.setConfiguredToolPolicy(name, policy),
+      requestPermissionProfileChange: (profile: PermissionProfile, source: 'fire' | 'permissions') => this.requestPermissionProfileChange(profile, source),
+      clearPlan: () => this.clearPlan(),
+      addPlanItem: (step: string) => this.addPlanItem(step),
+      updatePlanItem: (stepOrId: string, updates: { status?: PlanItemStatus; owner?: string }) => this.updatePlanItem(stepOrId, updates),
+      syncQueuedPrompts: () => this.syncQueuedPrompts(),
+      formatQueueSummary: () => this.formatQueueSummary(),
+      resolveQueueIndex: (value: string) => this.resolveQueueIndex(value),
+      submit: (prompt: string) => this.submit(prompt),
+      formatJobsSummary: () => this.formatJobsSummary(),
+      resolveBackgroundJob: (reference: string) => this.resolveBackgroundJob(reference),
+      getStoredBackgroundJob: (jobId: string) => this.getStoredBackgroundJob(jobId),
+      waitForJobCompletion: (jobId: string, timeoutMs: number) => this.waitForJobCompletion(jobId, timeoutMs),
+      pollBackgroundJobs: () => this.pollBackgroundJobs(),
+      canStartBackgroundJob: () => this.canStartBackgroundJob(),
+      startBackgroundTeamRun: (strategy: 'parallel' | 'sequential' | 'delegate', task: string, options: { routeNote?: string; attempt?: number }) =>
+        this.startBackgroundTeamRun(strategy, task, options),
+      startBackgroundDelegatedRoute: (
+        message: NativeMessageState,
+        decision: AutoRouteDecision,
+      ) => this.startBackgroundDelegatedRoute(message, decision),
+      formatJobInspect: (job: BackgroundJobState) => this.formatJobInspect(job),
+      formatJobResult: (job: BackgroundJobState) => this.formatJobResult(job),
+      getArtifactById: (id: string | null | undefined) => this.getArtifactById(id),
+      executeTeamRun: (strategy: 'parallel' | 'sequential' | 'delegate', task: string, options: { routeNote?: string }) => this.executeTeamRun(strategy, task, options),
+    };
+  }
+
+  private getSystemCommandDeps() {
+    return {
+      currentMode: this.currentMode,
+      state: this.state,
+      permissionProfile: this.permissionProfile,
+      todos: this.todos,
+      loadedSkills: this.loadedSkills,
+      toolRegistry: this.toolRegistry,
+      lspManager: this.lspManager,
+      queuedPrompts: this.queuedPrompts,
+      artifacts: this.artifacts,
+      remoteSessions: this.remoteSessions,
+      backgroundJobs: this.backgroundJobs,
+      getContextProfile: () => this.getContextProfile(),
+      getChangedFiles: (limit: number) => this.getChangedFiles(limit),
+      getBriefingSummary: () => this.getBriefingSummary(),
+      agentActivities: this.agentActivities,
+      epistemicState: this.epistemicState,
+      refreshSystemPrompt: () => this.refreshSystemPrompt(),
+      scheduleStatePush: () => this.scheduleStatePush(),
+      mcpManager: this.mcpManager,
+      config: this.config,
+      reloadMcpRuntime: () => this.reloadMcpRuntime(),
+      setMcpServerEnabled: (name: string, enabled: boolean) => this.setMcpServerEnabled(name, enabled),
+      setMcpServerTrust: (name: string, trust: TrustTier) => this.setMcpServerTrust(name, trust),
+      hookRegistry: this.hookRegistry,
+    };
+  }
+
+  private getTeamCommandDeps() {
+    return {
+      state: this.state,
+      abortController: this.abortController,
+      formatTeamSummary: () => this.formatTeamSummary(),
+      canStartBackgroundJob: () => this.canStartBackgroundJob(),
+      startBackgroundTeamRun: (
+        strategy: 'parallel' | 'sequential' | 'delegate',
+        task: string,
+        options: { routeNote?: string; attempt?: number },
+      ) => this.startBackgroundTeamRun(strategy, task, options),
+      executeTeamRun: (
+        strategy: 'parallel' | 'sequential' | 'delegate',
+        task: string,
+        options?: { routeNote?: string },
+      ) => this.executeTeamRun(strategy, task, options ?? {}),
+    };
+  }
+
+  private formatPlanSummary(): string {
+    return formatPlanSummaryCommand(this.getWorkspaceCommandDeps());
   }
 
   private async replacePlan(items: PlanItem[]): Promise<void> {
@@ -4170,6 +4325,7 @@ export class NativeBridgeController {
 
   private async reloadMcpRuntime(): Promise<void> {
     this.config = await loadConfig();
+    this.applyCostBudgetConfig();
     this.mcpManager?.disconnectAll();
     this.mcpManager = null;
     this.toolRegistry?.removeMatching((name) => name.startsWith('mcp__'));
@@ -4441,44 +4597,11 @@ export class NativeBridgeController {
   }
 
   private formatConfigSummary(): string {
-    const modeEntry = HARNESS_MODES[this.currentMode] ?? HARNESS_MODES.jennie;
-    const authLabel = this.state.authType ?? 'missing';
-
-    return [
-      'Runtime config',
-      `mode: ${modeEntry.label} (${modeEntry.tagline})`,
-      `provider: ${this.state.provider}`,
-      `model: ${this.state.model}`,
-      `auth: ${authLabel}`,
-      `permissions: ${this.permissionProfile}`,
-      `session: ${this.state.sessionId ?? 'none'}`,
-      `plan items: ${this.todos.length}`,
-      `skills loaded: ${this.loadedSkills.size}`,
-      `tools: ${this.toolRegistry?.list().length ?? 0}`,
-    ].join('\n');
+    return formatConfigSummaryCommand(this.getSystemCommandDeps());
   }
 
   private formatDoctorSummary(): string {
-    const profile = this.getContextProfile();
-    const queue = this.queuedPrompts.length > 0 ? this.queuedPrompts.length.toString() : '0';
-    const lspState = this.lspManager.getServerState();
-
-    return [
-      'Doctor',
-      `provider: ${this.state.provider}`,
-      `model: ${this.state.model}`,
-      `auth: ${this.state.authType ?? 'missing'}${this.state.authSource ? ` via ${this.state.authSource}` : ''}`,
-      `context: ${this.state.contextTokens.toLocaleString()} / ${this.state.contextLimit.toLocaleString()} (${(this.state.contextPercent * 100).toFixed(1)}%)`,
-      `working set: ${profile.canonicalWorkingSetTokens.toLocaleString()} · auto compact at ${profile.autoCompactAtTokens.toLocaleString()}`,
-      `permissions: ${this.permissionProfile}`,
-      `plan items: ${this.todos.length}`,
-      `artifacts: ${this.artifacts.length}`,
-      `skills loaded: ${this.loadedSkills.size}`,
-      `provider sessions: ${this.remoteSessions.size}`,
-      `background queue: ${queue}`,
-      `background jobs: ${this.backgroundJobs.length}`,
-      `lsp: ${lspState.connected.length}/${lspState.available.length} connected`,
-    ].join('\n');
+    return formatDoctorSummaryCommand(this.getSystemCommandDeps());
   }
 
   private async formatSessionSummary(): Promise<string> {
@@ -4514,24 +4637,11 @@ export class NativeBridgeController {
   }
 
   private async formatMemorySummary(): Promise<string> {
-    try {
-      const memory = await loadMemory(process.cwd());
-      if (!hasMeaningfulMemory(memory)) {
-        return 'Memory is empty.';
-      }
-      const preview = previewText(memory, 400);
-      return preview ? `Memory\n${preview}` : 'Memory is empty.';
-    } catch (error: unknown) {
-      return `Memory read failed: ${serializeError(error)}`;
-    }
+    return formatMemorySummaryCommand();
   }
 
   private parseMemoryScope(value: string | undefined): MemoryScope | null {
-    if (!value) {
-      return null;
-    }
-
-    return MEMORY_SCOPES.includes(value as MemoryScope) ? (value as MemoryScope) : null;
+    return parseMemoryScopeCommand(value);
   }
 
   private formatSessionTitle(session: SessionListItem): string {
@@ -4587,147 +4697,15 @@ export class NativeBridgeController {
   }
 
   private async runSessionCommand(args: string[]): Promise<string> {
-    const command = args[0]?.trim().toLowerCase() ?? '';
-    if (!command || command === 'status') {
-      return this.formatSessionSummary();
-    }
-
-    if (!this.sessionManager) {
-      return 'Session manager unavailable.';
-    }
-
-    if (command === 'list') {
-      const sessions = await this.sessionManager.list();
-      if (sessions.length === 0) {
-        return 'Sessions: none';
-      }
-      return [
-        'Sessions',
-        ...sessions.slice(0, 12).map((session, index) =>
-          `${index + 1}. ${this.formatSessionListItem(session)}`),
-      ].join('\n');
-    }
-
-    if (command === 'last') {
-      const sessions = await this.sessionManager.list();
-      const latest = sessions[0];
-      if (!latest) {
-        return 'No saved sessions yet.';
-      }
-      await this.resumeSessionById(latest.id);
-      return `Resumed ${this.formatSessionTitle(latest)}.`;
-    }
-
-    if (command === 'pick') {
-      const sessions = await this.sessionManager.list();
-      if (sessions.length === 0) {
-        return 'No saved sessions yet.';
-      }
-
-      const answer = await this.promptForQuestionValue(buildInputPrompt({
-        question: 'Which session do you want to resume?',
-        detail: 'Pick a recent session or type an index / session id prefix.',
-        placeholder: 'Type a session number or id prefix',
-        submitLabel: 'Resume session',
-        options: sessions.slice(0, 12).map((session, index) => ({
-          value: String(index + 1),
-          label: `${index + 1}. ${this.formatSessionTitle(session)}`,
-          description: [
-            [session.mode, session.provider, session.model]
-              .filter((part): part is string => Boolean(part))
-              .join(' · ') || null,
-            `${session.entryCount} entries`,
-            session.updatedAt.replace('T', ' ').replace(/\.\d+Z$/, 'Z'),
-            `#${session.id.slice(0, 8)}`,
-          ].filter((part): part is string => Boolean(part)).join(' · '),
-        })),
-      }));
-      const selected = this.resolveSessionReference(sessions, answer);
-      if (!selected) {
-        return 'Session selection cancelled.';
-      }
-
-      await this.resumeSessionById(selected.id);
-      return `Resumed ${this.formatSessionTitle(selected)}.`;
-    }
-
-    if (command === 'resume') {
-      const reference = args[1]?.trim();
-      if (!reference) {
-        return 'Usage: /session resume <id|index> or /session pick';
-      }
-      const sessions = await this.sessionManager.list();
-      const resolved = this.resolveSessionReference(sessions, reference);
-      if (!resolved) {
-        return `Session not found: ${reference}`;
-      }
-      await this.resumeSessionById(resolved.id);
-      return `Resumed ${this.formatSessionTitle(resolved)}.`;
-    }
-
-    return 'Usage: /session [list|last|pick|resume <id|index>]';
+    return runSessionCommandCommand(args, this.getSessionCommandDeps());
   }
 
   private async runResumeCommand(args: string[]): Promise<string> {
-    const reference = args[0]?.trim().toLowerCase() ?? '';
-    if (!reference || reference === 'last') {
-      return this.runSessionCommand(['last']);
-    }
-    if (reference === 'pick') {
-      return this.runSessionCommand(['pick']);
-    }
-    return this.runSessionCommand(['resume', args[0] ?? '']);
+    return runResumeCommandCommand(args, this.getSessionCommandDeps());
   }
 
   private async runMemoryCommand(args: string[]): Promise<string> {
-    const command = args[0]?.trim().toLowerCase() ?? '';
-    if (!command || command === 'read') {
-      if (command === 'read' && args[1]) {
-        const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
-        if (!scope) {
-          return 'Usage: /memory read [global|project|working|episodic|semantic|procedural]';
-        }
-        const memory = await loadMemory(process.cwd());
-        const title = `## ${scope.charAt(0).toUpperCase() + scope.slice(1)} Memory\n`;
-        const section = memory.split(/\n(?=## )/u).find((entry) => entry.startsWith(title));
-        return section ? `Memory\n${section.replace(title, '')}` : `Memory (${scope}) is empty.`;
-      }
-      return this.formatMemorySummary();
-    }
-
-    if (command === 'write' || command === 'append') {
-      const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
-      if (!scope) {
-        return `Usage: /memory ${command} <global|project|working|episodic|semantic|procedural> <content>`;
-      }
-      const content = args.slice(2).join(' ').trim();
-      if (!content) {
-        return `Usage: /memory ${command} <global|project|working|episodic|semantic|procedural> <content>`;
-      }
-      if (command === 'write') {
-        await saveMemory(process.cwd(), content, scope);
-      } else {
-        await appendMemory(process.cwd(), content, scope);
-      }
-      this.invalidateDerivedCaches({ memory: true });
-      await this.refreshSystemPrompt();
-      this.scheduleStatePush();
-      return `Memory ${command === 'write' ? 'written' : 'appended'} in ${scope}.`;
-    }
-
-    if (command === 'clear') {
-      const scope = this.parseMemoryScope(args[1]?.trim().toLowerCase());
-      if (!scope) {
-        return 'Usage: /memory clear <global|project|working|episodic|semantic|procedural>';
-      }
-      await clearMemory(process.cwd(), scope);
-      this.invalidateDerivedCaches({ memory: true });
-      await this.refreshSystemPrompt();
-      this.scheduleStatePush();
-      return `Memory cleared in ${scope}.`;
-    }
-
-    return 'Usage: /memory [read [scope]|write <scope> <content>|append <scope> <content>|clear <scope>]';
+    return runMemoryCommandCommand(args, this.getMemoryCommandDeps());
   }
 
   private async getChangedFiles(limit: number = 8): Promise<string[]> {
@@ -4773,6 +4751,109 @@ export class NativeBridgeController {
         return [];
       }
     }
+  }
+
+  private async getGitState(): Promise<NativeGitState | null> {
+    const cached = this.readTimedCache(this.gitStateCache);
+    if (cached) {
+      return {
+        ...cached,
+        changedFiles: [...cached.changedFiles],
+      };
+    }
+
+    try {
+      const [branchResult, statusResult] = await Promise.all([
+        execFileAsync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], {
+          cwd: process.cwd(),
+          encoding: 'utf8',
+          maxBuffer: 4 * 1024 * 1024,
+        }),
+        execFileAsync('git', ['status', '--porcelain'], {
+          cwd: process.cwd(),
+          encoding: 'utf8',
+          maxBuffer: 4 * 1024 * 1024,
+        }),
+      ]);
+
+      const branchNameRaw = branchResult.stdout.trim();
+      const branch = branchNameRaw.length > 0 ? branchNameRaw : null;
+
+      const changedFiles: string[] = [];
+      const changedFileSet = new Set<string>();
+      let stagedFileCount = 0;
+
+      for (const rawLine of statusResult.stdout.split('\n')) {
+        const line = rawLine.replace(/\r/g, '');
+        if (line.length < 3) {
+          continue;
+        }
+
+        const stagedColumn = line[0] ?? ' ';
+        const unstagedColumn = line[1] ?? ' ';
+        if (stagedColumn !== ' ' && stagedColumn !== '?') {
+          stagedFileCount += 1;
+        }
+
+        if (stagedColumn === ' ' && unstagedColumn === ' ') {
+          continue;
+        }
+
+        const filePath = line.slice(3).trim().replace(/^.* -> /, '');
+        if (!filePath) {
+          continue;
+        }
+
+        if (!changedFileSet.has(filePath)) {
+          changedFileSet.add(filePath);
+          if (changedFiles.length < 10) {
+            changedFiles.push(filePath);
+          }
+        }
+      }
+
+      const resolved: NativeGitState = {
+        branch,
+        changedFileCount: changedFileSet.size,
+        stagedFileCount,
+        hasUncommitted: changedFileSet.size > 0,
+        changedFiles,
+      };
+      this.gitStateCache = this.writeTimedCache(resolved, 2000);
+      return {
+        ...resolved,
+        changedFiles: [...resolved.changedFiles],
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private refreshGitStateAsync(): void {
+    if (!this.state.ready) {
+      return;
+    }
+
+    if (this.gitStateRefreshInFlight) {
+      return;
+    }
+
+    this.gitStateRefreshInFlight = true;
+    void this.getGitState()
+      .then((nextGitState) => {
+        const currentState = this.state.git;
+        const currentSerialized = currentState ? JSON.stringify(currentState) : null;
+        const nextSerialized = nextGitState ? JSON.stringify(nextGitState) : null;
+        if (currentSerialized === nextSerialized) {
+          return;
+        }
+
+        this.state.git = nextGitState;
+        this.scheduleStatePush();
+      })
+      .finally(() => {
+        this.gitStateRefreshInFlight = false;
+      });
   }
 
   private extractPromptFileHints(prompt: string): string[] {
@@ -5197,126 +5278,19 @@ export class NativeBridgeController {
   }
 
   private async formatContextSummary(): Promise<string> {
-    const changedFiles = await this.getChangedFiles(12);
-    let briefingSummary = 'none';
-    let briefingSteps: string[] = [];
-    try {
-      const briefing = await this.getBriefingSummary();
-      if (briefing) {
-        briefingSummary = briefing.summary;
-        briefingSteps = briefing.nextSteps.slice(0, 5);
-      }
-    } catch {
-      briefingSummary = 'unavailable';
-    }
-
-    const activeAgents = this.agentActivities
-      .slice()
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 6)
-      .map((item) => {
-        const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
-          .filter((part): part is string => Boolean(part))
-          .join(' · ');
-        return `${scope} · ${item.status}${item.detail ? ` · ${previewText(item.detail, 120)}` : ''}`;
-      });
-
-    const backgroundJobs = this.backgroundJobs
-      .slice()
-      .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 4)
-      .map((job) => `${job.label} · ${job.status}${job.detail ? ` · ${previewText(job.detail, 120)}` : ''}`);
-    const artifacts = this.artifacts
-      .slice(0, 6)
-      .map((artifact) => formatArtifactContextLine(artifact, 180));
-
-    return [
-      'Context Snapshot',
-      '',
-      'What ddudu currently includes in the live prompt:',
-      '- base system prompt + mode prompt addition',
-      '- DDUDU.md / AGENTS.md / provider instruction files',
-      '- global + project rules',
-      '- loaded skills',
-      '- layered memory',
-      '- workflow state (permissions + todo plan)',
-      '- dynamic context snapshot (changed files, briefing, uncertainties, active agents, background jobs, workspace)',
-      '',
-      `Changed files: ${changedFiles.length > 0 ? changedFiles.join(', ') : 'none'}`,
-      `Briefing: ${briefingSummary}`,
-      ...(briefingSteps.length > 0
-        ? ['Next steps:', ...briefingSteps.map((step) => `- ${step}`)]
-        : ['Next steps: none']),
-      ...(activeAgents.length > 0
-        ? ['Recent agents:', ...activeAgents.map((entry) => `- ${entry}`)]
-        : ['Recent agents: none']),
-      ...(backgroundJobs.length > 0
-        ? ['Background jobs:', ...backgroundJobs.map((entry) => `- ${entry}`)]
-        : ['Background jobs: none']),
-      ...(artifacts.length > 0
-        ? ['Artifacts:', ...artifacts.map((entry) => `- ${entry}`)]
-        : ['Artifacts: none']),
-      `Uncertainties: ${this.epistemicState.getStats().uncertainties}`,
-    ].join('\n');
+    return formatContextSummaryCommand(this.getSystemCommandDeps());
   }
 
   private async formatSkillSummary(): Promise<string> {
-    try {
-      const loader = new SkillLoader(process.cwd());
-      await loader.scan();
-      const skills = loader.list();
-      if (skills.length === 0) {
-        return 'No skills discovered.';
-      }
-
-      return [
-        'Skills',
-        ...skills.slice(0, 12).map((skill) => {
-          const loaded = this.loadedSkills.has(skill.name) ? 'loaded' : 'available';
-          return `${skill.name} · ${loaded} · ${skill.description}`;
-        }),
-      ].join('\n');
-    } catch (error: unknown) {
-      return `Skill scan failed: ${serializeError(error)}`;
-    }
+    return formatSkillSummaryCommand(this.getSystemCommandDeps());
   }
 
   private async loadSkillSummary(name: string): Promise<string> {
-    try {
-      const loader = new SkillLoader(process.cwd());
-      await loader.scan();
-      const skill = await loader.load(name);
-      if (!skill) {
-        return `Skill not found: ${name}`;
-      }
-
-      this.loadedSkills.set(skill.name, skill);
-      await this.refreshSystemPrompt();
-      this.scheduleStatePush();
-      return `Skill loaded into context: ${skill.name}`;
-    } catch (error: unknown) {
-      return `Skill load failed: ${serializeError(error)}`;
-    }
+    return loadSkillSummaryCommand(name, this.getSystemCommandDeps());
   }
 
   private async runReviewSummary(): Promise<string> {
-    const git = new GitCheckpoint(process.cwd());
-    if (!(await git.isAvailable())) {
-      return 'Review unavailable: not a git repository.';
-    }
-
-    try {
-      const diff = await git.getDiff();
-      if (!diff.trim()) {
-        return 'Review skipped: no diff available.';
-      }
-
-      const runner = new ChecksRunner(process.cwd());
-      const report = await runner.runAllChecks(diff);
-      return runner.formatReport(report);
-    } catch (error: unknown) {
-      return `Review failed: ${serializeError(error)}`;
-    }
+    return runReviewSummaryCommand();
   }
 
   private setWorkspaceState(workspace: IsolatedWorkspace | null): void {
@@ -5851,38 +5825,42 @@ export class NativeBridgeController {
     }
     this.memoryPromotionFingerprints.add(fingerprint);
 
-    const files = input.verification.changedFiles.length > 0
-      ? input.verification.changedFiles.slice(0, 6).join(', ')
-      : 'not detected';
-
-    await appendMemory(
-      process.cwd(),
-      [
-        `Outcome: ${input.purpose} verified successfully in ${HARNESS_MODES[input.mode].label}.`,
-        `Files: ${files}`,
-        `Verification: ${input.verification.summary}`,
-        `Result: ${previewText(input.output, 280)}`,
-      ].join('\n'),
-      'semantic',
-    );
-    this.invalidateDerivedCaches({ memory: true });
-
-    if (input.reason === 'verification auto-retry' || input.reason?.startsWith('Verification escalation') === true) {
-      await appendMemory(
-        process.cwd(),
-        [
-          `Repair pattern succeeded for ${input.purpose}.`,
-          `Mode: ${HARNESS_MODES[input.mode].label}`,
-          `Files: ${files}`,
-          `Verification: ${input.verification.summary}`,
-          'Guideline: prefer the smallest isolated patch that lands cleanly and rerun verification before returning control.',
-        ].join('\n'),
-        'procedural',
-      );
-      this.invalidateDerivedCaches({ memory: true });
+    if (input.verification.status !== 'passed' || input.verification.changedFiles.length === 0) {
+      return;
     }
 
-    await this.refreshSystemPrompt();
+    try {
+      const candidate: PromotionCandidate = {
+        content: input.verification.summary,
+        changedFiles: input.verification.changedFiles,
+        verificationStatus: 'passed',
+      };
+
+      const existingMemory = await loadMemory(process.cwd());
+      const existingEntries = existingMemory.split(/\n(?=## )/u).filter((entry) => entry.trim().length > 0);
+      const score = scoreCandidate(candidate, existingEntries);
+      const decision = decidePromotion(score);
+
+      if (
+        decision === 'promote_semantic' ||
+        decision === 'promote_procedural' ||
+        decision === 'promote_episodic'
+      ) {
+        const scope = decision.replace('promote_', '') as 'semantic' | 'procedural' | 'episodic';
+        const dedupe = dedupeAgainstExisting(candidate.content, existingEntries);
+        if (!dedupe.isDuplicate) {
+          const backend = await getMemoryBackend(process.cwd());
+          const metadata: MemoryEntryMetadata = {
+            confidence: score.composite,
+            promotedAt: new Date().toISOString(),
+            score,
+          };
+          await backend.append(process.cwd(), scope, candidate.content, metadata);
+          this.invalidateDerivedCaches({ memory: true });
+          await this.refreshSystemPrompt();
+        }
+      }
+    } catch {}
   }
 
   private async finalizeVerificationRecovery(input: {
@@ -6235,223 +6213,15 @@ export class NativeBridgeController {
   }
 
   private async runPermissionsCommand(args: string[]): Promise<string> {
-    const requested = args[0]?.trim().toLowerCase();
-    if (!requested) {
-      return [
-        'Permissions',
-        `current: ${this.permissionProfile}`,
-        'profiles:',
-        '- plan · read-only',
-        '- ask · prompt for any non-read tool',
-        '- workspace-write · auto-allow local edits, prompt for network/secrets/delegation',
-        '- permissionless · allow all except hard-blocked shell patterns',
-        '',
-        'commands:',
-        '- /permissions tool <tool|prefix*> <inherit|allow|ask|deny>',
-        '- /permissions network ...',
-        '- /permissions secrets ...',
-        '',
-        this.formatToolPolicySummary(),
-        '',
-        this.formatNetworkTrustSummary(),
-        '',
-        this.formatSecretTrustSummary(),
-      ].join('\n');
-    }
-
-    if (requested === 'tools') {
-      return this.formatToolPolicySummary();
-    }
-
-    if (requested === 'network') {
-      const action = args[1]?.trim().toLowerCase() ?? '';
-      const value = args[2]?.trim() ?? '';
-      if (!action || action === 'status') {
-        return this.formatNetworkTrustSummary();
-      }
-      if (action === 'allow') {
-        if (!value) {
-          return 'Usage: /permissions network allow <host>';
-        }
-        await this.addStringListConfigValue('tools.network.allowed_hosts', value);
-        return this.formatNetworkTrustSummary();
-      }
-      if (action === 'deny') {
-        if (!value) {
-          return 'Usage: /permissions network deny <host>';
-        }
-        await this.addStringListConfigValue('tools.network.denied_hosts', value);
-        return this.formatNetworkTrustSummary();
-      }
-      if (action === 'remove') {
-        const target = args[2]?.trim().toLowerCase();
-        const entry = args[3]?.trim() ?? '';
-        if (target === 'allow') {
-          if (!entry) {
-            return 'Usage: /permissions network remove allow <host>';
-          }
-          await this.removeStringListConfigValue('tools.network.allowed_hosts', entry);
-          return this.formatNetworkTrustSummary();
-        }
-        if (target === 'deny') {
-          if (!entry) {
-            return 'Usage: /permissions network remove deny <host>';
-          }
-          await this.removeStringListConfigValue('tools.network.denied_hosts', entry);
-          return this.formatNetworkTrustSummary();
-        }
-        return 'Usage: /permissions network remove <allow|deny> <host>';
-      }
-      if (action === 'clear') {
-        await this.setStringListConfigValue('tools.network.allowed_hosts', []);
-        await this.setStringListConfigValue('tools.network.denied_hosts', []);
-        return this.formatNetworkTrustSummary();
-      }
-      if (action === 'ask-on-new-host') {
-        const enabled = value.toLowerCase();
-        if (!['on', 'off', 'true', 'false'].includes(enabled)) {
-          return 'Usage: /permissions network ask-on-new-host <on|off>';
-        }
-        await setDduduConfigValue(
-          process.cwd(),
-          'tools.network.ask_on_new_host',
-          enabled === 'on' || enabled === 'true',
-        );
-        this.config = await loadConfig();
-        this.scheduleStatePush();
-        return this.formatNetworkTrustSummary();
-      }
-      return 'Usage: /permissions network [status|allow <host>|deny <host>|remove <allow|deny> <host>|clear|ask-on-new-host <on|off>]';
-    }
-
-    if (requested === 'secrets') {
-      const action = args[1]?.trim().toLowerCase() ?? '';
-      const target = args[2]?.trim().toLowerCase() ?? '';
-      const value = args[3]?.trim() ?? '';
-      if (!action || action === 'status') {
-        return this.formatSecretTrustSummary();
-      }
-      if (action === 'add') {
-        if (target === 'path') {
-          if (!value) {
-            return 'Usage: /permissions secrets add path <pattern>';
-          }
-          await this.addStringListConfigValue('tools.secrets.protected_paths', value);
-          return this.formatSecretTrustSummary();
-        }
-        if (target === 'env') {
-          if (!value) {
-            return 'Usage: /permissions secrets add env <NAME>';
-          }
-          await this.addStringListConfigValue('tools.secrets.protected_env', value);
-          return this.formatSecretTrustSummary();
-        }
-        return 'Usage: /permissions secrets add <path|env> <value>';
-      }
-      if (action === 'remove') {
-        if (target === 'path') {
-          if (!value) {
-            return 'Usage: /permissions secrets remove path <pattern>';
-          }
-          await this.removeStringListConfigValue('tools.secrets.protected_paths', value);
-          return this.formatSecretTrustSummary();
-        }
-        if (target === 'env') {
-          if (!value) {
-            return 'Usage: /permissions secrets remove env <NAME>';
-          }
-          await this.removeStringListConfigValue('tools.secrets.protected_env', value);
-          return this.formatSecretTrustSummary();
-        }
-        return 'Usage: /permissions secrets remove <path|env> <value>';
-      }
-      return 'Usage: /permissions secrets [status|add <path|env> <value>|remove <path|env> <value>]';
-    }
-
-    if (requested === 'tool') {
-      const name = args[1]?.trim();
-      const policy = args[2]?.trim().toLowerCase();
-      if (!name || !policy || !isToolPolicy(policy)) {
-        return 'Usage: /permissions tool <tool-name|prefix*> <inherit|allow|ask|deny>';
-      }
-      await this.setConfiguredToolPolicy(name, policy);
-      return [
-        `Tool policy updated: ${name} -> ${policy}`,
-        '',
-        this.formatToolPolicySummary(),
-      ].join('\n');
-    }
-
-    const nextProfile =
-      requested === 'workspace' ? 'workspace-write'
-        : requested === 'full' ? 'permissionless'
-          : requested;
-
-    if (!isPermissionProfile(nextProfile)) {
-      return 'Usage: /permissions <plan|ask|workspace-write|permissionless>';
-    }
-
-    const changed = await this.requestPermissionProfileChange(nextProfile, 'permissions');
-    if (!changed) {
-      return `Permissions unchanged: ${this.permissionProfile}`;
-    }
-    return `Permissions updated: ${nextProfile}`;
+    return runPermissionsCommandCommand(args, this.getWorkspaceCommandDeps());
   }
 
   private async runTodoCommand(args: string[]): Promise<string> {
-    const [action, ...rest] = args;
-    const trimmedAction = action?.trim().toLowerCase() ?? '';
-
-    if (!trimmedAction) {
-      return this.formatPlanSummary();
-    }
-
-    if (trimmedAction === 'clear') {
-      await this.clearPlan();
-      return 'Plan cleared.';
-    }
-
-    if (trimmedAction === 'add') {
-      const step = rest.join(' ').trim();
-      if (!step) {
-        return 'Usage: /todo add <step>';
-      }
-      await this.addPlanItem(step);
-      return this.formatPlanSummary();
-    }
-
-    if (trimmedAction === 'doing' || trimmedAction === 'done' || trimmedAction === 'pending') {
-      const stepOrId = rest.join(' ').trim();
-      if (!stepOrId) {
-        return `Usage: /todo ${trimmedAction} <step-or-id>`;
-      }
-      await this.updatePlanItem(stepOrId, {
-        status: trimmedAction === 'doing'
-          ? 'in_progress'
-          : trimmedAction === 'done'
-            ? 'completed'
-            : 'pending',
-      });
-      return this.formatPlanSummary();
-    }
-
-    return 'Usage: /todo [add|doing|done|pending|clear] ...';
+    return runTodoCommandCommand(args, this.getWorkspaceCommandDeps());
   }
 
   private formatArtifactSummary(): string {
-    if (this.artifacts.length === 0) {
-      return 'Artifacts: none';
-    }
-
-    return [
-      'Artifacts',
-      ...this.artifacts.slice(0, 8).flatMap((artifact, index) => {
-        const lines = formatArtifactForInspector(artifact);
-        return lines.map((line, lineIndex) =>
-          lineIndex === 0 ? `${index + 1}. ${line}` : `   ${line}`,
-        );
-      }),
-    ].join('\n');
+    return formatArtifactSummaryCommand(this.getWorkspaceCommandDeps());
   }
 
   private formatQueueSummary(): string {
@@ -6475,65 +6245,7 @@ export class NativeBridgeController {
   }
 
   private async runQueueCommand(args: string[]): Promise<string> {
-    const [action, ...rest] = args;
-    const command = action?.trim().toLowerCase() ?? '';
-
-    if (!command) {
-      return this.formatQueueSummary();
-    }
-
-    if (command === 'clear') {
-      this.queuedPrompts = [];
-      this.syncQueuedPrompts();
-      return 'Queue cleared.';
-    }
-
-    if (command === 'drop') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /queue drop <index>';
-      }
-      const index = this.resolveQueueIndex(ref);
-      const [removed] = this.queuedPrompts.splice(index, 1);
-      this.syncQueuedPrompts();
-      return `Dropped queue item ${index + 1}: ${previewText(removed ?? '', 120)}`;
-    }
-
-    if (command === 'promote') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /queue promote <index>';
-      }
-      const index = this.resolveQueueIndex(ref);
-      const [prompt] = this.queuedPrompts.splice(index, 1);
-      if (prompt) {
-        this.queuedPrompts.unshift(prompt);
-      }
-      this.syncQueuedPrompts();
-      return this.formatQueueSummary();
-    }
-
-    if (command === 'run') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /queue run <index>';
-      }
-      const index = this.resolveQueueIndex(ref);
-      const [prompt] = this.queuedPrompts.splice(index, 1);
-      this.syncQueuedPrompts();
-      if (!prompt) {
-        return `Queue item not found: ${ref}`;
-      }
-      if (this.state.loading && this.abortController) {
-        this.queuedPrompts.unshift(prompt);
-        this.syncQueuedPrompts();
-        return `Queue item ${ref} promoted to run next.`;
-      }
-      await this.submit(prompt);
-      return `Queue item ${ref} started.`;
-    }
-
-    return 'Usage: /queue [run|promote|drop|clear] ...';
+    return runQueueCommandCommand(args, this.getWorkspaceCommandDeps());
   }
 
   private async listVisibleBackgroundJobs(scope: 'all' | 'current' = 'all'): Promise<BackgroundJobState[]> {
@@ -6742,223 +6454,15 @@ export class NativeBridgeController {
   }
 
   private async runJobsCommand(args: string[]): Promise<string> {
-    const [action, ...rest] = args;
-    const command = action?.trim().toLowerCase() ?? '';
-
-    if (!command) {
-      return this.formatJobsSummary();
-    }
-
-    if (command === 'cancel') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs cancel <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      const stored = await this.getStoredBackgroundJob(job.id);
-      if (job.status !== 'running' || !stored?.pid) {
-        return `Job ${ref} is not cancellable.`;
-      }
-      try {
-        process.kill(stored.pid, 'SIGTERM');
-      } catch {
-        await this.backgroundJobStore?.update(job.id, {
-          status: 'cancelled',
-          detail: 'cancelled by user',
-          finishedAt: Date.now(),
-          pid: null,
-        });
-      }
-      const cancelled = await this.waitForJobCompletion(job.id, 2_000);
-      await this.pollBackgroundJobs();
-      return cancelled
-        ? `Cancelled job ${ref}.`
-        : `Cancellation signal sent to job ${ref}; waiting for worker shutdown.`;
-    }
-
-    if (command === 'retry') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs retry <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      if (!this.canStartBackgroundJob()) {
-        return 'Retry unavailable: background capacity full.';
-      }
-      if (!job.prompt) {
-        return `Job ${ref} cannot be retried.`;
-      }
-      if (job.kind === 'team') {
-        await this.startBackgroundTeamRun(job.strategy ?? 'parallel', job.prompt, {
-          routeNote: `Team run retry · ${job.strategy ?? 'parallel'}`,
-          attempt: (job.attempt ?? 0) + 1,
-        });
-      } else {
-        const decision: AutoRouteDecision = {
-          kind: 'delegate',
-          purpose: job.purpose && job.purpose !== 'general' ? job.purpose : 'general',
-          preferredMode: job.preferredMode ?? undefined,
-          reason: 'manual retry',
-          repairAttempt: (job.attempt ?? 0) + 1,
-        };
-        await this.startBackgroundDelegatedRoute(
-          {
-            id: randomUUID(),
-            role: 'user',
-            content: job.prompt,
-            timestamp: Date.now(),
-          },
-          decision,
-        );
-      }
-      return `Retried job ${ref} in background.`;
-    }
-
-    if (command === 'inspect') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs inspect <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      const stored = await this.getStoredBackgroundJob(job.id);
-      if (stored) {
-        return [
-          `Job ${stored.id}`,
-          `label: ${stored.label}`,
-          `kind: ${stored.kind}`,
-          `status: ${stored.status}`,
-          stored.purpose ? `purpose: ${stored.purpose}` : null,
-          stored.preferredMode ? `mode: ${HARNESS_MODES[stored.preferredMode].label}` : null,
-          stored.strategy ? `strategy: ${stored.strategy}` : null,
-          stored.reason ? `reason: ${stored.reason}` : null,
-          stored.attempt > 0 ? `attempt: ${stored.attempt}` : null,
-          `created: ${new Date(stored.createdAt).toISOString()}`,
-          stored.startedAt ? `started: ${new Date(stored.startedAt).toISOString()}` : null,
-          stored.finishedAt ? `finished: ${new Date(stored.finishedAt).toISOString()}` : null,
-          `updated: ${new Date(stored.updatedAt).toISOString()}`,
-          stored.detail ? `detail: ${stored.detail}` : null,
-          stored.result?.workspacePath ? `workspace: ${stored.result.workspacePath}` : null,
-          stored.result?.workspaceApply
-            ? `apply: ${stored.result.workspaceApply.applied ? 'applied' : stored.result.workspaceApply.empty ? 'empty' : 'failed'} · ${stored.result.workspaceApply.summary}${stored.result.workspaceApply.error ? ` · ${stored.result.workspaceApply.error}` : ''}`
-            : null,
-          stored.result?.text ? `result: ${previewText(stored.result.text, 220)}` : null,
-          stored.result?.verification?.summary ? `verification: ${stored.result.verification.summary}` : null,
-          stored.artifact ? `artifact: ${stored.artifact.title}` : null,
-          stored.prompt ? `prompt: ${stored.prompt}` : null,
-        ]
-          .filter((part): part is string => Boolean(part))
-          .join('\n');
-      }
-      return this.formatJobInspect(job);
-    }
-
-    if (command === 'logs') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs logs <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      const stored = await this.getStoredBackgroundJob(job.id);
-      if (!stored) {
-        return `Job ${ref} has no stored logs.`;
-      }
-      return this.formatJobLogs(stored);
-    }
-
-    if (command === 'result') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs result <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      const stored = await this.getStoredBackgroundJob(job.id);
-      if (stored?.result?.text) {
-        return stored.result.text;
-      }
-      if (stored?.artifact) {
-        return [
-          stored.artifact.title,
-          `source: ${stored.artifact.source}`,
-          stored.artifact.mode ? `mode: ${HARNESS_MODES[stored.artifact.mode].label}` : null,
-          `created: ${stored.artifact.createdAt}`,
-          '',
-          stored.artifact.summary,
-        ]
-          .filter((part): part is string => Boolean(part))
-          .join('\n');
-      }
-      return this.formatJobResult(job);
-    }
-
-    if (command === 'promote') {
-      const ref = rest[0]?.trim();
-      if (!ref) {
-        return 'Usage: /jobs promote <index-or-id>';
-      }
-      const job = await this.resolveBackgroundJob(ref);
-      if (!job.prompt) {
-        return `Job ${ref} cannot be promoted.`;
-      }
-
-      if (job.status === 'running' && job.controller) {
-        job.controller.abort();
-      } else {
-        const stored = await this.getStoredBackgroundJob(job.id);
-        if (stored?.pid) {
-          try {
-            process.kill(stored.pid, 'SIGTERM');
-          } catch {
-            // Process may already be gone; promote anyway.
-          }
-          await this.backgroundJobStore?.update(job.id, {
-            status: 'error',
-            detail: 'promoted to foreground',
-            finishedAt: Date.now(),
-            pid: null,
-          });
-          await this.pollBackgroundJobs();
-        }
-      }
-
-      if (this.state.loading && this.abortController) {
-        return 'Promote unavailable while a foreground request is active.';
-      }
-
-      if (job.kind === 'team') {
-        await this.executeTeamRun(job.strategy ?? 'parallel', job.prompt, {
-          routeNote: `Team run promoted · ${job.strategy ?? 'parallel'}`,
-        });
-      } else {
-        await this.submit(job.prompt);
-      }
-      return `Promoted job ${ref} to foreground.`;
-    }
-
-    return 'Usage: /jobs [cancel|retry|inspect|logs|result|promote] ...';
+    return runJobsCommandCommand(args, this.getWorkspaceCommandDeps());
   }
 
   private async runCheckpointCommand(message: string): Promise<string> {
-    if (!this.config?.git_checkpoint) {
-      return 'Checkpointing disabled in config.';
-    }
-
-    const git = new GitCheckpoint(process.cwd());
-    if (!(await git.isAvailable())) {
-      return 'Checkpoint unavailable: not a git repository.';
-    }
-
-    const hash = await git.checkpoint(message || 'checkpoint');
-    return hash ? `Checkpoint created: ${hash.slice(0, 8)}` : 'Checkpoint skipped: no changes to commit.';
+    return runCheckpointCommandCommand(message, this.getWorkspaceCommandDeps());
   }
 
   private async runUndoCommand(): Promise<string> {
-    const git = new GitCheckpoint(process.cwd());
-    if (!(await git.isAvailable())) {
-      return 'Undo unavailable: not a git repository.';
-    }
-
-    const success = await git.undo();
-    return success ? 'Reverted last ddudu checkpoint.' : 'No ddudu checkpoint to undo.';
+    return runUndoCommandCommand();
   }
 
   private async seedSessionMessages(
@@ -6971,113 +6475,19 @@ export class NativeBridgeController {
   }
 
   private async runForkCommand(name: string): Promise<string> {
-    if (!this.sessionManager) {
-      return 'Fork unavailable: no session manager.';
-    }
-
-    const parentId = this.state.sessionId ?? undefined;
-    const session = await this.sessionManager.create({
-      parentId,
-      provider: this.getCurrentProvider(),
-      model: this.getCurrentModel(),
-      title: name.trim() || `fork:${this.currentMode}`,
-      metadata: {
-        mode: this.currentMode,
-      },
-    });
-    await this.seedSessionMessages(session.id, this.state.messages);
-    this.state.sessionId = session.id;
-    await this.restoreEpistemicState();
-    this.appendSystemMessage(`Forked session ${session.id.slice(0, 8)} from parent ${parentId?.slice(0, 8) ?? 'none'}.`);
-    void this.persistWorkflowState('fork');
-    return `Forked to new session: ${session.id}`;
+    return runForkCommandCommand(name, this.getSessionCommandDeps());
   }
 
   private async runHandoffCommand(goal: string): Promise<string> {
-    if (!this.sessionManager) {
-      return 'Handoff unavailable: no session manager.';
-    }
-
-    const trimmedGoal = goal.trim();
-    if (!trimmedGoal) {
-      return 'Usage: /handoff <goal>';
-    }
-
-    const handoff = await this.compactionEngine.handoff(trimmedGoal, toCompactionMessages(this.state.messages));
-    const session = await this.sessionManager.create({
-      parentId: this.state.sessionId ?? undefined,
-      provider: this.getCurrentProvider(),
-      model: this.getCurrentModel(),
-      title: `handoff:${trimmedGoal.slice(0, 48)}`,
-      metadata: {
-        mode: this.currentMode,
-      },
-    });
-
-    const now = Date.now();
-    const nextMessages: NativeMessageState[] = [
-      {
-        id: randomUUID(),
-        role: 'system',
-        content: `Handoff created from previous session. Goal: ${trimmedGoal}`,
-        timestamp: now,
-      },
-      {
-        id: randomUUID(),
-        role: 'user',
-        content: handoff.summary,
-        timestamp: now + 1,
-      },
-      {
-        id: randomUUID(),
-        role: 'assistant',
-        content: 'Handoff loaded. Continue from this compact context.',
-        timestamp: now + 2,
-      },
-    ];
-
-    await this.seedSessionMessages(session.id, nextMessages);
-    this.state.sessionId = session.id;
-    this.state.messages = nextMessages;
-    this.remoteSessions.clear();
-    this.updateRemoteSessionState();
-    await this.restoreEpistemicState();
-    void this.persistWorkflowState('handoff');
-    this.scheduleStatePush();
-    return [
-      `Handoff created: ${session.id}`,
-      `Relevant files: ${handoff.relevantFiles.join(', ') || 'none'}`,
-      '',
-      handoff.summary,
-    ].join('\n');
+    return runHandoffCommandCommand(goal, this.getSessionCommandDeps());
   }
 
   private async runBriefingCommand(): Promise<string> {
-    const artifactDir = this.getSessionArtifactDirectory();
-    if (!artifactDir) {
-      return 'Briefing unavailable: no active session.';
-    }
-
-    const briefing = generateBriefing(toCompactionMessages(this.state.messages), this.epistemicState.getState());
-    await saveBriefing(briefing, artifactDir);
-    this.invalidateDerivedCaches({ briefing: true });
-    await this.epistemicState.save(artifactDir);
-    return formatBriefing(briefing);
+    return runBriefingCommandCommand(this.getSessionCommandDeps());
   }
 
   private async runDriftCommand(): Promise<string> {
-    const artifactDir = this.getSessionArtifactDirectory();
-    if (!artifactDir) {
-      return 'Drift check unavailable: no active session.';
-    }
-
-    const briefing = await loadBriefing(artifactDir);
-    if (!briefing) {
-      return 'Drift check unavailable: run /briefing first.';
-    }
-
-    const detector = new DriftDetector(process.cwd());
-    return detector.formatReport(await detector.detect(briefing));
+    return runDriftCommandCommand(this.getSessionCommandDeps());
   }
 
   private formatMcpSummary(): string {
@@ -7118,93 +6528,11 @@ export class NativeBridgeController {
   }
 
   private async runMcpCommand(args: string[]): Promise<string> {
-    const command = args[0]?.trim().toLowerCase() ?? '';
-    if (!command || command === 'status' || command === 'list') {
-      return this.formatMcpSummary();
-    }
-
-    if (command === 'path') {
-      const paths = getDduduPaths(process.cwd());
-      return [
-        'MCP config paths',
-        `project: ${paths.projectConfig}`,
-        `global: ${paths.globalConfig}`,
-      ].join('\n');
-    }
-
-    if (command === 'reload') {
-      await this.reloadMcpRuntime();
-      return this.formatMcpSummary();
-    }
-
-    if (command === 'add') {
-      const name = args[1]?.trim();
-      const executable = args[2]?.trim();
-      const commandArgs = args.slice(3).map((value) => value.trim()).filter(Boolean);
-      if (!name || !executable) {
-        return 'Usage: /mcp add <name> <command> [args...]';
-      }
-      await setDduduConfigValue(process.cwd(), `mcp.servers.${name}`, {
-        command: executable,
-        args: commandArgs,
-        enabled: true,
-      });
-      await this.reloadMcpRuntime();
-      return `Added MCP server ${name}.\n\n${this.formatMcpSummary()}`;
-    }
-
-    if (command === 'enable' || command === 'disable') {
-      const name = args[1]?.trim();
-      if (!name) {
-        return `Usage: /mcp ${command} <name>`;
-      }
-      await this.setMcpServerEnabled(name, command === 'enable');
-      return `${command === 'enable' ? 'Enabled' : 'Disabled'} MCP server ${name}.\n\n${this.formatMcpSummary()}`;
-    }
-
-    if (command === 'remove') {
-      const name = args[1]?.trim();
-      if (!name) {
-        return 'Usage: /mcp remove <name>';
-      }
-      if (!this.config?.mcp.servers[name]) {
-        return `Unknown MCP server: ${name}`;
-      }
-      await deleteDduduConfigValue(process.cwd(), `mcp.servers.${name}`);
-      await this.reloadMcpRuntime();
-      return `Removed MCP server ${name}.\n\n${this.formatMcpSummary()}`;
-    }
-
-    if (command === 'trust') {
-      const name = args[1]?.trim();
-      const trust = args[2]?.trim().toLowerCase();
-      if (!name || !trust || !isTrustTier(trust)) {
-        return 'Usage: /mcp trust <name> <trusted|ask|deny>';
-      }
-      if (!this.config?.mcp.servers[name]) {
-        return `Unknown MCP server: ${name}`;
-      }
-      await this.setMcpServerTrust(name, trust);
-      return `Updated MCP trust for ${name} -> ${trust}.\n\n${this.formatMcpSummary()}`;
-    }
-
-    return 'Usage: /mcp [status|list|path|reload|add <name> <command> [args...]|enable <name>|disable <name>|remove <name>|trust <name> <trusted|ask|deny>]';
+    return runMcpCommandCommand(args, this.getSystemCommandDeps());
   }
 
   private async runHookCommand(args: string[]): Promise<string> {
-    const command = args[0]?.trim().toLowerCase() ?? '';
-    if (!command || command === 'status' || command === 'list') {
-      return this.formatHookSummary();
-    }
-
-    if (command === 'reload') {
-      this.hookRegistry.clear();
-      await loadHookFiles(process.cwd(), this.hookRegistry);
-      this.scheduleStatePush();
-      return this.formatHookSummary();
-    }
-
-    return 'Usage: /hook [status|list|reload]';
+    return runHookCommandCommand(args, this.getSystemCommandDeps());
   }
 
   private formatTeamSummary(): string {
@@ -7241,36 +6569,7 @@ export class NativeBridgeController {
   }
 
   private async runTeamCommand(args: string[]): Promise<string> {
-    if (args.length === 0 || args[0] === 'status') {
-      return this.formatTeamSummary();
-    }
-
-    if (args[0] !== 'run') {
-      return 'Usage: /team run [parallel|sequential|delegate] <task>';
-    }
-
-    const strategyToken = args[1];
-    const strategy =
-      strategyToken === 'parallel' || strategyToken === 'sequential' || strategyToken === 'delegate'
-        ? strategyToken
-        : 'parallel';
-    const taskStartIndex = strategyToken === strategy ? 2 : 1;
-    const task = args.slice(taskStartIndex).join(' ').trim();
-    if (!task) {
-      return 'Usage: /team run [parallel|sequential|delegate] <task>';
-    }
-
-    if (this.state.loading || this.abortController) {
-      if (!this.canStartBackgroundJob()) {
-        return 'Team run unavailable: background capacity full.';
-      }
-      await this.startBackgroundTeamRun(strategy, task, {
-        routeNote: `Team run background · ${strategy}`,
-      });
-      return `Team run started in background · ${strategy}`;
-    }
-
-    return this.executeTeamRun(strategy, task);
+    return runTeamCommandCommand(args, this.getTeamCommandDeps());
   }
 
   private async executeTeamRun(
@@ -7714,16 +7013,7 @@ export class NativeBridgeController {
   }
 
   private async runInitSummary(): Promise<string> {
-    try {
-      const result = await initializeProject();
-      if (result.alreadyInitialized) {
-        return `Already initialized: ${result.projectDir}`;
-      }
-
-      return [`Initialized ${result.projectDir}`, `Created: ${result.created.join(', ')}`].join('\n');
-    } catch (error: unknown) {
-      return `Init failed: ${serializeError(error)}`;
-    }
+    return runInitSummaryCommand();
   }
 
   private async compactContext(notice?: string, instructions?: string): Promise<void> {
@@ -7989,6 +7279,10 @@ export class NativeBridgeController {
   }
 
   private emitStateNow(): void {
+    if (this.stateVersion === this.lastEmittedStateVersion) {
+      return;
+    }
+
     this.syncUsageState();
     this.syncLspState();
 
@@ -8020,6 +7314,12 @@ export class NativeBridgeController {
             connectedLabels: [...this.state.lsp.connectedLabels],
           }
         : null,
+      git: this.state.git
+        ? {
+            ...this.state.git,
+            changedFiles: [...this.state.git.changedFiles],
+          }
+        : null,
       modes: this.state.modes.map((mode) => ({ ...mode })),
       slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
       todos: this.state.todos.map((item) => ({ ...item })),
@@ -8034,11 +7334,7 @@ export class NativeBridgeController {
         : null,
     };
 
-    const serialized = JSON.stringify(nextState);
-    if (serialized === this.lastEmittedStateSerialized) {
-      return;
-    }
-    this.lastEmittedStateSerialized = serialized;
+    this.lastEmittedStateVersion = this.stateVersion;
 
     this.emit({
       type: 'state',
@@ -8047,6 +7343,8 @@ export class NativeBridgeController {
   }
 
   private scheduleStatePush(): void {
+    this.refreshGitStateAsync();
+    this.stateVersion += 1;
     if (this.flushTimer) {
       return;
     }
