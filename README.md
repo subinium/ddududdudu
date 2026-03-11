@@ -27,7 +27,7 @@
 - Team orchestration with parallel, sequential, and delegated runs
 - Isolated delegated runs with git worktrees for provider-backed agent sessions
 - Workflow state with todos, permission profiles, remote provider session state, detached background jobs, and automatic verification
-- Sidebar rails for subagents, detached background work, MCP servers, and LSP status
+- Sidebar rails for git status, subagents, detached background work, MCP servers, and LSP status
 - Context compaction, handoff, briefing, drift checking, and repair escalation
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 - Per-session cost budget tracking with configurable warning thresholds and hard-stop enforcement

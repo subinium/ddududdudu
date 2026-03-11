@@ -52,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mutations have occurred.
 - **Controller decomposition**: Extracted slash command handlers from the 8K-line
   controller monolith into modular command files under `src/tui/native/commands/`.
+- **TUI palette**: Switched to Dracula-pink color scheme with warm neutral muted tones.
+  Original ddudu pink (`#F7A7BB`) as primary accent, dark background (`#121218`),
+  no blue-purple tint in secondary colors.
+- **Git sidebar**: New sidebar section showing current branch, staged/unstaged file
+  counts, and changed file list (max 5 with overflow). Powered by async git state
+  collection with 2-second TTL cache, refreshed on file-mutating tool calls.
+- **Sidebar density**: Empty sections (idle workers, empty todo board) are now hidden
+  instead of showing placeholder text. Section headers use subtle muted styling.
 
 ### Fixed
 

@@ -88,12 +88,13 @@ Effect:
 High-signal state should appear first:
 
 1. current run
-2. todo board
-3. run checklist
-4. workers and ownership
-5. detached jobs
-6. queue
-7. context and systems
+2. git status (branch, changed files, staged/unstaged)
+3. todo board
+4. run checklist
+5. workers and ownership
+6. detached jobs
+7. queue
+8. context and systems
 
 Low-signal internals should be pushed into inspectors, palettes, or explicit secondary surfaces.
 
@@ -163,6 +164,9 @@ That structure is significantly more trustworthy than generic activity indicator
 - numeric shortcuts and default-choice handling for strict confirmations
 - context/system summaries instead of repeated provider trivia
 - running and waiting detail that can reflect scheduler pressure such as search or verification contention
+
+Empty sidebar sections (idle workers, empty todo board) are hidden to reduce decorative density.
+Git status (branch, changed files, staged/unstaged counts) now appears as a first-class sidebar section.
 
 The long-term quality bar is not "more panels".
 It is "less ambiguity about ownership, waiting reason, and completion state".

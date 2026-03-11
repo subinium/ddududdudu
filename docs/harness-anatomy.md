@@ -74,7 +74,7 @@ Inside those layers, `ddudu` is currently split into a few explicit runtime boun
 
 Under those boundaries, two generic kernels now matter more than mode names:
 
-- `ExecutionScheduler` owns shared concurrency policy across provider calls, search-heavy work, writes, and verification
+- `ExecutionScheduler` owns shared concurrency policy across provider calls, search-heavy work, writes, and verification, using an in-memory semaphore queue (no filesystem I/O on the scheduling hot path)
 - `TeamOrchestrator` owns dependency-aware parallel execution and now schedules newly-ready workers continuously instead of in fixed waves
 
 This matters because orchestration bugs are usually boundary bugs.
