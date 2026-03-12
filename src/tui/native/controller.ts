@@ -1048,11 +1048,15 @@ export class NativeBridgeController {
       this.appendSystemMessage(`[session] ${serializeError(error)}`);
     }
 
-    const [, ,] = await Promise.all([
+    await Promise.all([
       this.refreshSystemPrompt(),
       this.restoreEpistemicState(),
       this.pollBackgroundJobs(),
+      this.initializeMcpTools().catch((error: unknown) => {
+        this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
+      }),
     ]);
+    this.syncMcpState();
     this.reconfigureClient();
     this.startBackgroundJobPolling();
     this.scheduleIdleWarmup();
@@ -1061,17 +1065,6 @@ export class NativeBridgeController {
 
     this.refreshGitStateAsync();
     void this.refreshLspInBackground();
-    void this.initializeMcpInBackground();
-  }
-
-  private async initializeMcpInBackground(): Promise<void> {
-    try {
-      await this.initializeMcpTools();
-    } catch (error: unknown) {
-      this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
-    }
-    this.syncMcpState();
-    this.scheduleStatePush();
   }
 
   public async shutdown(): Promise<void> {
