@@ -17,6 +17,11 @@ const createDocsFixture = async () => {
     'utf8',
   );
   await writeFile(
+    resolve(root, 'AGENTS.md'),
+    '# Repository instructions\n\nAlways verify the cobalt-reef rollout before shipping.\n',
+    'utf8',
+  );
+  await writeFile(
     resolve(root, 'docs', 'setup.md'),
     '# Setup\n\nUse the neon garden deployment checklist before release.\n',
     'utf8',
@@ -60,6 +65,12 @@ test('docs_lookup finds project docs and instructions with scope filtering', asy
       { cwd: root },
     );
     assert.match(instructions.output, /\[instructions\] \.ddudu\/DDUDU\.md:3/);
+
+    const sharedInstructions = await docsLookupTool.execute(
+      { query: 'cobalt-reef rollout', scope: 'instructions' },
+      { cwd: root },
+    );
+    assert.match(sharedInstructions.output, /\[instructions\] AGENTS\.md:3/);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

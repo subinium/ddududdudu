@@ -1,9 +1,6 @@
-import type {
-  ApiMessage,
-  ToolStateUpdate,
-  UsageSummary,
-} from './anthropic-client.js';
 import { DEFAULT_ANTHROPIC_BASE_URL } from './anthropic-base-url.js';
+import type { ApiMessage, ToolStateUpdate, UsageSummary } from './anthropic-client.js';
+import { classifyError, computeBackoffMs, DEFAULT_RETRY_CONFIG, type RetryConfig, sleep } from './retry.js';
 
 export interface StreamEvent {
   type: 'text' | 'thinking' | 'done' | 'error' | 'tool_use' | 'tool_state' | 'session';
@@ -79,51 +76,85 @@ const buildStreamAdapter = (
     }
   };
 
-  void runner(options, {
-    onText: (text: string): void => {
-      push({ type: 'text', text });
-    },
-    onThinking: (thinking: string): void => {
-      push({ type: 'thinking', thinking });
-    },
-    onError: (error: Error): void => {
-      push({ type: 'error', error });
-      finished = true;
-      if (wake) {
-        wake();
-        wake = null;
+  const retryConfig: RetryConfig = DEFAULT_RETRY_CONFIG;
+
+  const runWithRetry = async (): Promise<void> => {
+    for (let attempt = 0; attempt <= retryConfig.maxRetries; attempt++) {
+      try {
+        await runner(options, {
+          onText: (text: string): void => {
+            push({ type: 'text', text });
+          },
+          onThinking: (thinking: string): void => {
+            push({ type: 'thinking', thinking });
+          },
+          onError: (error: Error): void => {
+            push({ type: 'error', error });
+            finished = true;
+            if (wake) {
+              wake();
+              wake = null;
+            }
+          },
+          onDone: (fullText: string, usage: UsageSummary): void => {
+            push({ type: 'done', fullText, usage });
+            finished = true;
+            if (wake) {
+              wake();
+              wake = null;
+            }
+          },
+          onToolUse: (
+            blocks: import('./anthropic-client.js').ToolUseContentBlock[],
+            textSoFar: string,
+            usage: UsageSummary,
+          ): void => {
+            push({ type: 'tool_use', toolUseBlocks: blocks, textSoFar, usage });
+          },
+          onToolState: (states: ToolStateUpdate[]): void => {
+            push({ type: 'tool_state', toolStates: states });
+          },
+          onSession: (sessionId: string): void => {
+            push({ type: 'session', sessionId });
+          },
+        });
+        return;
+      } catch (err: unknown) {
+        const error = err instanceof Error ? err : new Error('Client streaming failed unexpectedly.');
+        const category = classifyError(error);
+
+        if (category === 'retryable' && attempt < retryConfig.maxRetries) {
+          // Discard unconsumed partial events from the failed attempt so
+          // the next attempt starts with a clean queue. Events already
+          // yielded to the consumer cannot be recalled.
+          queue.length = 0;
+          const delayMs = computeBackoffMs(attempt, retryConfig);
+          try {
+            await sleep(delayMs, options.signal);
+          } catch {
+            push({ type: 'error', error });
+            finished = true;
+            if (wake) {
+              wake();
+              wake = null;
+            }
+            return;
+          }
+          continue;
+        }
+
+        push({ type: 'error', error });
+        finished = true;
+        if (wake) {
+          wake();
+          wake = null;
+        }
+        return;
       }
-    },
-    onDone: (fullText: string, usage: UsageSummary): void => {
-      push({ type: 'done', fullText, usage });
-      finished = true;
-      if (wake) {
-        wake();
-        wake = null;
-      }
-    },
-    onToolUse: (
-      blocks: import('./anthropic-client.js').ToolUseContentBlock[],
-      textSoFar: string,
-      usage: UsageSummary,
-    ): void => {
-      push({ type: 'tool_use', toolUseBlocks: blocks, textSoFar, usage });
-    },
-    onToolState: (states: ToolStateUpdate[]): void => {
-      push({ type: 'tool_state', toolStates: states });
-    },
-    onSession: (sessionId: string): void => {
-      push({ type: 'session', sessionId });
-    },
-  }).catch((err: unknown) => {
-    const error = err instanceof Error ? err : new Error('Client streaming failed unexpectedly.');
-    push({ type: 'error', error });
-    finished = true;
-    if (wake) {
-      wake();
-      wake = null;
     }
-  });
+  };
+
+  void runWithRetry();
 
   const iterate = async function* (): AsyncGenerator<StreamEvent> {
     while (!finished || queue.length > 0) {
@@ -161,10 +192,7 @@ const createCapabilities = (
   supportsRemoteSession: options.supportsRemoteSession ?? false,
 });
 
-export const getClientCapabilities = (
-  provider: string,
-  tokenType: string,
-): ApiClientCapabilities => {
+export const getClientCapabilities = (provider: string, tokenType: string): ApiClientCapabilities => {
   const normalized = provider.trim().toLowerCase();
 
   if (normalized === 'claude' || normalized === 'anthropic') {
@@ -236,16 +264,16 @@ export const createClient = (provider: string, token: string, tokenType: string)
               maxTokens: streamOptions.maxTokens,
             });
 
-              await client.stream(
-                streamOptions.systemPrompt,
-                messages,
-                {
-                  onText: callbacks.onText,
-                  onThinking: callbacks.onThinking,
-                  onError: callbacks.onError,
-                  onDone: callbacks.onDone,
-                  onToolUse: callbacks.onToolUse,
-                },
+            await client.stream(
+              streamOptions.systemPrompt,
+              messages,
+              {
+                onText: callbacks.onText,
+                onThinking: callbacks.onThinking,
+                onError: callbacks.onError,
+                onDone: callbacks.onDone,
+                onToolUse: callbacks.onToolUse,
+              },
               streamOptions.signal,
               streamOptions.tools,
             );
@@ -287,9 +315,7 @@ export const createClient = (provider: string, token: string, tokenType: string)
             }
 
             if (tokenType !== 'apikey') {
-              const error = new Error(
-                'OpenAI requests in ddudu require OPENAI_API_KEY or codex auth.'
-              );
+              const error = new Error('OpenAI requests in ddudu require OPENAI_API_KEY or codex auth.');
               callbacks.onError(error);
               throw error;
             }

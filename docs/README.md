@@ -76,6 +76,10 @@ The current `ddudu` implementation is especially shaped by a few practical choic
 - sessions and operator settings are global-first by default, with project `.ddudu/` config as an explicit override layer
 - project instructions support `AGENTS.md` as the cross-tool standard alongside `.ddudu/DDUDU.md`, so rules authored once apply across Claude Code, opencode, Codex CLI, and Amp
 - the operator surface now prioritizes run state, todo ownership, worker visibility, and explicit ask-user choices over redundant runtime detail
+- the TUI uses zone-differentiated visual encoding — recessed sidebar, neutral main, elevated composer — so the operator can orient spatially before reading any text
+- result augmentation injects behavioral nudges after tool calls (verification reminders, diagnostic hints) so the model self-corrects without operator intervention
+- API calls now have automatic retry with exponential backoff and jitter for transient provider errors, with error classification that separates retryable failures from auth and fatal errors
+- the composer supports prompt history recall (Arrow-Up/Down) with deduplication and draft stash, making repeated workflows fast
 
 ## What These Docs Are Not
 

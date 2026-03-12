@@ -58,6 +58,8 @@ The core layers depend on a second ring of systems:
 | Background workers | detached and long-running execution |
 | Resource scheduler | provider, search, write, and verification concurrency control |
 | Cost budget | per-session cost tracking, warning thresholds, hard-stop enforcement |
+| API resilience | retry with exponential backoff, error classification, transient failure recovery |
+| Result augmentation | rule-based behavioral nudges injected after tool calls to improve model self-correction |
 | Benchmarks | parallel task execution, multi-model comparison, failure categorization |
 
 ## Current ddudu Decomposition
@@ -144,10 +146,10 @@ Common architecture failures:
 - operator-visible worker state
 
 The intent is not to replace provider runtimes.
-The intent is to coordinate them more effectively.
+The intent is to coordinate them more effectively, recover from their failures more gracefully, and shape their behavior more precisely.
 
 The important bias is not "use more agents".
-It is "start the smallest executable unit that can make progress, then add orchestration only when it increases throughput or trust".
+It is "start the smallest executable unit that can make progress, nudge the model toward verification, and add orchestration only when it increases throughput or trust".
 
 ## Why This Matters
 

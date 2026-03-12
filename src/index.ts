@@ -15,8 +15,20 @@ import {
 import { getAuthStorePath, setStoredProviderAuth } from './auth/store.js';
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
+import { stringifyYaml } from './utils/yaml.js';
 
-const DISPLAY_VERSION = process.env.DDUDU_VERSION ?? '0.4.2';
+type HelpTopic =
+  | 'global'
+  | 'auth'
+  | 'config'
+  | 'doctor'
+  | 'init'
+  | 'job'
+  | 'provider'
+  | 'resume'
+  | 'run'
+  | 'session'
+  | 'status';
 
 const previewText = (value: string, maxLength: number = 68): string => {
   const normalized = value.replace(/\s+/g, ' ').trim();
@@ -61,39 +73,176 @@ const formatProviderChoice = (
   return `${provider.toUpperCase()}  ${DIM}${status}${RESET}`;
 };
 
-const printUsage = (): void => {
+const getDisplayVersion = async (): Promise<string> => {
+  const envVersion = process.env.DDUDU_VERSION?.trim();
+  if (envVersion) {
+    return envVersion;
+  }
+
+  try {
+    return await readVersion();
+  } catch {
+    return 'unknown';
+  }
+};
+
+const normalizeHelpTopic = (value?: string): HelpTopic | null => {
+  const normalized = value?.trim().toLowerCase();
+  switch (normalized) {
+    case undefined:
+    case '':
+      return 'global';
+    case 'auth':
+    case 'config':
+    case 'doctor':
+    case 'init':
+    case 'job':
+    case 'provider':
+    case 'resume':
+    case 'run':
+    case 'session':
+    case 'status':
+      return normalized;
+    default:
+      return null;
+  }
+};
+
+const isHelpRequested = (parsed: ParsedCommand): boolean => {
+  return parsed.flags.help === true || parsed.flags.h === true || parsed.subcommand === 'help';
+};
+
+const printUsage = async (topic: HelpTopic = 'global'): Promise<void> => {
   const isTTY = process.stdout.isTTY ?? false;
   const P = isTTY ? '\x1b[38;2;249;76;132m' : '';
   const PL = isTTY ? '\x1b[38;2;255;154;190m' : '';
   const D = isTTY ? '\x1b[2m' : '';
   const X = isTTY ? '\x1b[0m' : '';
+  const version = await getDisplayVersion();
 
-  const usage = [
-    '',
-    `  ${P}♪ DDUDUDDUDU${X}  ${D}v${DISPLAY_VERSION}${X}`,
-    `  ${D}Multi-Agent Orchestration CLI${X}`,
-    '',
-    `${PL}Usage${X}`,
-    `  ${P}ddudu${X}                       ${D}Launch TUI${X}`,
-    `  ${P}ddudu init${X}                  ${D}Initialize project${X}`,
-    `  ${P}ddudu run${X} "PROMPT"           ${D}Run single prompt${X}`,
-    `  ${P}ddudu run${X} --provider NAME    ${D}Use specific provider${X}`,
-    `  ${P}ddudu auth${X} [login|status]    ${D}Inspect or refresh provider auth${X}`,
-    `  ${P}ddudu doctor${X}                ${D}Check environment${X}`,
-    `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
-    `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
-    `  ${P}ddudu session${X} list|pick|resume|last ${D}Session management${X}`,
-    `  ${P}ddudu resume${X} [last|pick|ID]   ${D}Resume saved session quickly${X}`,
-    '',
-    `${PL}Shortcuts (TUI)${X}`,
-    `  Shift+Tab  cycle mode   Esc  interrupt`,
-    `  Ctrl+J     newline      Enter submit`,
-    '',
-    `  ${D}https://github.com/subinium/ddududdudu${X}`,
-    '',
-  ];
+  const usageByTopic: Record<HelpTopic, string[]> = {
+    global: [
+      '',
+      `  ${P}♪ DDUDUDDUDU${X}  ${D}v${version}${X}`,
+      `  ${D}Multi-Agent Orchestration CLI${X}`,
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu${X}                       ${D}Launch TUI${X}`,
+      `  ${P}ddudu init${X}                  ${D}Initialize project${X}`,
+      `  ${P}ddudu run${X} "PROMPT"           ${D}Run single prompt${X}`,
+      `  ${P}ddudu auth${X} [login|status]    ${D}Inspect or refresh provider auth${X}`,
+      `  ${P}ddudu doctor${X}                ${D}Check environment${X}`,
+      `  ${P}ddudu provider${X} list|check    ${D}Manage providers${X}`,
+      `  ${P}ddudu config${X} show|set        ${D}Configuration${X}`,
+      `  ${P}ddudu session${X} list|pick|resume|last ${D}Session management${X}`,
+      `  ${P}ddudu resume${X} [last|pick|ID]   ${D}Resume saved session quickly${X}`,
+      '',
+      `${PL}Help${X}`,
+      `  ${P}ddudu${X} <command> --help`,
+      `  ${P}ddudu help${X} <command>`,
+      '',
+      `${PL}Shortcuts (TUI)${X}`,
+      `  Shift+Tab  cycle mode   Ctrl+K  command palette`,
+      `  Ctrl+Y     session picker   Ctrl+P  file picker`,
+      `  Ctrl+L     clear transcript`,
+      `  Ctrl+J     newline      Enter submit   Esc interrupt/clear`,
+      '',
+      `  ${D}https://github.com/subinium/ddududdudu${X}`,
+      '',
+    ],
+    init: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu init${X} ${D}[--preset NAME]${X}`,
+      '',
+      'Creates project-local ddudu scaffolding in `.ddudu/`.',
+      'Scaffolds `.ddudu/config.yaml`, `.ddudu/DDUDU.md`, root `AGENTS.md`, and starter hook templates when missing.',
+      'Project hook templates are disabled by default until you rename them to a hook event name.',
+      '',
+    ],
+    run: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu run${X} "PROMPT" ${D}[--provider NAME]${X}`,
+      '',
+      'Runs a single prompt through the configured provider command.',
+      '',
+    ],
+    auth: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu auth${X}`,
+      `  ${P}ddudu auth status${X}`,
+      `  ${P}ddudu auth login${X} ${D}[claude|codex|gemini|all] [--api-key] [--method vendor|apikey|local]${X}`,
+      '',
+      'Discovers existing provider auth or launches interactive login flows.',
+      '',
+    ],
+    doctor: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu doctor${X}`,
+      '',
+      'Checks config loading, provider commands, and detected auth.',
+      '',
+    ],
+    provider: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu provider list${X}`,
+      `  ${P}ddudu provider check${X}`,
+      '',
+      'Lists configured providers or validates their local commands.',
+      '',
+    ],
+    config: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu config show${X}`,
+      `  ${P}ddudu config set${X} ${D}[--project] KEY VALUE${X}`,
+      '',
+      'Shows merged config with sensitive values redacted, or writes a global/project override.',
+      '',
+    ],
+    session: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu session list${X}`,
+      `  ${P}ddudu session pick${X}`,
+      `  ${P}ddudu session last${X}`,
+      `  ${P}ddudu session resume${X} ${D}<id>${X}`,
+      '',
+      'Lists and reopens saved sessions in the native TUI.',
+      '',
+    ],
+    resume: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu resume${X}`,
+      `  ${P}ddudu resume${X} ${D}last|pick|<id>${X}`,
+      '',
+      'Shortcut alias for reopening the latest or a selected session.',
+      '',
+    ],
+    job: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu job run${X} ${D}<id>${X}`,
+      '',
+      'Runs a detached background job worker for the given job id.',
+      '',
+    ],
+    status: [
+      '',
+      `${PL}Usage${X}`,
+      `  ${P}ddudu status${X}`,
+      '',
+      'Prints a minimal runtime status summary.',
+      '',
+    ],
+  };
 
-  process.stdout.write(`${usage.join('\n')}\n`);
+  process.stdout.write(`${usageByTopic[topic].join('\n')}\n`);
 };
 
 const readVersion = async (): Promise<string> => {
@@ -174,9 +323,8 @@ const handleRun = async (args: string[], flags: Record<string, string | boolean>
 
 const loadMergedConfigText = async (): Promise<string> => {
   const configModule = await import('./core/config.js');
-  const yamlModule = await import('yaml');
   const config = await configModule.loadConfig();
-  return yamlModule.stringify(config);
+  return stringifyYaml(redactConfigForDisplay(config));
 };
 
 const parseConfigValue = (value: string): unknown => {
@@ -196,6 +344,36 @@ const parseConfigValue = (value: string): unknown => {
   const numeric = Number(trimmed);
   if (!Number.isNaN(numeric) && trimmed.length > 0) {
     return numeric;
+  }
+
+  return value;
+};
+
+const REDACTED_VALUE = '[redacted]';
+const SENSITIVE_CONFIG_KEYS = new Set([
+  'token',
+  'apikey',
+  'accesstoken',
+  'refreshtoken',
+  'secret',
+  'clientsecret',
+  'password',
+]);
+
+const redactConfigForDisplay = (value: unknown): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => redactConfigForDisplay(item));
+  }
+
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+
+    for (const [key, entry] of Object.entries(value)) {
+      const normalizedKey = key.toLowerCase().replace(/[_-]/g, '');
+      result[key] = SENSITIVE_CONFIG_KEYS.has(normalizedKey) ? REDACTED_VALUE : redactConfigForDisplay(entry);
+    }
+
+    return result;
   }
 
   return value;
@@ -868,12 +1046,17 @@ const startTui = async (): Promise<void> => {
 
 const runCommand = async (parsed: ParsedCommand): Promise<void> => {
   if (parsed.command === 'help') {
-    printUsage();
+    await printUsage(normalizeHelpTopic(parsed.args[0]) ?? 'global');
     return;
   }
 
   if (parsed.command === 'version') {
     process.stdout.write(`${await readVersion()}\n`);
+    return;
+  }
+
+  if (isHelpRequested(parsed)) {
+    await printUsage(normalizeHelpTopic(parsed.command) ?? 'global');
     return;
   }
 

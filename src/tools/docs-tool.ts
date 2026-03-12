@@ -130,6 +130,7 @@ export const collectDocsCandidates = async (
   };
 
   if (scope === 'auto' || scope === 'instructions' || scope === 'all') {
+    pushFile(resolve(cwd, 'AGENTS.md'), 'instructions', 'AGENTS.md');
     pushFile(paths.projectInstructions, 'instructions', '.ddudu/DDUDU.md');
     pushFile(paths.globalInstructions, 'instructions', '~/.ddudu/DDUDU.md');
     const projectRules = await walkFiles(paths.projectRules, DEFAULT_EXCLUDES);

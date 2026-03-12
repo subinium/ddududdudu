@@ -5,6 +5,10 @@ const path = require('node:path');
 const process = require('node:process');
 const ts = require('typescript');
 
+// ts.sys may be undefined under Node.js v25+ ESM-interop CJS loading.
+// Build a minimal polyfill from Node.js builtins so the script works regardless.
+const sys = ts.sys ?? buildFallbackSys();
+
 const projectRoot = process.cwd();
 const srcRoot = path.join(projectRoot, 'src');
 const distRoot = path.join(projectRoot, 'dist');
@@ -15,7 +19,7 @@ const configPath = path.join(projectRoot, 'tsconfig.json');
 const args = new Set(process.argv.slice(2));
 const noEmit = args.has('--noEmit');
 
-const configResult = ts.readConfigFile(configPath, ts.sys.readFile);
+const configResult = ts.readConfigFile(configPath, sys.readFile);
 if (configResult.error) {
   console.error(ts.formatDiagnosticsWithColorAndContext([configResult.error], formatHost()));
   process.exit(1);
@@ -23,7 +27,7 @@ if (configResult.error) {
 
 const parsedConfig = ts.parseJsonConfigFileContent(
   configResult.config,
-  ts.sys,
+  sys,
   projectRoot,
   {},
   configPath,
@@ -114,7 +118,127 @@ function formatHost() {
   return {
     getCanonicalFileName: (fileName) => fileName,
     getCurrentDirectory: () => projectRoot,
-    getNewLine: () => ts.sys.newLine,
+    getNewLine: () => sys.newLine,
+  };
+}
+
+function buildFallbackSys() {
+  const isCaseSensitive = process.platform !== 'win32' && process.platform !== 'darwin';
+  const readFile = (filePath) => {
+    try { return fs.readFileSync(filePath, 'utf8'); }
+    catch { return undefined; }
+  };
+  const fileExists = (filePath) => {
+    try { fs.accessSync(filePath, fs.constants.R_OK); return true; }
+    catch { return false; }
+  };
+  const directoryExists = (dirPath) => {
+    try { return fs.statSync(dirPath).isDirectory(); }
+    catch { return false; }
+  };
+  const getDirectories = (dirPath) => {
+    try {
+      return fs.readdirSync(dirPath, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch { return []; }
+  };
+  const readDirectory = (rootDir, extensions, excludes, _includes, depth) => {
+    const results = [];
+    const extSet = new Set(extensions || []);
+    const excludeSet = new Set(excludes || []);
+    const maxDepth = typeof depth === 'number' ? depth : 64;
+    const walk = (dir, currentDepth) => {
+      if (currentDepth > maxDepth) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+      catch { return; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (excludeSet.has(entry.name)) continue;
+          walk(full, currentDepth + 1);
+        } else if (entry.isFile()) {
+          if (extSet.size === 0 || Array.from(extSet).some((ext) => entry.name.endsWith(ext))) {
+            results.push(full);
+          }
+        }
+      }
+    };
+    walk(rootDir, 0);
+    return results;
+  };
+  return {
+    readFile,
+    fileExists,
+    directoryExists,
+    getDirectories,
+    readDirectory,
+    useCaseSensitiveFileNames: isCaseSensitive,
+    newLine: '\n',
+    getCurrentDirectory: () => process.cwd(),
+    write: (text) => process.stdout.write(text),
+    exit: (code) => process.exit(code),
+  };
+}
+
+function buildFallbackSys() {
+  const isCaseSensitive = process.platform !== 'win32' && process.platform !== 'darwin';
+  const readFile = (filePath) => {
+    try { return fs.readFileSync(filePath, 'utf8'); }
+    catch { return undefined; }
+  };
+  const fileExists = (filePath) => {
+    try { fs.accessSync(filePath, fs.constants.R_OK); return true; }
+    catch { return false; }
+  };
+  const directoryExists = (dirPath) => {
+    try { return fs.statSync(dirPath).isDirectory(); }
+    catch { return false; }
+  };
+  const getDirectories = (dirPath) => {
+    try {
+      return fs.readdirSync(dirPath, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory())
+        .map((entry) => entry.name);
+    } catch { return []; }
+  };
+  const readDirectory = (rootDir, extensions, excludes, _includes, depth) => {
+    const results = [];
+    const extSet = new Set(extensions || []);
+    const excludeSet = new Set(excludes || []);
+    const maxDepth = typeof depth === 'number' ? depth : 64;
+    const walk = (dir, currentDepth) => {
+      if (currentDepth > maxDepth) return;
+      let entries;
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+      catch { return; }
+      for (const entry of entries) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          if (excludeSet.has(entry.name)) continue;
+          walk(full, currentDepth + 1);
+        } else if (entry.isFile()) {
+          if (extSet.size === 0 || Array.from(extSet).some((ext) => entry.name.endsWith(ext))) {
+            results.push(full);
+          }
+        }
+      }
+    };
+    walk(rootDir, 0);
+    return results;
+  };
+  return {
+    readFile,
+    fileExists,
+    directoryExists,
+    getDirectories,
+    readDirectory,
+    useCaseSensitiveFileNames: isCaseSensitive,
+    newLine: '\n',
+    getCurrentDirectory: () => process.cwd(),
+    write: (text) => process.stdout.write(text),
+    exit: (code) => process.exit(code),
   };
 }
 

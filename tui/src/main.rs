@@ -1,5 +1,8 @@
 use std::cmp::min;
+use std::collections::HashSet;
+use std::fs::read_dir;
 use std::io::{BufRead, BufReader, Write};
+use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
@@ -22,13 +25,18 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const BG: Color = Color::Rgb(18, 18, 24);
+const SIDEBAR_BG: Color = Color::Rgb(14, 14, 20); // #0E0E14 recessed sidebar
+const COMPOSER_BG: Color = Color::Rgb(22, 22, 30); // #16161E elevated input area
 const FG: Color = Color::Rgb(248, 248, 242);
+const USER_FG: Color = Color::Rgb(255, 255, 255); // #FFFFFF pure white for user
+const ASSISTANT_FG: Color = Color::Rgb(216, 213, 216); // #D8D5D8 warm neutral for assistant
 const ACCENT: Color = Color::Rgb(247, 167, 187); // #F7A7BB original ddudu pink
 const ACCENT_DIM: Color = Color::Rgb(160, 110, 125);
 const SUCCESS: Color = Color::Rgb(80, 250, 123);
 const ERROR: Color = Color::Rgb(255, 85, 85);
 const MUTED: Color = Color::Rgb(110, 100, 105);
-const TOOL_MUTED: Color = Color::Rgb(110, 100, 105);
+const MUTED_LIGHT: Color = Color::Rgb(138, 128, 136); // #8A8088 lighter muted
+const TOOL_MUTED: Color = Color::Rgb(90, 82, 88); // #5A5258 darker tool calls
 const LINK: Color = Color::Rgb(139, 233, 253);
 const PATH: Color = Color::Rgb(241, 250, 140);
 const ORANGE: Color = Color::Rgb(255, 184, 108);
@@ -36,6 +44,18 @@ const PANEL_TOP_PADDING: u16 = 2;
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const THINKING_FRAMES: &[&str] = &["◉", "◎", "○", "◎"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
+const FILE_PICKER_MAX_RESULTS: usize = 8;
+const MAX_PROMPT_HISTORY: usize = 200;
+const REPO_FILE_CACHE_LIMIT: usize = 2000;
+const REPO_FILE_SCAN_DEPTH: usize = 8;
+const REPO_FILE_EXCLUDES: &[&str] = &[".git", "node_modules", "dist", "coverage", "tmp", "target"];
+const COMMON_REPO_FILES: &[&str] = &[
+    "AGENTS.md",
+    "README.md",
+    "package.json",
+    "Cargo.toml",
+    ".ddudu/DDUDU.md",
+];
 const SPLASH_FULL: &[&str] = &[
     "      d8b       d8b                d8b                    d8b       d8b                d8b",
     "      88P       88P                88P                    88P       88P                88P",
@@ -417,6 +437,7 @@ enum SuggestionKind {
     Slash,
     Mode,
     Model,
+    File,
 }
 
 #[derive(Debug, Clone)]
@@ -454,6 +475,7 @@ enum SidebarTarget {
     Agent(usize),
     Job(usize),
     Queue(usize),
+    Artifact(usize),
     Plan(usize),
     ContextOverview,
     ContextEstimate,
@@ -482,6 +504,7 @@ struct PaletteState {
 #[derive(Clone)]
 enum PaletteAction {
     InsertSlash(String),
+    InsertText(String),
     SwitchTab(SidebarTab),
     OpenTarget(SidebarTarget),
     OpenContext,
@@ -500,6 +523,7 @@ enum InspectorKind {
     Agent(usize),
     Job(String),
     Queue(usize),
+    Artifact(usize),
     Plan(usize),
     Context,
     McpSummary,
@@ -718,6 +742,11 @@ struct App {
     next_prefetch_at: Option<Instant>,
     pending_prefetch_input: Option<String>,
     last_prefetched_input: Option<String>,
+    prompt_history: Vec<String>,
+    history_index: Option<usize>,
+    history_stash: Option<String>,
+    repo_files: Vec<String>,
+    repo_files_cwd: String,
     dirty: bool,
     should_quit: bool,
     notices: Vec<TransientNotice>,
@@ -795,6 +824,11 @@ impl App {
             next_prefetch_at: None,
             pending_prefetch_input: None,
             last_prefetched_input: None,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_stash: None,
+            repo_files: Vec::new(),
+            repo_files_cwd: String::new(),
             dirty: true,
             should_quit: false,
             notices: Vec::new(),
@@ -854,6 +888,7 @@ impl App {
             }
             BridgeEvent::State { state } => {
                 let was_asking = self.state.ask_user.is_some();
+                let previous_cwd = self.state.cwd.clone();
                 let previous_mode = self.state.mode.clone();
                 let previous_model = self.state.model.clone();
                 let previous_provider = self.state.provider.clone();
@@ -869,6 +904,13 @@ impl App {
                     .as_ref()
                     .map(|item| item.status.clone());
                 self.state = state;
+
+                if !self.state.cwd.is_empty()
+                    && (self.state.cwd != previous_cwd || self.repo_files_cwd != self.state.cwd)
+                {
+                    self.repo_files = load_repo_files(&self.state.cwd);
+                    self.repo_files_cwd = self.state.cwd.clone();
+                }
 
                 if !was_asking && self.state.ask_user.is_some() {
                     self.ask_user_selection = self
@@ -964,6 +1006,94 @@ impl App {
             .find(|mode| mode.active)
             .map(|mode| mode.label.clone())
             .unwrap_or_else(|| self.state.mode.to_uppercase())
+    }
+
+    fn changed_file_paths(&self) -> &[String] {
+        self.state
+            .git
+            .as_ref()
+            .map(|git| git.changed_files.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn current_file_query(&self) -> Option<String> {
+        let input = self.composer.text.trim_end();
+        let token = input.split_whitespace().last()?;
+        token.strip_prefix('@').map(|value| value.to_string())
+    }
+
+    fn ranked_file_paths(&self, query: &str, limit: usize) -> Vec<String> {
+        let mut ordered = Vec::new();
+        let mut seen = HashSet::new();
+
+        for path in self.changed_file_paths() {
+            if seen.insert(path.clone()) {
+                ordered.push(path.clone());
+            }
+        }
+
+        for path in COMMON_REPO_FILES {
+            let path = (*path).to_string();
+            if seen.insert(path.clone()) {
+                ordered.push(path);
+            }
+        }
+
+        for path in &self.repo_files {
+            if seen.insert(path.clone()) {
+                ordered.push(path.clone());
+            }
+        }
+
+        let mut matches = ordered
+            .into_iter()
+            .filter_map(|path| {
+                score_repo_file_path(&path, query, self.changed_file_paths())
+                    .map(|score| (score, path))
+            })
+            .collect::<Vec<_>>();
+
+        matches.sort_by(|left, right| {
+            right
+                .0
+                .cmp(&left.0)
+                .then_with(|| left.1.len().cmp(&right.1.len()))
+                .then_with(|| left.1.cmp(&right.1))
+        });
+
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, path)| path)
+            .collect()
+    }
+
+    fn current_file_suggestions(&self, query: &str) -> Vec<Suggestion> {
+        self.ranked_file_paths(query, FILE_PICKER_MAX_RESULTS)
+            .into_iter()
+            .map(|path| Suggestion {
+                kind: SuggestionKind::File,
+                description: if self.changed_file_paths().iter().any(|item| item == &path) {
+                    "changed file".to_string()
+                } else {
+                    "file path".to_string()
+                },
+                value: path,
+            })
+            .collect()
+    }
+
+    fn replace_trailing_token(&mut self, replacement: &str) {
+        let split = self
+            .composer
+            .text
+            .char_indices()
+            .rev()
+            .find(|(_, ch)| ch.is_whitespace())
+            .map(|(index, ch)| index + ch.len_utf8())
+            .unwrap_or(0);
+        let prefix = &self.composer.text[..split];
+        self.composer.set_text(format!("{prefix}{replacement}"));
     }
 
     fn ask_user_shortcut_index(&self, prompt: &NativeAskUserState, key: char) -> Option<usize> {
@@ -1353,6 +1483,10 @@ impl App {
         let composer_metrics = self.render_composer(frame, chunks[3]);
 
         if show_sidebar {
+            frame.render_widget(
+                Block::default().style(Style::default().bg(SIDEBAR_BG)),
+                root[1],
+            );
             self.draw_sidebar_divider(frame, root[1].x, frame.area());
             self.render_sidebar(frame, root[1]);
         }
@@ -1424,7 +1558,7 @@ impl App {
     fn draw_sidebar_divider(&self, frame: &mut Frame, x: u16, area: Rect) {
         for row in area.top()..area.bottom() {
             frame.buffer_mut().cell_mut((x, row)).map(|cell| {
-                cell.set_symbol("│").set_fg(MUTED).set_bg(BG);
+                cell.set_symbol("│").set_fg(MUTED).set_bg(SIDEBAR_BG);
             });
         }
     }
@@ -1513,7 +1647,7 @@ impl App {
         self.render_sidebar_systems_tab(&mut lines, &mut item_index);
 
         frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
+            Paragraph::new(Text::from(lines)).style(Style::default().bg(SIDEBAR_BG)),
             inner,
         );
     }
@@ -2342,6 +2476,13 @@ impl App {
             spans.push(Span::styled(error, Style::default().fg(ERROR)));
         } else if !self.state.ready {
             spans.push(Span::styled("booting…", Style::default().fg(ACCENT_DIM)));
+        } else {
+            let idle_hint = if self.state.queued_prompts.is_empty() {
+                "Ctrl+K commands  ·  Ctrl+Y sessions  ·  Shift+Tab mode"
+            } else {
+                "Ctrl+K commands  ·  Ctrl+Y sessions  ·  /queue inspect"
+            };
+            spans.push(Span::styled(idle_hint, Style::default().fg(ACCENT_DIM)));
         }
 
         if let Some(started_at) = self.streaming_start {
@@ -2454,12 +2595,21 @@ impl App {
             Style::default().fg(ACCENT_DIM),
         );
         frame.render_widget(
-            Paragraph::new(Line::from(divider)).style(Style::default().bg(BG)),
+            Paragraph::new(Line::from(divider)).style(Style::default().bg(COMPOSER_BG)),
             Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
                 height: 1,
+            },
+        );
+        frame.render_widget(
+            Block::default().style(Style::default().bg(COMPOSER_BG)),
+            Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: area.height.saturating_sub(1),
             },
         );
 
@@ -2764,6 +2914,17 @@ impl App {
                     }),
                 Style::default().fg(ACCENT_DIM),
             ));
+        } else {
+            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+            footer_spans.push(Span::styled(
+                "Ctrl+K palette",
+                Style::default().fg(ACCENT_DIM),
+            ));
+            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+            footer_spans.push(Span::styled(
+                "Ctrl+P @file",
+                Style::default().fg(ACCENT_DIM),
+            ));
         }
         if self.state.context_percent > 0.0 {
             footer_spans.push(Span::styled("  ", Style::default()));
@@ -2889,6 +3050,10 @@ impl App {
                 .collect();
         }
 
+        if let Some(query) = self.current_file_query() {
+            return self.current_file_suggestions(&query);
+        }
+
         if !input.starts_with('/') || input.contains(' ') {
             return Vec::new();
         }
@@ -2909,27 +3074,40 @@ impl App {
         let q = query.trim().to_lowercase();
         let mut items = Vec::new();
 
-        items.extend(self.state.slash_commands.iter().filter_map(|command| {
-            let haystack = format!("{} {}", command.value, command.description).to_lowercase();
-            if !q.is_empty() && !haystack.contains(&q) {
-                return None;
-            }
-            Some(PaletteItem {
-                label: command.value.clone(),
-                description: command.description.clone(),
-                action: PaletteAction::InsertSlash(command.value.clone()),
-            })
-        }));
+        if q.is_empty()
+            || "resume session".contains(&q)
+            || "saved session".contains(&q)
+            || "/session pick".contains(&q)
+        {
+            items.push(PaletteItem {
+                label: "Resume saved session".to_string(),
+                description: "sessions".to_string(),
+                action: PaletteAction::InsertSlash("/session pick".to_string()),
+            });
+        }
 
-        for tab in SidebarTab::all() {
-            let label = format!("Jump to {} section", tab.label());
-            if q.is_empty() || label.to_lowercase().contains(&q) {
-                items.push(PaletteItem {
-                    label,
-                    description: "sidebar".to_string(),
-                    action: PaletteAction::SwitchTab(tab),
-                });
-            }
+        if q.is_empty() || "queued prompts".contains(&q) || "/queue".contains(&q) {
+            items.push(PaletteItem {
+                label: "Inspect queued prompts".to_string(),
+                description: "queue".to_string(),
+                action: PaletteAction::InsertSlash("/queue".to_string()),
+            });
+        }
+
+        if q.is_empty() || "detached jobs".contains(&q) || "/jobs".contains(&q) {
+            items.push(PaletteItem {
+                label: "Inspect detached jobs".to_string(),
+                description: "jobs".to_string(),
+                action: PaletteAction::InsertSlash("/jobs".to_string()),
+            });
+        }
+
+        if q.is_empty() || "recent artifacts".contains(&q) || "/artifacts".contains(&q) {
+            items.push(PaletteItem {
+                label: "Inspect recent artifacts".to_string(),
+                description: "artifacts".to_string(),
+                action: PaletteAction::InsertSlash("/artifacts".to_string()),
+            });
         }
 
         if q.is_empty() || "context inspector".contains(&q) || "injected context".contains(&q) {
@@ -2948,15 +3126,28 @@ impl App {
             });
         }
 
-        if q.is_empty()
-            || "resume session".contains(&q)
-            || "saved session".contains(&q)
-            || "/session pick".contains(&q)
-        {
+        for (index, artifact) in self.state.artifacts.iter().enumerate().take(6) {
+            let label = format!("Inspect artifact · {}", preview_line(&artifact.title, 28));
+            let haystack = format!(
+                "{label} {} {} {}",
+                artifact.kind, artifact.source, artifact.summary
+            )
+            .to_lowercase();
+            if q.is_empty() || haystack.contains(&q) {
+                items.push(PaletteItem {
+                    label,
+                    description: format!("{} · {}", artifact.kind, artifact.source),
+                    action: PaletteAction::OpenTarget(SidebarTarget::Artifact(index)),
+                });
+            }
+        }
+
+        for path in self.ranked_file_paths(&q, 6) {
+            let label = format!("Insert file path · {}", preview_line(&path, 32));
             items.push(PaletteItem {
-                label: "Resume saved session".to_string(),
-                description: "sessions".to_string(),
-                action: PaletteAction::InsertSlash("/session pick".to_string()),
+                label,
+                description: "files".to_string(),
+                action: PaletteAction::InsertText(format!("@{path}")),
             });
         }
 
@@ -2978,6 +3169,29 @@ impl App {
                     label,
                     description: "queued prompt".to_string(),
                     action: PaletteAction::OpenTarget(SidebarTarget::Queue(index)),
+                });
+            }
+        }
+
+        items.extend(self.state.slash_commands.iter().filter_map(|command| {
+            let haystack = format!("{} {}", command.value, command.description).to_lowercase();
+            if !q.is_empty() && !haystack.contains(&q) {
+                return None;
+            }
+            Some(PaletteItem {
+                label: command.value.clone(),
+                description: command.description.clone(),
+                action: PaletteAction::InsertSlash(command.value.clone()),
+            })
+        }));
+
+        for tab in SidebarTab::all() {
+            let label = format!("Jump to {} section", tab.label());
+            if q.is_empty() || label.to_lowercase().contains(&q) {
+                items.push(PaletteItem {
+                    label,
+                    description: "sidebar".to_string(),
+                    action: PaletteAction::SwitchTab(tab),
                 });
             }
         }
@@ -3090,6 +3304,25 @@ impl App {
             return Ok(());
         }
 
+        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('p') {
+            if self.composer.trim().is_empty() {
+                self.composer.set_text("@".to_string());
+            } else if self
+                .composer
+                .text
+                .chars()
+                .last()
+                .is_some_and(|ch| ch.is_whitespace())
+            {
+                self.composer.insert_text("@");
+            } else {
+                self.composer.insert_text(" @");
+            }
+            self.selected_suggestion = 0;
+            self.push_notice("file picker".to_string(), NoticeTone::Info);
+            return Ok(());
+        }
+
         if key.code == KeyCode::BackTab
             || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
         {
@@ -3150,13 +3383,40 @@ impl App {
         if !popup_visible && self.state.ask_user.is_none() && composer_empty {
             match key.code {
                 KeyCode::Up => {
-                    self.auto_scroll = false;
-                    self.scroll = self.scroll.saturating_sub(1);
+                    if !self.prompt_history.is_empty() {
+                        let new_index = match self.history_index {
+                            None => {
+                                self.history_stash = Some(self.composer.text.clone());
+                                self.prompt_history.len() - 1
+                            }
+                            Some(i) if i > 0 => i - 1,
+                            Some(i) => i,
+                        };
+                        self.history_index = Some(new_index);
+                        self.composer
+                            .set_text(self.prompt_history[new_index].clone());
+                    } else {
+                        self.auto_scroll = false;
+                        self.scroll = self.scroll.saturating_sub(1);
+                    }
                     return Ok(());
                 }
                 KeyCode::Down => {
-                    self.auto_scroll = false;
-                    self.scroll = self.scroll.saturating_add(1);
+                    if let Some(i) = self.history_index {
+                        if i + 1 < self.prompt_history.len() {
+                            let new_index = i + 1;
+                            self.history_index = Some(new_index);
+                            self.composer
+                                .set_text(self.prompt_history[new_index].clone());
+                        } else {
+                            self.history_index = None;
+                            self.composer
+                                .set_text(self.history_stash.take().unwrap_or_default());
+                        }
+                    } else {
+                        self.auto_scroll = false;
+                        self.scroll = self.scroll.saturating_add(1);
+                    }
                     return Ok(());
                 }
                 _ => {}
@@ -3324,6 +3584,14 @@ impl App {
         self.bridge.send(BridgeCommand::Submit {
             content: trimmed.clone(),
         })?;
+        if self.prompt_history.last().map(|s| s.as_str()) != Some(&trimmed) {
+            if self.prompt_history.len() >= MAX_PROMPT_HISTORY {
+                self.prompt_history.remove(0);
+            }
+            self.prompt_history.push(trimmed);
+        }
+        self.history_index = None;
+        self.history_stash = None;
         self.composer.clear();
         self.clear_context_prefetch();
         self.auto_scroll = true;
@@ -3354,6 +3622,9 @@ impl App {
                     model: selected.value,
                 })?;
                 self.composer.clear();
+            }
+            SuggestionKind::File => {
+                self.replace_trailing_token(&format!("@{}", selected.value));
             }
         }
 
@@ -3434,6 +3705,24 @@ impl App {
         match action {
             PaletteAction::InsertSlash(command) => {
                 self.composer.set_text(command);
+                self.selected_suggestion = 0;
+            }
+            PaletteAction::InsertText(value) => {
+                if self.current_file_query().is_some() {
+                    self.replace_trailing_token(&value);
+                } else if self.composer.trim().is_empty() {
+                    self.composer.set_text(value);
+                } else if self
+                    .composer
+                    .text
+                    .chars()
+                    .last()
+                    .is_some_and(|ch| ch.is_whitespace())
+                {
+                    self.composer.insert_text(&value);
+                } else {
+                    self.composer.insert_text(&format!(" {value}"));
+                }
                 self.selected_suggestion = 0;
             }
             PaletteAction::SwitchTab(tab) => self.set_sidebar_tab(tab),
@@ -3546,6 +3835,7 @@ impl App {
             SidebarTarget::Agent(index) => self.build_agent_inspector(index),
             SidebarTarget::Job(index) => self.build_job_inspector(index),
             SidebarTarget::Queue(index) => self.build_queue_inspector(index),
+            SidebarTarget::Artifact(index) => self.build_artifact_inspector(index),
             SidebarTarget::Plan(index) => self.build_plan_inspector(index),
             SidebarTarget::ContextOverview | SidebarTarget::ContextEstimate => {
                 Some(self.build_context_inspector())
@@ -3668,6 +3958,31 @@ impl App {
             footer: Some("r run · p promote · d drop · Esc close".to_string()),
             scroll: 0,
             kind: InspectorKind::Queue(index),
+        })
+    }
+
+    fn build_artifact_inspector(&self, index: usize) -> Option<InspectorState> {
+        let artifact = self.state.artifacts.get(index)?;
+        let mut body = vec![
+            format!("kind: {}", artifact.kind),
+            format!("source: {}", artifact.source),
+            format!("created: {}", artifact.created_at),
+            artifact
+                .mode
+                .as_ref()
+                .map(|mode| format!("mode: {}", title_case_label(mode)))
+                .unwrap_or_else(|| "mode: n/a".to_string()),
+        ];
+        if !artifact.summary.trim().is_empty() {
+            body.push(String::new());
+            body.extend(artifact.summary.lines().map(|line| line.to_string()));
+        }
+        Some(InspectorState {
+            title: format!("Artifact · {}", artifact.title),
+            body,
+            footer: Some("Esc close".to_string()),
+            scroll: 0,
+            kind: InspectorKind::Artifact(index),
         })
     }
 
@@ -3850,6 +4165,7 @@ impl App {
                 .position(|job| job.id == job_id)
                 .and_then(|index| self.build_job_inspector(index)),
             InspectorKind::Queue(index) => self.build_queue_inspector(index),
+            InspectorKind::Artifact(index) => self.build_artifact_inspector(index),
             InspectorKind::Plan(index) => self.build_plan_inspector(index),
             InspectorKind::Context => Some(self.build_context_inspector()),
             InspectorKind::McpSummary => self.build_mcp_summary_inspector(),
@@ -4582,6 +4898,129 @@ fn short_job_ref(job_id: &str) -> &str {
     job_id.get(..8).unwrap_or(job_id)
 }
 
+fn walk_repo_files(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) {
+    if depth > REPO_FILE_SCAN_DEPTH || files.len() >= REPO_FILE_CACHE_LIMIT {
+        return;
+    }
+
+    let Ok(entries) = read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        if files.len() >= REPO_FILE_CACHE_LIMIT {
+            break;
+        }
+
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if kind.is_dir() {
+            if REPO_FILE_EXCLUDES.iter().any(|value| *value == name) {
+                continue;
+            }
+            walk_repo_files(root, &path, depth + 1, files);
+            continue;
+        }
+
+        if !kind.is_file() {
+            continue;
+        }
+
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        let value = relative.to_string_lossy().replace('\\', "/");
+        if !value.is_empty() {
+            files.push(value);
+        }
+    }
+}
+
+fn load_repo_files(cwd: &str) -> Vec<String> {
+    if let Ok(output) = Command::new("git")
+        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
+        .current_dir(cwd)
+        .output()
+    {
+        if output.status.success() {
+            let mut files = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(|line| line.replace('\\', "/"))
+                .collect::<Vec<_>>();
+            files.sort();
+            files.dedup();
+            files.truncate(REPO_FILE_CACHE_LIMIT);
+            return files;
+        }
+    }
+
+    let mut files = Vec::new();
+    walk_repo_files(Path::new(cwd), Path::new(cwd), 0, &mut files);
+    files.sort();
+    files.dedup();
+    files.truncate(REPO_FILE_CACHE_LIMIT);
+    files
+}
+
+fn score_repo_file_path(path: &str, query: &str, changed_files: &[String]) -> Option<i32> {
+    let normalized_path = path.to_lowercase();
+    let normalized_name = normalized_path
+        .rsplit('/')
+        .next()
+        .unwrap_or(normalized_path.as_str());
+    let query = query.trim().trim_start_matches('@').to_lowercase();
+    let is_changed = changed_files.iter().any(|item| item == path);
+    let is_common = COMMON_REPO_FILES.iter().any(|item| *item == path);
+
+    if query.is_empty() {
+        let mut score = 10;
+        if is_changed {
+            score += 200;
+        }
+        if is_common {
+            score += 120;
+        }
+        if normalized_path.starts_with("src/") {
+            score += 20;
+        }
+        return Some(score);
+    }
+
+    let mut score = 0;
+    if normalized_path == query {
+        score += 300;
+    }
+    if normalized_path.starts_with(&query) {
+        score += 220;
+    }
+    if normalized_name.starts_with(&query) {
+        score += 190;
+    }
+    if normalized_path.contains(&format!("/{query}")) {
+        score += 150;
+    }
+    if normalized_path.contains(&query) {
+        score += 90;
+    }
+    if score == 0 {
+        return None;
+    }
+    if is_changed {
+        score += 40;
+    }
+    if is_common {
+        score += 20;
+    }
+    Some(score)
+}
+
 fn load_git_diff(cwd: &str) -> Result<String> {
     let output = Command::new("git")
         .args(["diff", "--no-ext-diff", "--stat=120", "--patch", "--"])
@@ -4978,7 +5417,7 @@ fn render_markdown_table_block(
         else {
             break;
         };
-        if *largest_width <= 4 {
+        if *largest_width <= 8 {
             break;
         }
         widths[largest_index] = largest_width.saturating_sub(1);
@@ -5143,19 +5582,23 @@ fn build_transcript_lines(
             "user" => (
                 "› ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                Style::default().fg(FG),
+                Style::default().fg(USER_FG),
             ),
             "assistant" => (
                 "│ ",
                 Style::default().fg(ACCENT_DIM),
-                Style::default().fg(FG),
+                Style::default().fg(ASSISTANT_FG),
             ),
             "system" => (
                 "! ",
                 Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
-                Style::default().fg(FG),
+                Style::default().fg(MUTED_LIGHT),
             ),
-            _ => ("· ", Style::default().fg(MUTED), Style::default().fg(FG)),
+            _ => (
+                "· ",
+                Style::default().fg(MUTED),
+                Style::default().fg(MUTED_LIGHT),
+            ),
         };
 
         let prefix_width = prefix.width();

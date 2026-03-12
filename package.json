@@ -1,6 +1,6 @@
 {
   "name": "ddududdudu",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "AI coding harness with a native Rust TUI",
   "type": "module",
   "engines": {
@@ -74,6 +74,6 @@
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0",
     "c8": "^11.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "~5.8.3"
   }
 }

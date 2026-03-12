@@ -226,9 +226,9 @@ const MAX_TOOL_TURNS_FALLBACK = 25;
 const SYSTEM_PROMPT_CACHE_TTL_MS = 30_000;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.5.0';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.0';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
-const MAX_BACKGROUND_JOBS = 4;
+const MAX_BACKGROUND_JOBS = 6;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
 const DIFF_FILE_PATTERN = /^\+\+\+\s+b\/(.+)$/gm;
 const PARALLEL_SAFE_TOOL_NAMES = new Set([
@@ -1931,7 +1931,7 @@ export class NativeBridgeController {
     prompt: string,
     decision: AutoRouteDecision,
   ): Promise<{ prompt: string; artifact: WorkflowArtifact }> {
-    const done = await this.promptForQuestionValue(buildInputPrompt({
+    const done = await this.promptUserQuestionValue(buildInputPrompt({
       question: 'Before I split this up: what should count as done?',
       detail: 'Set the finish line so I can scope the work correctly before execution.',
       placeholder: 'Describe the outcome you want to ship',
@@ -1954,7 +1954,7 @@ export class NativeBridgeController {
         },
       ],
     }));
-    const constraints = await this.promptForQuestionValue(buildInputPrompt({
+    const constraints = await this.promptUserQuestionValue(buildInputPrompt({
       question: 'Any important constraints or things I should not break?',
       detail: 'Call out compatibility, UX, infra, or repo boundaries before I start.',
       placeholder: 'Type constraints, risks, or “none”',
@@ -1982,7 +1982,7 @@ export class NativeBridgeController {
         },
       ],
     }));
-    const optimizeFor = await this.promptForQuestionValue(buildInputPrompt({
+    const optimizeFor = await this.promptUserQuestionValue(buildInputPrompt({
       question: 'What should I optimize for?',
       detail: 'This decides whether I bias toward speed, minimal churn, or depth.',
       placeholder: 'Type the tradeoff you care about most',
@@ -2047,7 +2047,7 @@ export class NativeBridgeController {
   }
 
   private async maybeStartBackgroundPrompt(trimmedContent: string): Promise<boolean> {
-    if (this.currentMode !== 'jennie' || !this.canStartBackgroundJob()) {
+    if (!this.canStartBackgroundJob()) {
       return false;
     }
 

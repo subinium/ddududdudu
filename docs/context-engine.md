@@ -139,7 +139,7 @@ If no provider is authenticated or the LLM call fails, compaction falls back to 
 
 ### Why LLM-Powered
 
-String-clipping compaction (220-character message truncation) destroys context quality. Key decisions, file paths, and progress state are lost. LLM-powered compaction produces a structured document that another agent can actually continue from, similar to how opencode and Codex CLI handle compaction.
+String-clipping compaction (220-character message truncation) destroys context quality. Key decisions, file paths, and progress state are lost. LLM-powered compaction produces a structured handoff document that another agent can actually continue from — preserving goals, decisions, progress, and active file context instead of discarding them.
 
 ## Execution-Shape-First Retrieval
 
@@ -173,6 +173,30 @@ The target metric is:
 
 That is a context quality problem, not a context size problem.
 
+## Result Augmentation
+
+Context engineering does not stop at the input boundary.
+
+The harness can also improve model behavior by augmenting the context that follows tool execution.
+
+`ddudu` includes a result augmentation engine that injects behavioral nudges based on execution state:
+
+| Trigger | Nudge | Purpose |
+| --- | --- | --- |
+| File edit completed | verification reminder | prompt the model to run diagnostics after changing code |
+| Tool call failed | diagnostic suggestion | suggest next steps instead of letting the model retry blindly |
+| Manual-looking workflow | tool usage hint | remind the model that a built-in tool exists for the current task |
+| Pending verification detected | verification follow-up | prevent the model from moving on without checking results |
+| Long tool sequence | progress checkpoint | encourage the model to report intermediate status |
+
+These nudges are:
+
+- rule-based (zero latency, no LLM call)
+- cooldown-gated (same rule does not fire again within a configurable window)
+- contextual (they reference actual tool names and file paths from the current execution)
+
+This is not prompt injection. It is context-aware behavioral guidance at the output boundary, similar in spirit to how a good code review bot leaves inline comments.
+
 ## ddudu Implementation Notes
 
 Current `ddudu` leans on:
@@ -186,6 +210,8 @@ Current `ddudu` leans on:
 - two-phase LLM-powered compaction (prune then structured summary)
 - delta streaming pipeline (~80-byte events instead of full-state JSON) for real-time feedback
 - provider `resume` and `hydrate` for session continuity
+- result augmentation engine with rule-based behavioral nudges after tool calls
+- API resilience layer with automatic retry, exponential backoff, jitter, and error classification
 
 The main tuning surface is no longer "add more prompt".
-It is "select better context".
+It is "select better context and shape better behavior".

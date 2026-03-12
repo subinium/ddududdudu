@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.5.1-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.6.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
@@ -31,6 +31,10 @@
 - LLM-powered context compaction with structured handoff (Goal, Decisions, Progress, Files) and automatic prune-before-summarize
 - Delta streaming pipeline with ~80-byte events, blinking cursor, live token counter, and thinking breathing animation
 - Muted inline tool call rendering and color-coded context meter in the footer bar
+- Zone-differentiated visual encoding: recessed sidebar, elevated composer, and distinct message styles for user, assistant, and system content
+- Result augmentation engine that injects behavioral nudges (verification reminders, diagnostic hints, tool suggestions) based on execution context
+- API resilience with automatic retry, exponential backoff with jitter, and error classification (retryable vs auth vs fatal)
+- Arrow-Up prompt history recall in the composer with deduplication and stash/restore
 - Skills, hooks, MCP tools, LSP-backed retrieval, git-aware retrieval, and layered memory
 - Per-session cost budget tracking with configurable warning thresholds and hard-stop enforcement
 - Scored memory promotion pipeline with confidence metadata, Jaccard dedupe, and merge
@@ -43,10 +47,22 @@ ddudu treats a coding harness as a small operating layer around provider runtime
 The core system is organized around:
 
 - an execution kernel for provider runtimes, tools, and permissions
-- a context engine for retrieval, compaction, memory selection, and handoff
+- a context engine for retrieval, compaction, memory selection, result augmentation, and handoff
 - a session/state layer for canonical transcripts, artifacts, jobs, and checkpoints
 - an orchestration layer for routing, delegation, verification, and recovery
 - an operator surface for making progress, ownership, and risk legible
+
+### UX Philosophy
+
+The operator surface is not decoration. It is the control plane.
+
+ddudu's UX is built on a few concrete beliefs:
+
+1. **Perceived speed matters as much as actual speed.** Streaming deltas, breathing animations, blinking cursors, and live token counters exist because a system that looks alive earns more trust than one that looks frozen.
+2. **Visual encoding should carry meaning, not just color.** The TUI uses zone-differentiated backgrounds (recessed sidebar, neutral main, elevated composer) so the operator can orient spatially. User messages are pure white, assistant messages are warm neutral, system messages are muted. These are not theme choices — they are information hierarchy decisions.
+3. **Tool calls should recede, not compete.** Muted inline rendering (✓/✗/spinner) keeps tool activity visible without flooding the transcript. The operator should see answers, not plumbing.
+4. **The system should nudge the model, not just the operator.** Result augmentation injects verification reminders and diagnostic hints after tool calls so the model self-corrects without waiting for the operator to notice a missed step.
+5. **History is muscle memory.** Arrow-Up prompt recall means repeated workflows are fast. The composer is an input device, not a one-shot text field.
 
 The deeper technical notes live in [`docs/`](./docs/):
 
@@ -73,6 +89,14 @@ Recommended setup: run this default four-mode lineup together and let ddudu rout
 If only one provider is authenticated, ddudu still keeps the four-mode surface and resolves each mode to the best available fallback. In practice that means a Claude-only setup still gives you `Opus 4.6` for orchestration and `Sonnet 4.6` for planning/execution fallbacks, while a Codex-only setup collapses the modes onto `GPT-5.4`.
 
 `Shift+Tab` cycles modes inside the TUI.
+
+Additional native TUI shortcuts:
+
+- `Ctrl+K` opens the command palette
+- `Ctrl+Y` opens the saved-session picker
+- `Ctrl+P` starts an `@file` picker in the composer
+- `Ctrl+L` clears the current transcript
+- `Ctrl+C` interrupts the active run or exits when idle
 
 ## Built-In Tools
 
@@ -127,6 +151,8 @@ ddudu
 ```
 
 `npm run install:global` packs the current checkout and installs that tarball globally, which avoids the live symlink behavior of `npm install -g .` on newer npm versions. This is the recommended source install path.
+
+`ddudu <command> --help` and `ddudu help <command>` print command-specific usage.
 
 If you want to run the equivalent steps manually:
 
@@ -187,6 +213,7 @@ ddudu keeps one canonical session and layers provider-specific sessions on top o
 
 By default, ddudu stores sessions and operator settings in `~/.ddudu/` so the experience follows you across repositories.
 Project-local `.ddudu/config.yaml` remains available as an explicit override layer when a repo really needs different policy.
+`ddudu init` scaffolds `.ddudu/config.yaml`, `.ddudu/DDUDU.md`, root `AGENTS.md`, and starter hook templates. `AGENTS.md` is loaded automatically as the shared cross-tool instruction file.
 
 - `session list`, `session last`, and `session resume <id>` reopen saved sessions
 - `resume`, `/resume`, and `/session resume` are all supported aliases for reopening saved work
@@ -217,6 +244,8 @@ ddudu session resume <id>  # reopen a saved session in the native TUI
 ddudu resume          # quick alias for the latest saved session
 ddudu resume <id>     # quick alias for reopening a specific session
 ```
+
+`ddudu config show` prints the merged config with sensitive values redacted.
 
 ## Benchmarks
 
@@ -256,7 +285,9 @@ Task packs and the full comparison workflow are still being refined.
 | `Shift+Enter` / `Ctrl+J` | newline in composer                        |
 | `Enter`                  | submit                                     |
 | `Esc`                    | interrupt running request / clear composer |
-| `Up` / `Down`            | scroll transcript when composer is empty   |
+| `Up`                     | recall previous prompt (when composer is empty) |
+| `Down`                   | navigate forward in prompt history         |
+| `Up` / `Down`            | scroll transcript (when history is inactive) |
 | `PgUp` / `PgDn`          | jump scroll                                |
 | `End`                    | follow latest output                       |
 

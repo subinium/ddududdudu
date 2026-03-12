@@ -220,7 +220,50 @@ It becomes part of the trust model because it determines whether the operator ca
 - what already passed
 - who owns what
 
-## 14. ddudu Is A Control Plane Around Provider Workers
+## 14. Perceived Speed Is Real Speed
+
+A system that looks frozen feels broken even if it is working correctly.
+
+Perceived speed comes from:
+
+- immediate visual feedback: streaming deltas, blinking cursors, breathing animations
+- live progress signals: token counters, spinner icons on tool calls, typing indicators
+- spatial orientation: zone-differentiated backgrounds that let the eye track state without scanning
+
+These are not cosmetic polish. They are trust signals. An operator who cannot see the system working will interrupt it, start over, or stop trusting the output.
+
+## 15. Visual Encoding Should Carry Meaning
+
+Color, position, and weight should encode operational semantics, not just aesthetics.
+
+That means:
+
+- different UI zones should have distinct backgrounds so the operator can orient spatially
+- message sources (user, assistant, system) should be visually distinguishable without reading prefixes
+- tool activity should recede into muted rendering so answers are not buried in plumbing
+- tables and structured output should have minimum readable widths to avoid information loss through aggressive truncation
+
+If visual encoding is arbitrary, the operator has to read everything. If it is semantic, they can scan.
+
+## 16. The System Should Nudge The Model
+
+A harness can improve model behavior not only through the initial prompt but through runtime augmentation.
+
+Result augmentation injects context-aware behavioral nudges after tool calls:
+
+- verification reminders after file edits
+- diagnostic suggestions after failed tool calls
+- tool usage hints when the model appears to be working manually
+
+These nudges are:
+
+- rule-based, not LLM-generated (zero latency cost)
+- cooldown-gated to avoid nagging
+- scoped to execution context so they stay relevant
+
+This is a form of context engineering applied at the output boundary rather than the input boundary.
+
+## 17. ddudu Is A Control Plane Around Provider Workers
 
 `ddudu` is not built on the assumption that official tools are weak.
 

@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { access, writeFile } from 'node:fs/promises';
-import { basename } from 'node:path';
+import { basename, resolve } from 'node:path';
 
 import { ensureProjectDirs, getDduduPaths } from './dirs.js';
 
@@ -9,6 +9,105 @@ export interface ProjectInitResult {
   created: string[];
   alreadyInitialized: boolean;
 }
+
+const ROOT_AGENTS_TEMPLATE = `# Repository Instructions
+
+<!-- Shared instructions for ddudu, Codex CLI, Claude Code, opencode, and similar tools -->
+
+## Product Context
+- What this repository does:
+- Primary user or customer:
+- Non-goals or explicit scope limits:
+
+## Build And Verify
+- Main dev command:
+- Test command:
+- Lint or format command:
+- Required checks before completion:
+
+## Codebase Rules
+- Preferred architecture or layering constraints:
+- File or package boundaries that should stay stable:
+- Naming or API compatibility requirements:
+
+## Workflow
+- Keep changes focused and verification-ready.
+- Prefer reading local docs and config before making assumptions.
+- Surface blockers, tradeoffs, and follow-up work explicitly.
+`;
+
+const HOOKS_README = `# ddudu Hook Templates
+
+Hooks in this folder run automatically when the filename starts with a supported event name.
+
+Supported events:
+- beforeToolCall
+- afterToolCall
+- beforeApiCall
+- afterApiCall
+- onSessionStart
+- onSessionEnd
+- onModeSwitch
+- onError
+- beforeSend
+- afterResponse
+
+Starter templates are included in this folder but are disabled by default.
+Rename a template so the filename starts with the event name to enable it.
+
+Examples:
+- rename \`template-onSessionStart.mjs\` to \`onSessionStart.mjs\`
+- rename \`template-afterResponse.mjs\` to \`afterResponse.mjs\`
+`;
+
+const TEMPLATE_ON_SESSION_START = `import { appendFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+
+const readContext = async () => {
+  let input = '';
+  for await (const chunk of process.stdin) {
+    input += chunk;
+  }
+  return JSON.parse(input);
+};
+
+const main = async () => {
+  const ctx = await readContext();
+  const logPath = resolve(process.cwd(), '.ddudu', 'session-events.log');
+  const line = JSON.stringify({
+    event: ctx.event,
+    timestamp: ctx.timestamp,
+  });
+  await appendFile(logPath, \`\${line}\\n\`, 'utf8');
+};
+
+await main();
+`;
+
+const TEMPLATE_AFTER_RESPONSE = `const readContext = async () => {
+  let input = '';
+  for await (const chunk of process.stdin) {
+    input += chunk;
+  }
+  return JSON.parse(input);
+};
+
+const main = async () => {
+  const ctx = await readContext();
+  const preview =
+    typeof ctx.data?.response === 'string'
+      ? ctx.data.response.replace(/\\s+/g, ' ').trim().slice(0, 120)
+      : null;
+
+  if (!preview) {
+    return;
+  }
+
+  console.error(\`[hook:afterResponse] \${preview}\`);
+};
+
+await main();
+`;
 
 export const DEFAULT_CONFIG_YAML = `providers:
   claude:
@@ -96,6 +195,7 @@ export const buildProjectInstructionsTemplate = (
 
 <!-- Add project-specific instructions for ddudu here -->
 <!-- These are injected into every AI interaction -->
+<!-- AGENTS.md is also loaded automatically if you want one shared instruction file across tools -->
 
 ## Project Context
 - Name: ${projectName}
@@ -123,6 +223,8 @@ export const initializeProject = async (
   preset?: string | null,
 ): Promise<ProjectInitResult> => {
   const paths = getDduduPaths(cwd);
+  const projectHooksExisted = await exists(paths.projectHooks);
+  const rootAgentsPath = resolve(cwd, 'AGENTS.md');
   await ensureProjectDirs(cwd);
 
   const configContent = preset
@@ -144,7 +246,30 @@ export const initializeProject = async (
     created.push('.ddudu/DDUDU.md');
   }
 
-  if (!(await exists(paths.projectHooks))) {
+  if (!(await exists(rootAgentsPath))) {
+    await writeFile(rootAgentsPath, ROOT_AGENTS_TEMPLATE, 'utf8');
+    created.push('AGENTS.md');
+  }
+
+  const hooksReadmePath = resolve(paths.projectHooks, 'README.md');
+  if (!(await exists(hooksReadmePath))) {
+    await writeFile(hooksReadmePath, HOOKS_README, 'utf8');
+    created.push('.ddudu/hooks/README.md');
+  }
+
+  const sessionStartTemplatePath = resolve(paths.projectHooks, 'template-onSessionStart.mjs');
+  if (!(await exists(sessionStartTemplatePath))) {
+    await writeFile(sessionStartTemplatePath, TEMPLATE_ON_SESSION_START, 'utf8');
+    created.push('.ddudu/hooks/template-onSessionStart.mjs');
+  }
+
+  const afterResponseTemplatePath = resolve(paths.projectHooks, 'template-afterResponse.mjs');
+  if (!(await exists(afterResponseTemplatePath))) {
+    await writeFile(afterResponseTemplatePath, TEMPLATE_AFTER_RESPONSE, 'utf8');
+    created.push('.ddudu/hooks/template-afterResponse.mjs');
+  }
+
+  if (!projectHooksExisted) {
     created.push('.ddudu/hooks/');
   }
 
