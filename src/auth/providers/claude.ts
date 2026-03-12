@@ -7,7 +7,7 @@ import { promisify } from 'node:util';
 import { getStoredProviderAuth } from '../store.js';
 
 const execFileAsync = promisify(execFile);
-const KEYCHAIN_TIMEOUT_MS = 3000;
+const KEYCHAIN_TIMEOUT_MS = 1500;
 
 interface ClaudeCredentialsPayload {
   claudeAiOauth?: {

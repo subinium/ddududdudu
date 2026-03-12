@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 
-const KEYRING_GET_TIMEOUT_MS = 3000;
+const KEYRING_GET_TIMEOUT_MS = 1500;
 
 interface ExecResult {
   stdout: string;

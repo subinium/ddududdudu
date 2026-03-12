@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import { getStoredProviderAuth } from '../store.js';
 
 const execFileAsync = promisify(execFile);
-const KEYCHAIN_TIMEOUT_MS = 3000;
+const KEYCHAIN_TIMEOUT_MS = 1500;
 
 interface OAuthTokenResponse {
   access_token?: string;
@@ -271,11 +271,7 @@ export const discoverCodexToken = async (): Promise<{
       }
 
       if (refreshToken) {
-        const refreshed = await refreshOpenAiAccessToken(
-          refreshToken,
-          authFile.client_id,
-          authFile.client_secret,
-        );
+        const refreshed = await refreshOpenAiAccessToken(refreshToken, authFile.client_id, authFile.client_secret);
         if (refreshed) {
           return {
             token: refreshed,
