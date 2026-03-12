@@ -1,5 +1,5 @@
-import { streamText } from 'ai';
 import { createGoogleGenerativeAI } from '@ai-sdk/google';
+import { streamText } from 'ai';
 import type { ApiMessage, StreamCallbacks } from './anthropic-client.js';
 
 export interface GeminiClientConfig {
@@ -180,13 +180,17 @@ export class GeminiClient {
       };
     }
 
+    const FETCH_TIMEOUT_MS = 60_000;
+    const timeoutSignal = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    const combinedSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+
     let response: Response;
     try {
       response = await fetch(endpoint.toString(), {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
-        signal,
+        signal: combinedSignal,
       });
     } catch (error: unknown) {
       const normalized = toError(error, 'Network error while calling Gemini API.');
@@ -283,10 +287,7 @@ export class GeminiClient {
           inputTokens = usage.promptTokenCount;
         }
 
-        if (
-          typeof usage.candidatesTokenCount === 'number' &&
-          Number.isFinite(usage.candidatesTokenCount)
-        ) {
+        if (typeof usage.candidatesTokenCount === 'number' && Number.isFinite(usage.candidatesTokenCount)) {
           outputTokens = usage.candidatesTokenCount;
         }
       }
@@ -300,6 +301,11 @@ export class GeminiClient {
         }
 
         buffer += decoder.decode(value, { stream: true });
+        if (buffer.length > 5_000_000) {
+          const error = new Error('Gemini SSE buffer overflow');
+          callbacks.onError(error);
+          throw error;
+        }
 
         let boundary = buffer.indexOf('\n\n');
         while (boundary !== -1) {

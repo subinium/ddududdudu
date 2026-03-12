@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 
 export interface McpServerConfig {
   command: string;
@@ -68,6 +68,7 @@ interface ToolListResult {
 
 const REQUEST_TIMEOUT_MS = 30_000;
 const RECONNECT_DELAY_MS = 1_000;
+const MAX_STDOUT_BUFFER_SIZE = 10 * 1024 * 1024;
 
 const isObject = (value: unknown): value is Record<string, unknown> => {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -233,7 +234,8 @@ export class StdioMcpClient implements McpClient {
     });
 
     child.stderr.setEncoding('utf8');
-    child.stderr.on('data', (_chunk: string) => {
+    child.stderr.on('data', (chunk: string) => {
+      console.error(`[mcp:${this.name}] ${chunk.trimEnd()}`);
     });
 
     child.once('error', (err: unknown) => {
@@ -252,8 +254,6 @@ export class StdioMcpClient implements McpClient {
       }
     });
 
-    this.connected = true;
-
     try {
       const initializeResult = await this.sendRequest('initialize', {
         protocolVersion: '2024-11-05',
@@ -270,9 +270,9 @@ export class StdioMcpClient implements McpClient {
         this.serverName = discoveredName.trim();
       }
 
+      this.connected = true;
       this.sendNotification('notifications/initialized', {});
     } catch (err: unknown) {
-      this.connected = false;
       this.process?.kill();
       this.process = null;
       throw toError(err, `Failed to initialize MCP server ${this.name}.`);
@@ -357,6 +357,12 @@ export class StdioMcpClient implements McpClient {
 
   private handleStdoutChunk(chunk: string): void {
     this.stdoutBuffer += chunk;
+
+    if (this.stdoutBuffer.length > MAX_STDOUT_BUFFER_SIZE) {
+      this.stdoutBuffer = '';
+      this.rejectAllPending(new Error(`MCP server ${this.name} stdout buffer overflow.`));
+      return;
+    }
 
     let boundary = this.stdoutBuffer.indexOf('\n');
     while (boundary !== -1) {
@@ -451,7 +457,7 @@ export class McpManager {
         await client.connect();
         const tools = await client.listTools();
         this.toolsByServer.set(serverName, tools);
-      })
+      }),
     );
   }
 

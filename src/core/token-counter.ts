@@ -48,6 +48,7 @@ const MODEL_PRICING_USD_PER_MILLION: { [model: string]: ModelPricing } = {
   'gpt-5.1': { inputPerMillion: 1.25, outputPerMillion: 10 },
   'gpt-5': { inputPerMillion: 1.25, outputPerMillion: 10 },
   'gpt-4o': { inputPerMillion: 2.5, outputPerMillion: 10 },
+  'gpt-4.1': { inputPerMillion: 2, outputPerMillion: 8 },
   'gemini-2.5-pro': { inputPerMillion: 1.25, outputPerMillion: 10 },
   'gemini-2.0-flash': { inputPerMillion: 0.075, outputPerMillion: 0.3 },
 };
@@ -55,23 +56,25 @@ const MODEL_PRICING_USD_PER_MILLION: { [model: string]: ModelPricing } = {
 const DEFAULT_CONTEXT_LIMIT = 128000;
 const CJK_PATTERN = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/g;
 
+const normalizeModelKey = (model: string): string => {
+  for (const key of Object.keys(MODEL_PRICING_USD_PER_MILLION)) {
+    if (model === key || model.startsWith(key)) {
+      return key;
+    }
+  }
+  // Strip date suffix (e.g. claude-opus-4-20250514 → claude-opus-4) and retry
+  const stripped = model.replace(/-\d{8}$/, '');
+  if (stripped !== model) {
+    for (const key of Object.keys(MODEL_PRICING_USD_PER_MILLION)) {
+      if (stripped === key || key.startsWith(stripped)) {
+        return key;
+      }
+    }
+  }
+  return model;
+};
+
 export class TokenCounter {
-  private static readonly COST_PER_1K_INPUT: Record<string, number> = {
-    'claude-opus-4-20250514': 0.015,
-    'claude-sonnet-4-20250514': 0.003,
-    'gpt-4.1': 0.002,
-    'gemini-2.5-pro': 0.00125,
-    default: 0.003,
-  };
-
-  private static readonly COST_PER_1K_OUTPUT: Record<string, number> = {
-    'claude-opus-4-20250514': 0.075,
-    'claude-sonnet-4-20250514': 0.015,
-    'gpt-4.1': 0.008,
-    'gemini-2.5-pro': 0.01,
-    default: 0.015,
-  };
-
   private model: string;
   private inputTokens: number;
   private outputTokens: number;
@@ -150,9 +153,13 @@ export class TokenCounter {
   }
 
   public getEstimatedCost(model: string = this.model): number {
-    const pricing = MODEL_PRICING_USD_PER_MILLION[model];
+    const key = normalizeModelKey(model);
+    const pricing = MODEL_PRICING_USD_PER_MILLION[key];
     if (!pricing) {
-      return 0;
+      const defaultPricing = { inputPerMillion: 3, outputPerMillion: 15 };
+      const inputCost = (this.inputTokens / 1_000_000) * defaultPricing.inputPerMillion;
+      const outputCost = (this.outputTokens / 1_000_000) * defaultPricing.outputPerMillion;
+      return Number((inputCost + outputCost).toFixed(6));
     }
 
     const inputCost = (this.inputTokens / 1_000_000) * pricing.inputPerMillion;
@@ -204,15 +211,7 @@ export class TokenCounter {
   }
 
   public getEstimatedCostUsd(): number {
-    const inputRate =
-      TokenCounter.COST_PER_1K_INPUT[this.model] ?? TokenCounter.COST_PER_1K_INPUT.default;
-    const outputRate =
-      TokenCounter.COST_PER_1K_OUTPUT[this.model] ?? TokenCounter.COST_PER_1K_OUTPUT.default;
-
-    const inputCost = (this.inputTokens / 1_000) * inputRate;
-    const outputCost = (this.outputTokens / 1_000) * outputRate;
-
-    return Number((inputCost + outputCost).toFixed(6));
+    return this.getEstimatedCost(this.model);
   }
 
   public onBudgetEvent(callback: (event: BudgetEvent) => void): void {

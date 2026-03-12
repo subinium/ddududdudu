@@ -1,11 +1,6 @@
 import { Codex, type ThreadEvent, type ThreadItem, type ThreadOptions } from '@openai/codex-sdk';
 
-import type {
-  ApiMessage,
-  StreamCallbacks,
-  ToolStateUpdate,
-  UsageSummary,
-} from './anthropic-client.js';
+import type { ApiMessage, StreamCallbacks, ToolStateUpdate, UsageSummary } from './anthropic-client.js';
 
 export interface CodexClientConfig {
   model: string;
@@ -63,9 +58,7 @@ const toError = (error: unknown, fallbackMessage: string): Error => {
 
 const createExecEnv = (): Record<string, string> => {
   return Object.fromEntries(
-    Object.entries(process.env).filter(
-      (entry): entry is [string, string] => typeof entry[1] === 'string',
-    ),
+    Object.entries(process.env).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
   );
 };
 
@@ -87,24 +80,17 @@ const emitToolState = (
   callbacks.onToolState?.([state]);
 };
 
-const summarizeFileChanges = (
-  changes: Array<{ path: string; kind: string }> | undefined,
-): string => {
+const summarizeFileChanges = (changes: Array<{ path: string; kind: string }> | undefined): string => {
   if (!changes || changes.length === 0) {
     return '';
   }
 
-  const visible = changes
-    .slice(0, 6)
-    .map((change) => `${change.kind}:${change.path}`);
+  const visible = changes.slice(0, 6).map((change) => `${change.kind}:${change.path}`);
   const hidden = changes.length - visible.length;
   return hidden > 0 ? `${visible.join(', ')} (+${hidden} more)` : visible.join(', ');
 };
 
-const toThreadOptions = (
-  model: string,
-  cwd: string,
-): ThreadOptions => ({
+const toThreadOptions = (model: string, cwd: string): ThreadOptions => ({
   model,
   workingDirectory: cwd,
   skipGitRepoCheck: true,
@@ -121,8 +107,7 @@ export class CodexClient {
   public constructor(config: CodexClientConfig) {
     this.model = config.model;
     this.cwd = config.cwd ?? process.cwd();
-    this.commandOverride =
-      config.command?.trim() || process.env.DDUDU_CODEX_COMMAND?.trim() || null;
+    this.commandOverride = config.command?.trim() || process.env.DDUDU_CODEX_COMMAND?.trim() || null;
   }
 
   public async stream(
@@ -138,16 +123,12 @@ export class CodexClient {
 
     const codex = new Codex({
       codexPathOverride:
-        this.commandOverride && this.commandOverride !== DEFAULT_COMMAND
-          ? this.commandOverride
-          : undefined,
+        this.commandOverride && this.commandOverride !== DEFAULT_COMMAND ? this.commandOverride : undefined,
       env: createExecEnv(),
     });
 
     const threadOptions = toThreadOptions(this.model, this.cwd);
-    const thread = sessionId
-      ? codex.resumeThread(sessionId, threadOptions)
-      : codex.startThread(threadOptions);
+    const thread = sessionId ? codex.resumeThread(sessionId, threadOptions) : codex.startThread(threadOptions);
 
     const messageTexts = new Map<string, string>();
     const messageOrder: string[] = [];
@@ -168,6 +149,13 @@ export class CodexClient {
 
       if (!messageTexts.has(item.id)) {
         messageOrder.push(item.id);
+        if (messageOrder.length > 1000) {
+          const removed = messageOrder.shift();
+          if (removed) {
+            messageTexts.delete(removed);
+            emittedStates.delete(removed);
+          }
+        }
       }
       messageTexts.set(item.id, item.text);
 
@@ -193,12 +181,7 @@ export class CodexClient {
         emitToolState(callbacks, emittedStates, {
           id: item.id,
           name: 'bash',
-          status:
-            item.status === 'in_progress'
-              ? 'running'
-              : item.status === 'completed'
-                ? 'done'
-                : 'error',
+          status: item.status === 'in_progress' ? 'running' : item.status === 'completed' ? 'done' : 'error',
           input: { command: item.command },
           result: item.aggregated_output || '',
         });
@@ -209,18 +192,11 @@ export class CodexClient {
         emitToolState(callbacks, emittedStates, {
           id: item.id,
           name: `${item.server}:${item.tool}`,
-          status:
-            item.status === 'in_progress'
-              ? 'running'
-              : item.status === 'completed'
-                ? 'done'
-                : 'error',
+          status: item.status === 'in_progress' ? 'running' : item.status === 'completed' ? 'done' : 'error',
           input: { arguments: item.arguments ?? {} },
           result:
             item.error?.message ??
-            item.result?.content
-              ?.map((block) => ('text' in block ? String(block.text ?? '') : ''))
-              .join('\n') ??
+            item.result?.content?.map((block) => ('text' in block ? String(block.text ?? '') : '')).join('\n') ??
             '',
         });
         return;
@@ -255,11 +231,7 @@ export class CodexClient {
           continue;
         }
 
-        if (
-          event.type === 'item.started' ||
-          event.type === 'item.updated' ||
-          event.type === 'item.completed'
-        ) {
+        if (event.type === 'item.started' || event.type === 'item.updated' || event.type === 'item.completed') {
           handleItemEvent(event.item, event.type);
           continue;
         }

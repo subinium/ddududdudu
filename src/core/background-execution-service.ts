@@ -1,31 +1,29 @@
 import { discoverAllProviders } from '../auth/discovery.js';
 import { buildArtifactPayload } from './artifacts.js';
-import { loadConfig } from './config.js';
 import {
-  BackgroundJobStore,
-  resolveBackgroundJobDirectory,
   type BackgroundJobAgentActivity,
   type BackgroundJobChecklistItem,
   type BackgroundJobRecord,
+  BackgroundJobStore,
+  resolveBackgroundJobDirectory,
 } from './background-jobs.js';
-import { DelegationRuntime, type DelegationCredentials, type DelegationPurpose } from './delegation.js';
+import { loadConfig } from './config.js';
+import { type DelegationCredentials, type DelegationPurpose, DelegationRuntime } from './delegation.js';
 import { SessionManager } from './session.js';
+import type { TeamMessage } from './team-agent.js';
 import {
-  TeamExecutionRuntime,
   formatTeamAgentDetail,
   formatTeamAgentLabel,
   runTeamAgentDelegation,
+  TeamExecutionRuntime,
   teamAgentPurpose,
 } from './team-execution.js';
-import type { TeamMessage } from './team-agent.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
-import { WorktreeManager } from './worktree-manager.js';
 import type { WorkflowArtifact, WorkflowArtifactKind } from './workflow-state.js';
+import { WorktreeManager } from './worktree-manager.js';
 
-const normalizeProviderMap = (
-  providers: Map<string, DelegationCredentials>,
-): Map<string, DelegationCredentials> => {
+const normalizeProviderMap = (providers: Map<string, DelegationCredentials>): Map<string, DelegationCredentials> => {
   const normalized = new Map(providers);
   const claude = normalized.get('claude');
   if (claude && !normalized.has('anthropic')) {
@@ -131,15 +129,15 @@ const updateActivity = (
 ): BackgroundJobAgentActivity[] => {
   const existing = activities.find((activity) => activity.id === next.id);
   if (existing) {
-    existing.label = next.label;
-    existing.mode = next.mode;
-    existing.purpose = next.purpose;
-    existing.checklistId = next.checklistId ?? existing.checklistId ?? null;
-    existing.status = next.status;
-    existing.detail = next.detail;
-    existing.workspacePath = next.workspacePath;
-    existing.updatedAt = next.updatedAt;
-    return activities;
+    return activities.map((activity) =>
+      activity.id === next.id
+        ? {
+            ...activity,
+            ...next,
+            checklistId: next.checklistId ?? activity.checklistId ?? null,
+          }
+        : activity,
+    );
   }
 
   return [next, ...activities].slice(0, 12);
@@ -167,8 +165,7 @@ const formatTeamProgress = (message: TeamMessage): string =>
 const verificationModeForJob = (job: BackgroundJobRecord): VerificationMode =>
   job.verificationMode ?? (job.purpose === 'execution' || job.purpose === 'review' ? 'checks' : 'none');
 
-const resolvePreferredMode = (job: BackgroundJobRecord): NamedMode | undefined =>
-  job.preferredMode ?? undefined;
+const resolvePreferredMode = (job: BackgroundJobRecord): NamedMode | undefined => job.preferredMode ?? undefined;
 
 export class BackgroundExecutionService {
   public async run(jobId: string): Promise<void> {
@@ -230,7 +227,10 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       .then(async () => {
         current = await store.update(job.id, patch);
       })
-      .catch(() => undefined);
+      .catch((err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(`[background-job] persist failed for ${job.id}: ${msg}`);
+      });
   };
 
   const abortController = new AbortController();
@@ -338,7 +338,10 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
               detail: state.summary ?? current.detail,
               checklist: updateChecklistItem(
                 updateChecklistItem(current.checklist, 'execute', {
-                  status: state.status === 'running' ? 'completed' : current.checklist.find((item) => item.id === 'execute')?.status ?? 'completed',
+                  status:
+                    state.status === 'running'
+                      ? 'completed'
+                      : (current.checklist.find((item) => item.id === 'execute')?.status ?? 'completed'),
                   detail: current.checklist.find((item) => item.id === 'execute')?.detail ?? current.detail,
                 }),
                 'verify',
@@ -405,15 +408,18 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       });
 
       await sessionManager.append(
-        current.sessionId ?? (await sessionManager.create({
-          provider: result.provider,
-          model: result.model,
-          metadata: {
-            mode: result.mode,
-            purpose: result.purpose,
-            background: true,
-          },
-        })).id,
+        current.sessionId ??
+          (
+            await sessionManager.create({
+              provider: result.provider,
+              model: result.model,
+              metadata: {
+                mode: result.mode,
+                purpose: result.purpose,
+                background: true,
+              },
+            })
+          ).id,
         buildSessionEntry(current, finalText, {
           mode: result.mode,
           provider: result.provider,
@@ -442,13 +448,14 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       );
 
       current = await store.update(current.id, {
-        status: result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty ? 'error' : 'done',
+        status:
+          result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty ? 'error' : 'done',
         detail:
           result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
             ? `apply failed · ${result.workspaceApply.error ?? result.workspaceApply.summary}`
             : result.workspaceApply?.applied
               ? `applied · ${result.workspaceApply.summary}`
-              : result.verification?.summary ?? latestDetail,
+              : (result.verification?.summary ?? latestDetail),
         finishedAt: Date.now(),
         pid: null,
         result: {
@@ -476,36 +483,31 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
             status: 'completed',
             detail: result.verification?.summary ?? previewText(finalText, 72),
           }),
-        ]
-          .map((item) => {
-            if (item.id === 'verify') {
-              return {
-                ...item,
-                status:
-                  result.verification?.status === 'failed'
-                    ? 'error'
-                    : result.verification
-                      ? 'completed'
-                      : item.status,
-                detail: result.verification?.summary ?? item.detail,
-                updatedAt: Date.now(),
-              };
-            }
-            if (item.id === 'apply') {
-              return {
-                ...item,
-                status:
-                  result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
-                    ? 'error'
-                    : result.workspaceApply
-                      ? 'completed'
-                      : item.status,
-                detail: result.workspaceApply?.summary ?? item.detail,
-                updatedAt: Date.now(),
-              };
-            }
-            return item;
-          }),
+        ].map((item) => {
+          if (item.id === 'verify') {
+            return {
+              ...item,
+              status:
+                result.verification?.status === 'failed' ? 'error' : result.verification ? 'completed' : item.status,
+              detail: result.verification?.summary ?? item.detail,
+              updatedAt: Date.now(),
+            };
+          }
+          if (item.id === 'apply') {
+            return {
+              ...item,
+              status:
+                result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
+                  ? 'error'
+                  : result.workspaceApply
+                    ? 'completed'
+                    : item.status,
+              detail: result.workspaceApply?.summary ?? item.detail,
+              updatedAt: Date.now(),
+            };
+          }
+          return item;
+        }),
         agentActivities: updateActivity(current.agentActivities, {
           id: `job:${current.id}:delegate`,
           label: result.mode,
@@ -525,8 +527,8 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
                 : 'done',
           detail:
             result.workspaceApply && !result.workspaceApply.applied && !result.workspaceApply.empty
-              ? result.workspaceApply.error ?? result.workspaceApply.summary
-              : result.verification?.summary ?? previewText(finalText, 72),
+              ? (result.workspaceApply.error ?? result.workspaceApply.summary)
+              : (result.verification?.summary ?? previewText(finalText, 72)),
           workspacePath: result.workspace?.path ?? null,
           updatedAt: Date.now(),
         }),
@@ -739,17 +741,20 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
       });
 
       await sessionManager.append(
-        current.sessionId ?? (await sessionManager.create({
-          title: 'background-team',
-          provider: teamAgents[0]?.provider,
-          model: teamAgents[0]?.model,
-          metadata: {
-            mode: current.preferredMode ?? teamAgents[0]?.mode,
-            purpose: current.purpose,
-            background: true,
-            strategy: current.strategy ?? 'parallel',
-          },
-        })).id,
+        current.sessionId ??
+          (
+            await sessionManager.create({
+              title: 'background-team',
+              provider: teamAgents[0]?.provider,
+              model: teamAgents[0]?.model,
+              metadata: {
+                mode: current.preferredMode ?? teamAgents[0]?.mode,
+                purpose: current.purpose,
+                background: true,
+                strategy: current.strategy ?? 'parallel',
+              },
+            })
+          ).id,
         buildSessionEntry(current, finalText, {
           mode: current.preferredMode ?? teamAgents[0]?.mode,
           teamStrategy: current.strategy ?? 'parallel',
@@ -778,8 +783,7 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
             return {
               ...item,
               status: 'completed',
-              detail:
-                item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
+              detail: item.detail ?? `${current.strategy ?? 'parallel'} · ${result.rounds} rounds`,
               updatedAt: Date.now(),
             };
           }
@@ -798,7 +802,9 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
 
     await persistChain;
   } catch (error: unknown) {
-    const detail = abortController.signal.aborted ? current.detail ?? 'background job aborted' : serializeError(error);
+    const detail = abortController.signal.aborted
+      ? (current.detail ?? 'background job aborted')
+      : serializeError(error);
     current = await store.update(current.id, {
       status: abortController.signal.aborted ? 'cancelled' : 'error',
       detail,

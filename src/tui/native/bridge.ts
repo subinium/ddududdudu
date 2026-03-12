@@ -1,8 +1,8 @@
 import { createInterface } from 'node:readline';
 
 import type { NamedMode } from '../../core/types.js';
-import type { NativeBridgeCommand, NativeBridgeEvent } from './protocol.js';
 import { NativeBridgeController } from './controller.js';
+import type { NativeBridgeCommand, NativeBridgeEvent } from './protocol.js';
 
 const BRIDGE_EVENT_PREFIX = '__DDUDU_BRIDGE__ ';
 
@@ -52,42 +52,36 @@ const parseCommand = (line: string): NativeBridgeCommand | null => {
     case 'submit':
       return typeof parsed.content === 'string' ? { type: 'submit', content: parsed.content } : null;
     case 'prefetch_context':
-      return typeof parsed.content === 'string'
-        ? { type: 'prefetch_context', content: parsed.content }
-        : null;
+      return typeof parsed.content === 'string' ? { type: 'prefetch_context', content: parsed.content } : null;
     case 'abort':
       return { type: 'abort' };
     case 'clear_messages':
       return { type: 'clear_messages' };
     case 'run_slash':
-      return typeof parsed.command === 'string'
-        ? { type: 'run_slash', command: parsed.command }
-        : null;
+      return typeof parsed.command === 'string' ? { type: 'run_slash', command: parsed.command } : null;
     case 'toggle_fire':
       return { type: 'toggle_fire' };
     case 'append_system':
-      return typeof parsed.content === 'string'
-        ? { type: 'append_system', content: parsed.content }
-        : null;
+      return typeof parsed.content === 'string' ? { type: 'append_system', content: parsed.content } : null;
     case 'set_model':
       return typeof parsed.model === 'string' ? { type: 'set_model', model: parsed.model } : null;
     case 'answer_ask_user':
-      return typeof parsed.answer === 'object'
-        && parsed.answer !== null
-        && typeof parsed.answer.value === 'string'
-        && (parsed.answer.source === 'choice' || parsed.answer.source === 'custom' || parsed.answer.source === 'default')
+      return typeof parsed.answer === 'object' &&
+        parsed.answer !== null &&
+        typeof parsed.answer.value === 'string' &&
+        (parsed.answer.source === 'choice' || parsed.answer.source === 'custom' || parsed.answer.source === 'default')
         ? {
-          type: 'answer_ask_user',
-          answer: {
-            value: parsed.answer.value,
-            source: parsed.answer.source,
-            optionIndex:
-              typeof parsed.answer.optionIndex === 'number' && Number.isFinite(parsed.answer.optionIndex)
-                ? parsed.answer.optionIndex
-                : null,
-            optionLabel: typeof parsed.answer.optionLabel === 'string' ? parsed.answer.optionLabel : null,
-          },
-        }
+            type: 'answer_ask_user',
+            answer: {
+              value: parsed.answer.value,
+              source: parsed.answer.source,
+              optionIndex:
+                typeof parsed.answer.optionIndex === 'number' && Number.isFinite(parsed.answer.optionIndex)
+                  ? parsed.answer.optionIndex
+                  : null,
+              optionLabel: typeof parsed.answer.optionLabel === 'string' ? parsed.answer.optionLabel : null,
+            },
+          }
         : null;
     case 'cycle_mode':
       return parsed.direction === -1 ? { type: 'cycle_mode', direction: -1 } : { type: 'cycle_mode', direction: 1 };
@@ -159,10 +153,7 @@ export const runNativeBridge = async (): Promise<void> => {
     try {
       command = parseCommand(line);
     } catch (error: unknown) {
-      console.error(
-        '[ddudu bridge] ignored invalid command:',
-        error instanceof Error ? error.message : String(error),
-      );
+      console.error('[ddudu bridge] ignored invalid command:', error instanceof Error ? error.message : String(error));
       return;
     }
 
@@ -183,7 +174,7 @@ export const runNativeBridge = async (): Promise<void> => {
   });
 
   rl.on('close', () => {
-    controller.shutdown();
+    void controller.shutdown();
   });
 
   try {
@@ -196,8 +187,7 @@ export const runNativeBridge = async (): Promise<void> => {
     bootFailed = true;
     writeEvent({
       type: 'fatal',
-      message:
-        error instanceof Error ? `Bridge boot failed: ${error.message}` : `Bridge boot failed: ${String(error)}`,
+      message: error instanceof Error ? `Bridge boot failed: ${error.message}` : `Bridge boot failed: ${String(error)}`,
     });
     rl.close();
   }

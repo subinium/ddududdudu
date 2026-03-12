@@ -1,8 +1,8 @@
-import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { readFile, readdir } from 'node:fs/promises';
+import { type ChildProcessWithoutNullStreams, execFile, spawn } from 'node:child_process';
+import { readdir, readFile } from 'node:fs/promises';
 import { dirname, extname, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 
@@ -178,10 +178,7 @@ const exists = async (filePath: string): Promise<boolean> => {
   }
 };
 
-const hasMatchingFiles = async (
-  rootPath: string,
-  extensions: Set<string>,
-): Promise<boolean> => {
+const hasMatchingFiles = async (rootPath: string, extensions: Set<string>): Promise<boolean> => {
   const visit = async (dirPath: string): Promise<boolean> => {
     const entries = await readdir(dirPath, { withFileTypes: true });
     for (const entry of entries) {
@@ -280,11 +277,14 @@ class JsonRpcClient {
   private readonly rootPath: string;
   private readonly spec: LspServerSpec;
   private readonly openedDocuments = new Map<string, { version: number; text: string }>();
-  private readonly pending = new Map<number, {
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-    timer: NodeJS.Timeout;
-  }>();
+  private readonly pending = new Map<
+    number,
+    {
+      resolve: (value: unknown) => void;
+      reject: (error: Error) => void;
+      timer: NodeJS.Timeout;
+    }
+  >();
   private readonly ready: Promise<void>;
   private readonly shutdownPromise: Promise<void>;
   private nextId = 1;
@@ -494,9 +494,7 @@ class JsonRpcClient {
         return [];
       }
 
-      const children = Array.isArray(record.children)
-        ? record.children.flatMap((child) => flatten(child))
-        : [];
+      const children = Array.isArray(record.children) ? record.children.flatMap((child) => flatten(child)) : [];
       return [
         {
           name,
@@ -578,7 +576,7 @@ class JsonRpcClient {
         const message = JSON.parse(messageBuffer.toString('utf8')) as Record<string, unknown>;
         this.handleMessage(message);
       } catch {
-        // Ignore malformed server output.
+        console.error('[lsp] malformed server message');
       }
     }
   }
@@ -599,9 +597,10 @@ class JsonRpcClient {
 
     if (message.error && typeof message.error === 'object' && message.error !== null) {
       const errorRecord = message.error as Record<string, unknown>;
-      const errorMessage = typeof errorRecord.message === 'string'
-        ? errorRecord.message
-        : `${this.spec.label} language server request failed.`;
+      const errorMessage =
+        typeof errorRecord.message === 'string'
+          ? errorRecord.message
+          : `${this.spec.label} language server request failed.`;
       pending.reject(new Error(errorMessage));
       return;
     }
@@ -749,10 +748,12 @@ export class LspManager {
   public async shutdown(): Promise<void> {
     const clients = Array.from(this.clients.values());
     this.clients.clear();
-    await Promise.allSettled(clients.map(async (clientPromise) => {
-      const client = await clientPromise;
-      await client.shutdown();
-    }));
+    await Promise.allSettled(
+      clients.map(async (clientPromise) => {
+        const client = await clientPromise;
+        await client.shutdown();
+      }),
+    );
   }
 
   private async getClientForFile(filePath: string): Promise<JsonRpcClient | null> {

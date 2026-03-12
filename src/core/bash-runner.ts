@@ -19,11 +19,7 @@ const chunkToString = (chunk: Buffer | string): string => {
   return typeof chunk === 'string' ? chunk : chunk.toString('utf8');
 };
 
-const appendByLine = (
-  value: string,
-  carry: string,
-  target: string[],
-): string => {
+const appendByLine = (value: string, carry: string, target: string[]): string => {
   const combined = carry + value;
   const lines = combined.replace(/\r/g, '').split('\n');
   const nextCarry = lines.pop() ?? '';
@@ -54,9 +50,15 @@ export class BashRunner {
         return;
       }
 
+      const filteredEnv = Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => !/(API_KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL)/i.test(key) || key === 'PATH',
+        ),
+      );
+
       const child = spawn('bash', ['-lc', command], {
         cwd: this.cwd,
-        env: process.env,
+        env: filteredEnv,
       });
 
       const stdoutLines: string[] = [];
@@ -125,9 +127,7 @@ export class BashRunner {
     const stdout = result.stdout.length > 0 ? result.stdout : `${DIM}(no stdout)${RESET}`;
     const stderr = result.stderr.length > 0 ? `${RED}${result.stderr}${RESET}` : '';
 
-    return stderr.length > 0
-      ? [header, badge, stdout, stderr].join('\n')
-      : [header, badge, stdout].join('\n');
+    return stderr.length > 0 ? [header, badge, stdout, stderr].join('\n') : [header, badge, stdout].join('\n');
   }
 }
 

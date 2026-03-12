@@ -4,6 +4,8 @@ export interface RetryConfig {
   maxDelayMs: number;
 }
 
+// TODO(security): Add request-level API rate limiting; current logic only retries after failures.
+
 export const DEFAULT_RETRY_CONFIG: RetryConfig = {
   maxRetries: 3,
   baseDelayMs: 1_000,
@@ -54,10 +56,7 @@ export const classifyError = (error: unknown): ErrorCategory => {
   return 'fatal';
 };
 
-export const computeBackoffMs = (
-  attempt: number,
-  config: RetryConfig = DEFAULT_RETRY_CONFIG,
-): number => {
+export const computeBackoffMs = (attempt: number, config: RetryConfig = DEFAULT_RETRY_CONFIG): number => {
   const jitter = Math.random() * 0.3 + 0.85;
   const delay = config.baseDelayMs * 2 ** attempt * jitter;
   return Math.min(delay, config.maxDelayMs);

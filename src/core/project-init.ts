@@ -68,11 +68,18 @@ const readContext = async () => {
   for await (const chunk of process.stdin) {
     input += chunk;
   }
-  return JSON.parse(input);
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
 };
 
 const main = async () => {
   const ctx = await readContext();
+  if (!ctx) {
+    return;
+  }
   const logPath = resolve(process.cwd(), '.ddudu', 'session-events.log');
   const line = JSON.stringify({
     event: ctx.event,
@@ -89,11 +96,18 @@ const TEMPLATE_AFTER_RESPONSE = `const readContext = async () => {
   for await (const chunk of process.stdin) {
     input += chunk;
   }
-  return JSON.parse(input);
+  try {
+    return JSON.parse(input);
+  } catch {
+    return null;
+  }
 };
 
 const main = async () => {
   const ctx = await readContext();
+  if (!ctx) {
+    return;
+  }
   const preview =
     typeof ctx.data?.response === 'string'
       ? ctx.data.response.replace(/\\s+/g, ' ').trim().slice(0, 120)
@@ -187,10 +201,7 @@ mcp:
 #       trust: ask
 `;
 
-export const buildProjectInstructionsTemplate = (
-  projectName: string,
-  createdDate: string,
-): string => {
+export const buildProjectInstructionsTemplate = (projectName: string, createdDate: string): string => {
   return `# Project Instructions
 
 <!-- Add project-specific instructions for ddudu here -->

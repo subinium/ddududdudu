@@ -1,5 +1,5 @@
-import type { NamedMode } from './types.js';
 import type { SpecialistRole } from './specialist-roles.js';
+import type { NamedMode } from './types.js';
 import type { WorkflowArtifactKind } from './workflow-state.js';
 
 export interface AgentRole {
@@ -106,9 +106,7 @@ export class TeamOrchestrator {
 
     this.leadId = leadAgents[0].id;
     this.workerIds = this.config.agents.filter((agent) => agent.role === 'worker').map((agent) => agent.id);
-    this.reviewerIds = this.config.agents
-      .filter((agent) => agent.role === 'reviewer')
-      .map((agent) => agent.id);
+    this.reviewerIds = this.config.agents.filter((agent) => agent.role === 'reviewer').map((agent) => agent.id);
     this.workUnitToAgentId = new Map(
       this.config.agents
         .filter((agent) => typeof agent.workUnitId === 'string' && agent.workUnitId.length > 0)
@@ -256,8 +254,12 @@ export class TeamOrchestrator {
 
     while (pending.size > 0 || inFlight.size > 0) {
       scheduleReadyWorkers();
+      if (inFlight.size === 0 && pending.size === 0) {
+        break;
+      }
       if (inFlight.size === 0) {
         this.ensureReadyWorkers(this.selectReadyWorkers(pending, completed), pending, completed);
+        continue;
       }
 
       const finished = await Promise.race(inFlight.values());
@@ -393,11 +395,7 @@ export class TeamOrchestrator {
     return workerId;
   }
 
-  private ensureReadyWorkers(
-    ready: string[],
-    pending: Set<string>,
-    completed: Set<string>,
-  ): string[] {
+  private ensureReadyWorkers(ready: string[], pending: Set<string>, completed: Set<string>): string[] {
     if (ready.length > 0) {
       return ready;
     }
@@ -456,20 +454,13 @@ export class TeamOrchestrator {
     return `Dependency outputs:\n${dependencyOutputs.join('\n\n')}`;
   }
 
-  private async runWorkerFromQueue(
-    workerId: string,
-    round: number,
-    priorOutput?: string,
-  ): Promise<string> {
+  private async runWorkerFromQueue(workerId: string, round: number, priorOutput?: string): Promise<string> {
     this.ensureNotAborted();
     this.agentStates.set(workerId, 'working');
 
     const queue = this.messageQueues.get(workerId);
     const taskIndex = queue?.findIndex((message) => message.type === 'task') ?? -1;
-    const assignedTask =
-      queue && taskIndex >= 0
-        ? queue.splice(taskIndex, 1)[0]
-        : undefined;
+    const assignedTask = queue && taskIndex >= 0 ? queue.splice(taskIndex, 1)[0] : undefined;
     const taskContent = assignedTask?.content ?? this.buildWorkerSubtask(workerId, round, priorOutput);
 
     const workerOutput = await this.simulateAgentOutput(workerId, taskContent, round);
@@ -597,16 +588,7 @@ export class TeamOrchestrator {
         : '';
     const readOnly = agent?.readOnly ? 'Constraint: stay read-only unless explicitly instructed otherwise.' : '';
 
-    return [
-      `Main task: ${this.activeTask}`,
-      label,
-      sharedContext,
-      brief,
-      deliverable,
-      criteria,
-      readOnly,
-      prior,
-    ]
+    return [`Main task: ${this.activeTask}`, label, sharedContext, brief, deliverable, criteria, readOnly, prior]
       .filter((part) => part.length > 0)
       .join('\n\n');
   }

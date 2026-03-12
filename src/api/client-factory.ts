@@ -64,11 +64,15 @@ const buildStreamAdapter = (
   messages: ApiMessage[],
   options: StreamOptions,
 ): AsyncGenerator<StreamEvent> => {
+  const MAX_QUEUE_SIZE = 2000;
   const queue: StreamEvent[] = [];
   let finished = false;
   let wake: (() => void) | null = null;
 
   const push = (event: StreamEvent): void => {
+    if (queue.length >= MAX_QUEUE_SIZE && event.type === 'text') {
+      queue.splice(0, Math.floor(MAX_QUEUE_SIZE / 4));
+    }
     queue.push(event);
     if (wake) {
       wake();

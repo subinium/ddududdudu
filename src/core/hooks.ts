@@ -80,7 +80,7 @@ export class HookRegistry {
 
     for (const result of results) {
       if (result.status === 'rejected') {
-        console.error(`[HookRegistry] Hook handler failed for event "${event}".`, result.reason);
+        console.error(`[HookRegistry] Hook handler failed during emit for event "${event}".`, result.reason);
       }
     }
   }

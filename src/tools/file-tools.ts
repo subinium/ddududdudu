@@ -1,5 +1,5 @@
 import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises';
-import { resolve, dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 
 import type { LspDocumentSymbol } from '../core/lsp-manager.js';
 import type { Tool, ToolContext } from './index.js';
@@ -20,7 +20,13 @@ const toPath = (cwd: string, value: unknown): string | null => {
     return null;
   }
 
-  return resolve(cwd, value);
+  const resolved = resolve(cwd, value);
+  const normalizedCwd = resolve(cwd);
+  if (!resolved.startsWith(normalizedCwd + '/') && resolved !== normalizedCwd) {
+    return null;
+  }
+
+  return resolved;
 };
 
 const parsePositiveInt = (value: unknown): number | null => {
@@ -55,11 +61,7 @@ const renderDiffSummary = (before: string, after: string): string => {
   return lines.length > 0 ? lines.join('\n') : 'no visible diff';
 };
 
-const clampRange = (
-  totalLines: number,
-  startLine: number,
-  endLine: number,
-): { startLine: number; endLine: number } => {
+const clampRange = (totalLines: number, startLine: number, endLine: number): { startLine: number; endLine: number } => {
   const clampedStart = Math.min(Math.max(1, startLine), Math.max(totalLines, 1));
   const clampedEnd = Math.min(Math.max(clampedStart, endLine), Math.max(totalLines, clampedStart));
   return {
@@ -68,11 +70,7 @@ const clampRange = (
   };
 };
 
-const renderNumberedLines = (
-  lines: string[],
-  startLine: number,
-  endLine: number,
-): string => {
+const renderNumberedLines = (lines: string[], startLine: number, endLine: number): string => {
   return lines
     .slice(startLine - 1, endLine)
     .map((line, index) => `${startLine + index}: ${line}`)
@@ -123,8 +121,7 @@ const resolveSymbolSelection = async (
       .map((symbol) => ({ symbol, score: symbolScore(query, symbol) }))
       .filter((entry) => entry.score > 0)
       .sort((left, right) => {
-        return right.score - left.score
-          || left.symbol.range.start.line - right.symbol.range.start.line;
+        return right.score - left.score || left.symbol.range.start.line - right.symbol.range.start.line;
       })[0];
 
     if (!match) {
@@ -224,27 +221,26 @@ export const readFileTool: Tool = {
 
       const content = buffer.toString('utf8');
       const lines = content.split('\n');
-      const around =
-        parsePositiveInt(args.before) === null && parsePositiveInt(args.after) === null
-          ? 3
-          : 0;
+      const around = parsePositiveInt(args.before) === null && parsePositiveInt(args.after) === null ? 3 : 0;
       const before = parsePositiveInt(args.before) ?? around;
       const after = parsePositiveInt(args.after) ?? around;
       const maxMatches = parsePositiveInt(args.maxMatches) ?? 3;
       const explicitStart = parsePositiveInt(args.startLine);
       const explicitEnd = parsePositiveInt(args.endLine);
-      const symbol = typeof args.symbol === 'string' && args.symbol.trim().length > 0
-        ? args.symbol.trim()
-        : null;
-      const match = typeof args.match === 'string' && args.match.trim().length > 0
-        ? args.match.trim()
-        : null;
+      const symbol = typeof args.symbol === 'string' && args.symbol.trim().length > 0 ? args.symbol.trim() : null;
+      const match = typeof args.match === 'string' && args.match.trim().length > 0 ? args.match.trim() : null;
 
       let rendered: string;
       let metadata: Record<string, unknown>;
 
       if (symbol) {
-        const selection = await resolveSymbolSelection(filePath, symbol, Math.max(before, after), lines.length, ctx.lsp);
+        const selection = await resolveSymbolSelection(
+          filePath,
+          symbol,
+          Math.max(before, after),
+          lines.length,
+          ctx.lsp,
+        );
         if (!selection) {
           return {
             output: `Could not resolve symbol "${symbol}" in ${filePath}`,
@@ -270,7 +266,7 @@ export const readFileTool: Tool = {
           };
         }
 
-        const requestedEnd = explicitEnd ?? (explicitStart + limit - 1);
+        const requestedEnd = explicitEnd ?? explicitStart + limit - 1;
         const range = clampRange(lines.length, explicitStart, requestedEnd);
         rendered = renderNumberedLines(lines, range.startLine, range.endLine);
         metadata = {
@@ -448,9 +444,7 @@ export const editFileTool: Tool = {
           if (endLine > lines.length) {
             return { output: `line range ${startLine}-${endLine} exceeds ${lines.length} lines`, isError: true };
           }
-          const replacement = mode === 'range'
-            ? (typeof args.newString === 'string' ? args.newString : '')
-            : '';
+          const replacement = mode === 'range' ? (typeof args.newString === 'string' ? args.newString : '') : '';
           const replacementLines = replacement.length > 0 ? replacement.split('\n') : [];
           lines.splice(startLine - 1, endLine - startLine + 1, ...replacementLines);
           updated = lines.join('\n');
@@ -515,11 +509,7 @@ export const listDirTool: Tool = {
       const entries = await readdir(targetPath, { withFileTypes: true });
       const output = entries
         .map((entry) => {
-          const type = entry.isDirectory()
-            ? 'dir'
-            : entry.isSymbolicLink()
-              ? 'symlink'
-              : 'file';
+          const type = entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'symlink' : 'file';
           return `${entry.name}\t${type}`;
         })
         .sort((a, b) => a.localeCompare(b))
