@@ -1,3 +1,5 @@
+import type { AugmentationContext, ResultAugmenter } from '../core/result-augmentation.js';
+import type { HookRegistry } from '../core/hooks.js';
 import type { ToolContext } from '../tools/index.js';
 import type { ToolRegistry } from '../tools/registry.js';
 
@@ -15,10 +17,17 @@ export interface ToolResultBlock {
   is_error?: boolean;
 }
 
+export interface ToolExecutionOptions {
+  augmenter?: ResultAugmenter;
+  augmentationContext?: AugmentationContext;
+  hooks?: HookRegistry;
+}
+
 export const executeToolCalls = async (
   blocks: ToolUseBlock[],
   registry: ToolRegistry,
   ctx: ToolContext,
+  options?: ToolExecutionOptions,
 ): Promise<ToolResultBlock[]> => {
   return Promise.all(
     blocks.map(async (block): Promise<ToolResultBlock> => {
@@ -32,8 +41,26 @@ export const executeToolCalls = async (
         };
       }
 
+      if (options?.hooks) {
+        await options.hooks.emit('beforeToolCall', { name: block.name, input: block.input });
+      }
+
       try {
-        const result = await tool.execute(block.input, ctx);
+        let result = await tool.execute(block.input, ctx);
+
+        if (options?.augmenter && options.augmentationContext) {
+          result = options.augmenter.augment(block.name, block.input, result, options.augmentationContext);
+        }
+
+        if (options?.hooks) {
+          await options.hooks.emit('afterToolCall', {
+            name: block.name,
+            input: block.input,
+            output: result.output,
+            isError: result.isError ?? false,
+          });
+        }
+
         return {
           type: 'tool_result',
           tool_use_id: block.id,
@@ -41,6 +68,15 @@ export const executeToolCalls = async (
           is_error: result.isError || undefined,
         };
       } catch (err: unknown) {
+        if (options?.hooks) {
+          await options.hooks.emit('afterToolCall', {
+            name: block.name,
+            input: block.input,
+            output: err instanceof Error ? err.message : String(err),
+            isError: true,
+          });
+        }
+
         return {
           type: 'tool_result',
           tool_use_id: block.id,

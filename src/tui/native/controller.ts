@@ -42,6 +42,7 @@ import { GitCheckpoint } from '../../core/git-checkpoint.js';
 import { ExecutionScheduler, type ExecutionSchedulerConfig } from '../../core/execution-scheduler.js';
 import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
+import { ResultAugmenter } from '../../core/result-augmentation.js';
 import { initializeProject } from '../../core/project-init.js';
 import { LspManager } from '../../core/lsp-manager.js';
 import { clearMemory, loadMemory, loadSelectedMemory, saveMemory, type MemoryScope } from '../../core/memory.js';
@@ -266,6 +267,12 @@ const FILE_MUTATION_TOOL_NAMES = new Set([
   'patch_apply',
   'write',
   'edit',
+]);
+const VERIFICATION_TOOL_NAMES = new Set([
+  'lint_runner',
+  'test_runner',
+  'build_runner',
+  'verify_changes',
 ]);
 
 const normalizeToolName = (name: string): string => name.trim().toLowerCase();
@@ -979,6 +986,9 @@ export class NativeBridgeController {
   private teamLastSummary: string | null = null;
   private readonly compactionEngine = new CompactionEngine();
   private readonly hookRegistry = new HookRegistry();
+  private readonly resultAugmenter = new ResultAugmenter();
+  private recentToolNames: string[] = [];
+  private pendingVerification = false;
   private readonly lspManager = new LspManager(process.cwd());
   private readonly remoteSessions = new Map<string, CliBackedSessionState>();
   private readonly backgroundCoordinator = new BackgroundCoordinator({
@@ -1473,6 +1483,9 @@ export class NativeBridgeController {
   public clearMessages(): void {
     this.state.messages = [];
     this.remoteSessions.clear();
+    this.resultAugmenter.reset();
+    this.recentToolNames = [];
+    this.pendingVerification = false;
     this.updateRemoteSessionState();
     this.scheduleStatePush();
   }
@@ -3802,15 +3815,38 @@ export class NativeBridgeController {
           sessionId: this.state.sessionId,
         });
 
-        if (!result.isError && FILE_MUTATION_TOOL_NAMES.has(normalizeToolName(block.name))) {
+        const normalizedName = normalizeToolName(block.name);
+        if (!result.isError && FILE_MUTATION_TOOL_NAMES.has(normalizedName)) {
           this.invalidateDerivedCaches({ changedFiles: true, git: true });
+          this.pendingVerification = true;
         }
+        if (!result.isError && VERIFICATION_TOOL_NAMES.has(normalizedName)) {
+          this.pendingVerification = false;
+        }
+
+        this.recentToolNames.push(block.name);
+        if (this.recentToolNames.length > 20) {
+          this.recentToolNames = this.recentToolNames.slice(-20);
+        }
+
+        const augmented = this.resultAugmenter.augment(
+          block.name,
+          block.input,
+          result,
+          {
+            recentToolNames: this.recentToolNames,
+            contextUsagePercent: Math.round((this.state.contextPercent ?? 0) * 100),
+            pendingVerification: this.pendingVerification,
+            availableSkills: Array.from(this.loadedSkills.keys()),
+            currentMode: this.state.mode ?? null,
+          },
+        );
 
         results[index] = {
           type: 'tool_result',
           tool_use_id: block.id,
-          content: result.output,
-          is_error: result.isError || undefined,
+          content: augmented.output,
+          is_error: augmented.isError || undefined,
         };
       } catch (error: unknown) {
         const message = serializeError(error);
