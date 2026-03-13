@@ -1,6 +1,6 @@
 import type { DelegationPurpose } from '../../core/delegation.js';
-import { planWorkAllocation, type WorkAllocationPlan } from '../../core/work-allocation.js';
 import type { NamedMode } from '../../core/types.js';
+import { planWorkAllocation, type WorkAllocationPlan } from '../../core/work-allocation.js';
 import { HARNESS_MODES } from '../shared/theme.js';
 
 export interface AutoRouteDecision {
@@ -20,28 +20,43 @@ export interface TeamExecutionPlanDraft {
 
 const normalizeSingleLine = (value: string): string => value.replace(/\s+/g, ' ').trim();
 
-export const classifyJennieAutoRoute = (
-  prompt: string,
-  availableModes: NamedMode[],
-): AutoRouteDecision => {
+export const classifyJennieAutoRoute = (prompt: string, availableModes: NamedMode[]): AutoRouteDecision => {
   const normalized = normalizeSingleLine(prompt);
   const lower = normalized.toLowerCase();
   const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
-  const allocation = availableModes.length > 0
-    ? planWorkAllocation(prompt, 'parallel', availableModes)
-    : null;
+  const allocation = availableModes.length > 0 ? planWorkAllocation(prompt, 'parallel', availableModes) : null;
   const unitCount = allocation?.units.length ?? 0;
   const readOnlyUnits = allocation?.units.filter((unit) => unit.readOnly).length ?? 0;
   const writeUnits = allocation?.units.filter((unit) => !unit.readOnly).length ?? 0;
 
-  const hasDesign = /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b|(?:디자인|레이아웃|타이포|접근성|색상|인터랙션)/u.test(lower);
-  const hasPlanning = /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b|(?:계획|플랜|설계|아키텍처|전략|로드맵|스펙)/u.test(lower);
-  const hasResearch = /\b(research|investigate|look into|survey|compare options|explore)\b|(?:리서치|조사|찾아|찾아줘|비교|탐색|분석해|알아봐)/u.test(lower);
-  const hasReview = /\b(review|audit|verify|validation|regression|risk|critic|critique)\b|(?:리뷰|검토|검증|감사|리스크|회귀)/u.test(lower);
-  const hasExecution = /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b|(?:구현|수정|고쳐|작성|편집|리팩터|패치|코드|변경)/u.test(lower);
-  const explicitTeam = /\b(team|multi[- ]agent|orchestrate|delegate|parallel|sequential|split (this|it) up|break (this|it) down)\b|(?:팀으로|서브에이전트|멀티 에이전트|병렬|동시에|나눠서|분담)/u.test(lower);
+  const hasDesign =
+    /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color|interaction)\b|(?:디자인|레이아웃|타이포|접근성|색상|인터랙션)/u.test(
+      lower,
+    );
+  const hasPlanning =
+    /\b(plan|planning|architecture|architect|strategy|roadmap|tradeoff|spec|design doc)\b|(?:계획|플랜|설계|아키텍처|전략|로드맵|스펙)/u.test(
+      lower,
+    );
+  const hasResearch =
+    /\b(research|investigate|look into|survey|compare options|explore)\b|(?:리서치|조사|찾아|찾아줘|비교|탐색|분석해|알아봐)/u.test(
+      lower,
+    );
+  const hasReview =
+    /\b(review|audit|verify|validation|regression|risk|critic|critique)\b|(?:리뷰|검토|검증|감사|리스크|회귀)/u.test(
+      lower,
+    );
+  const hasExecution =
+    /\b(implement|build|fix|write|edit|refactor|patch|ship|code|change)\b|(?:구현|수정|고쳐|작성|편집|리팩터|패치|코드|변경)/u.test(
+      lower,
+    );
+  const explicitTeam =
+    /\b(team|multi[- ]agent|orchestrate|delegate|parallel|sequential|split (this|it) up|break (this|it) down)\b|(?:팀으로|서브에이전트|멀티 에이전트|병렬|동시에|나눠서|분담)/u.test(
+      lower,
+    );
   const multiStep =
-    /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(lower) ||
+    /(\b(plan|research|review|design|implement|fix)\b.*\b(and|then|also)\b.*\b(plan|research|review|design|implement|fix)\b)/u.test(
+      lower,
+    ) ||
     /\b(end-to-end|from scratch|full flow|across the repo|whole project|entire codebase)\b/u.test(lower) ||
     normalized.split(/\n+/u).length > 1;
   const repoWide =
@@ -63,15 +78,14 @@ export const classifyJennieAutoRoute = (
     return {
       kind: 'team',
       strategy:
-        allocation?.suggestedStrategy
-        ?? (explicitTeam || (hasExecution && (hasPlanning || hasResearch || hasReview)) ? 'delegate' : 'parallel'),
+        allocation?.suggestedStrategy ??
+        (explicitTeam || (hasExecution && (hasPlanning || hasResearch || hasReview)) ? 'delegate' : 'parallel'),
       executionClass: shardableResearch ? 'research_fast' : 'managed',
-      reason:
-        explicitTeam
-          ? 'explicit orchestration request'
-          : shardableResearch
-            ? 'itemized research benefits from parallel comparison'
-            : 'broad repo-scale work benefits from specialist split',
+      reason: explicitTeam
+        ? 'explicit orchestration request'
+        : shardableResearch
+          ? 'itemized research benefits from parallel comparison'
+          : 'broad repo-scale work benefits from specialist split',
     };
   }
 
@@ -131,17 +145,25 @@ export const formatAutoRouteNotice = (decision: AutoRouteDecision): string => {
     return `Auto route · team ${decision.strategy ?? 'parallel'} · ${decision.reason}`;
   }
 
-  const modeLabel = decision.preferredMode
-    ? HARNESS_MODES[decision.preferredMode].label
-    : 'Auto';
+  const modeLabel = decision.preferredMode ? HARNESS_MODES[decision.preferredMode].label : 'Auto';
   const purpose = decision.purpose ?? 'general';
   return `Auto route · ${modeLabel} · ${purpose} · ${decision.reason}`;
 };
 
-export const shouldRunPlanningInterview = (
-  prompt: string,
-  decision: AutoRouteDecision,
-): boolean => {
+const hasHighSpecificity = (lower: string): boolean => {
+  const hasFilePath = /\b[\w-]+\.(ts|js|tsx|jsx|rs|py|yaml|json|toml|md|css|html)\b/u.test(lower);
+  const hasModuleName = /\b(src|lib|core|api|tui|mcp|auth|tools|test|bench)\//u.test(lower);
+  const hasTechName =
+    /\b(react|next|node|rust|python|typescript|express|postgres|redis|docker|graphql|grpc|websocket|oauth|jwt)\b/u.test(
+      lower,
+    );
+  const hasFunction = /\b[a-z][a-zA-Z]+\(\)/u.test(lower);
+  const hasSpecificAction =
+    /\b(add|remove|rename|move|extract|inline|split|merge|convert|migrate)\b.*\b(to|from|into|as)\b/u.test(lower);
+  return [hasFilePath, hasModuleName, hasTechName, hasFunction, hasSpecificAction].filter(Boolean).length >= 2;
+};
+
+export const shouldRunPlanningInterview = (prompt: string, decision: AutoRouteDecision): boolean => {
   if (decision.kind === 'direct') {
     return false;
   }
@@ -153,13 +175,16 @@ export const shouldRunPlanningInterview = (
   const normalized = normalizeSingleLine(prompt);
   const lower = normalized.toLowerCase();
   const wordCount = normalized.length > 0 ? normalized.split(/\s+/u).length : 0;
-  const hasExplicitConstraints =
-    /\b(keep|preserve|avoid|without|must|should not|don't|do not|only|exactly)\b/u.test(lower);
+  const hasExplicitConstraints = /\b(keep|preserve|avoid|without|must|should not|don't|do not|only|exactly)\b/u.test(
+    lower,
+  );
   const hasExplicitSuccessCriteria =
     /\b(done|success|pass|green|working|ship|finish|complete|acceptance|criteria)\b/u.test(lower);
   const clearlySmall =
     wordCount <= 10 &&
-    !/\b(across the repo|codebase|architecture|end-to-end|refactor|research|review|design)\b|(?:코드베이스|아키텍처|리서치|리뷰|디자인)/u.test(lower);
+    !/\b(across the repo|codebase|architecture|end-to-end|refactor|research|investigate|look into|survey|explore|review|design)\b|(?:코드베이스|아키텍처|리서치|조사|탐색|분석|알아봐|리뷰|디자인)/u.test(
+      lower,
+    );
 
   if (clearlySmall) {
     return false;
@@ -169,10 +194,11 @@ export const shouldRunPlanningInterview = (
     return wordCount >= 16 && (!hasExplicitConstraints || !hasExplicitSuccessCriteria);
   }
 
-  return (
-    decision.purpose === 'planning'
-    || decision.purpose === 'design'
-  );
+  if (decision.purpose === 'research' && !hasHighSpecificity(lower)) {
+    return true;
+  }
+
+  return decision.purpose === 'planning' || decision.purpose === 'design';
 };
 
 export const createTeamExecutionPlanDraft = (

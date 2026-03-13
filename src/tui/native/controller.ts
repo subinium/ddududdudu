@@ -1909,6 +1909,10 @@ export class NativeBridgeController {
     prompt: string,
     decision: AutoRouteDecision,
   ): Promise<{ prompt: string; artifact: WorkflowArtifact }> {
+    if (decision.purpose === 'research') {
+      return this.runResearchInterview(prompt, decision);
+    }
+
     const done = await this.promptUserQuestionValue(
       buildInputPrompt({
         question: 'Before I split this up: what should count as done?',
@@ -1938,7 +1942,7 @@ export class NativeBridgeController {
       buildInputPrompt({
         question: 'Any important constraints or things I should not break?',
         detail: 'Call out compatibility, UX, infra, or repo boundaries before I start.',
-        placeholder: 'Type constraints, risks, or “none”',
+        placeholder: 'Type constraints, risks, or "none"',
         submitLabel: 'Continue',
         options: [
           {
@@ -2020,6 +2024,126 @@ export class NativeBridgeController {
         `constraints: ${constraints || 'none specified'}`,
         `optimize_for: ${optimizeFor || 'balanced execution'}`,
         '</planning_brief>',
+      ].join('\n'),
+      artifact,
+    };
+  }
+
+  private async runResearchInterview(
+    prompt: string,
+    decision: AutoRouteDecision,
+  ): Promise<{ prompt: string; artifact: WorkflowArtifact }> {
+    const scope = await this.promptUserQuestionValue(
+      buildInputPrompt({
+        question: 'What aspect should I focus on?',
+        detail: 'Narrow the scope so I investigate the right area.',
+        placeholder: 'Describe the specific area or question',
+        submitLabel: 'Continue',
+        options: [
+          {
+            value: 'how it works internally',
+            label: 'Internal mechanics',
+            description: 'Trace the implementation — data flow, call chains, state transitions.',
+          },
+          {
+            value: 'available options and tradeoffs',
+            label: 'Options & tradeoffs',
+            description: 'Compare alternatives, surface pros/cons, recommend a path.',
+          },
+          {
+            value: 'current issues and risks',
+            label: 'Issues & risks',
+            description: 'Find bugs, performance gaps, security concerns, or missing edge cases.',
+          },
+          {
+            value: 'best practices and patterns',
+            label: 'Best practices',
+            description: 'Look up established patterns, conventions, and recommendations.',
+          },
+        ],
+      }),
+    );
+    const depth = await this.promptUserQuestionValue(
+      buildInputPrompt({
+        question: 'How deep should I go?',
+        detail: 'This controls how much time I spend vs. how detailed the results are.',
+        placeholder: 'Type the level of depth you need',
+        submitLabel: 'Continue',
+        options: [
+          {
+            value: 'quick summary',
+            label: 'Quick summary',
+            description: 'High-level overview in a few minutes.',
+          },
+          {
+            value: 'thorough analysis',
+            label: 'Thorough analysis',
+            description: 'Detailed investigation with evidence and examples.',
+          },
+          {
+            value: 'exhaustive deep-dive',
+            label: 'Exhaustive deep-dive',
+            description: 'Leave no stone unturned — full code reading, cross-references, docs.',
+          },
+        ],
+      }),
+    );
+    const deliverable = await this.promptUserQuestionValue(
+      buildInputPrompt({
+        question: 'What will you use the results for?',
+        detail: 'This shapes the output format — actionable recommendations vs. raw findings.',
+        placeholder: 'Describe what you plan to do next',
+        submitLabel: 'Start',
+        options: [
+          {
+            value: 'decide on an approach',
+            label: 'Decision-making',
+            description: 'I need to pick a direction — give me a recommendation.',
+          },
+          {
+            value: 'implement something',
+            label: 'Implementation',
+            description: 'I will build based on the findings — give me concrete details.',
+          },
+          {
+            value: 'just understand',
+            label: 'Understanding',
+            description: 'I want to learn — explain clearly with context.',
+          },
+        ],
+      }),
+    );
+
+    const summary = [
+      `Focus: ${scope || 'not specified'}`,
+      `Depth: ${depth || 'thorough analysis'}`,
+      `Deliverable: ${deliverable || 'not specified'}`,
+    ].join('\n');
+
+    const artifact = this.rememberArtifact({
+      kind: 'plan',
+      title: `${HARNESS_MODES['rosé'].label} research brief`,
+      summary: `${previewText(prompt, 120)} · ${previewText(summary, 220)}`,
+      payload: buildArtifactPayload({
+        kind: 'plan',
+        purpose: 'research',
+        prompt,
+        summary,
+        notes: [scope, depth, deliverable].filter((value): value is string => Boolean(value && value.trim())),
+      }),
+      source: 'session',
+      mode: 'rosé',
+    });
+
+    return {
+      prompt: [
+        prompt,
+        '',
+        '<research_brief>',
+        `focus: ${scope || 'not specified'}`,
+        `depth: ${depth || 'thorough analysis'}`,
+        `deliverable: ${deliverable || 'not specified'}`,
+        '</research_brief>',
       ].join('\n'),
       artifact,
     };
