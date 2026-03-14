@@ -980,7 +980,19 @@ export class NativeBridgeController {
   }
 
   public async boot(): Promise<void> {
-    this.config = await loadConfig();
+    const [config, providers, toolboxResult] = await Promise.all([
+      loadConfig(),
+      discoverAllProviders(),
+      discoverToolboxTools().catch((error: unknown) => {
+        this.appendSystemMessage(`[toolbox] ${serializeError(error)}`);
+        return [] as ReturnType<typeof discoverToolboxTools> extends Promise<infer T> ? T : never;
+      }),
+      loadHookFiles(process.cwd(), this.hookRegistry).catch((error: unknown) => {
+        this.appendSystemMessage(`[hooks] ${serializeError(error)}`);
+      }),
+    ]);
+
+    this.config = config;
     this.applyCostBudgetConfig();
     this.currentMode = clampMode(this.config.mode);
     this.state.mode = this.currentMode;
@@ -995,30 +1007,12 @@ export class NativeBridgeController {
       this.selectedModels[modeName] = HARNESS_MODES[modeName].model;
     }
 
-    const providers = await discoverAllProviders();
     this.availableProviders = normalizeProviders(providers);
     this.state.providers = this.buildProviderState();
 
     this.toolRegistry = new ToolRegistry();
-    try {
-      const toolboxTools = await discoverToolboxTools();
-      for (const tool of toolboxTools) {
-        this.toolRegistry.register(tool);
-      }
-    } catch (error: unknown) {
-      this.appendSystemMessage(`[toolbox] ${serializeError(error)}`);
-    }
-
-    try {
-      await this.initializeMcpTools();
-    } catch (error: unknown) {
-      this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
-    }
-    this.syncMcpState();
-    try {
-      await loadHookFiles(process.cwd(), this.hookRegistry);
-    } catch (error: unknown) {
-      this.appendSystemMessage(`[hooks] ${serializeError(error)}`);
+    for (const tool of toolboxResult) {
+      this.toolRegistry.register(tool);
     }
 
     this.sessionManager = new SessionManager(this.config.session.directory);
@@ -1047,10 +1041,16 @@ export class NativeBridgeController {
       this.appendSystemMessage(`[session] ${serializeError(error)}`);
     }
 
-    await this.refreshSystemPrompt();
+    await Promise.all([
+      this.refreshSystemPrompt(),
+      this.restoreEpistemicState(),
+      this.pollBackgroundJobs(),
+      this.initializeMcpTools().catch((error: unknown) => {
+        this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
+      }),
+    ]);
+    this.syncMcpState();
     this.reconfigureClient();
-    await this.restoreEpistemicState();
-    await this.pollBackgroundJobs();
     this.startBackgroundJobPolling();
     this.scheduleIdleWarmup();
     this.state.ready = true;
