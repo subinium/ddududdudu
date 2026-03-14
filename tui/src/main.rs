@@ -709,13 +709,14 @@ fn send_command(stdin: &mut ChildStdin, command: BridgeCommand) -> Result<()> {
 }
 
 fn poll_bridge(receiver: &Receiver<Result<BridgeEvent>>, app: &mut App, ui: &mut slt::Context) {
-    while let Ok(event) = receiver.try_recv() {
-        match event {
-            Ok(ev) => app.on_bridge_event(ev, ui.tick()),
-            Err(error) => {
+    for _ in 0..MAX_BRIDGE_EVENTS_PER_FRAME {
+        match receiver.try_recv() {
+            Ok(Ok(ev)) => app.on_bridge_event(ev, ui.tick()),
+            Ok(Err(error)) => {
                 app.fatal_error = Some(error.to_string());
                 break;
             }
+            Err(_) => break,
         }
     }
 }
@@ -965,6 +966,174 @@ fn validate_ask_user_input(prompt: &NativeAskUserState, value: &str) -> Option<S
     None
 }
 
+// ── Safe markdown renderer (replaces SLT's buggy markdown()) ────────
+//
+// SLT 0.6.1's parse_inline_segments uses char index as byte index,
+// which panics on multi-byte text (Korean, CJK) with inline formatting.
+// The panic leaves an unmatched BeginContainer on the command stack,
+// corrupting the entire layout for the rest of the frame.
+//
+// This implementation:
+// - Uses char_indices() for byte-safe string slicing
+// - Properly tracks code block state (```...```)
+// - Handles headings, lists, block quotes, horizontal rules
+// - Uses line_wrap() for styled inline text wrapping
+
+#[derive(Clone, Copy)]
+enum InlineStyle {
+    Normal,
+    Bold,
+    Code,
+}
+
+fn render_content(ui: &mut slt::Context, text: &str) {
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            if in_code_block {
+                let lang = trimmed.strip_prefix("```").unwrap_or("");
+                let label = if lang.is_empty() {
+                    "code".to_string()
+                } else {
+                    lang.to_string()
+                };
+                ui.styled(format!("  ┌─{label}─"), Style::new().fg(MUTED).dim());
+            } else {
+                ui.styled("  └──────", Style::new().fg(MUTED).dim());
+            }
+            continue;
+        }
+
+        if in_code_block {
+            ui.styled(format!("  │ {line}"), Style::new().fg(ACCENT));
+            continue;
+        }
+
+        if trimmed.is_empty() {
+            ui.text(" ");
+            continue;
+        }
+
+        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            ui.styled("─".repeat(40), Style::new().fg(MUTED).dim());
+            continue;
+        }
+
+        if let Some(heading) = trimmed.strip_prefix("### ") {
+            ui.styled(heading, Style::new().fg(ACCENT).bold());
+        } else if let Some(heading) = trimmed.strip_prefix("## ") {
+            ui.styled(heading, Style::new().fg(ACCENT_DIM).bold());
+        } else if let Some(heading) = trimmed.strip_prefix("# ") {
+            ui.styled(heading, Style::new().fg(ACCENT).bold());
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            ui.styled(format!("  ▏ {quote}"), Style::new().fg(MUTED).italic());
+        } else if let Some(item) = trimmed
+            .strip_prefix("- ")
+            .or_else(|| trimmed.strip_prefix("* "))
+        {
+            render_styled_line(ui, &format!("  • {item}"));
+        } else if trimmed.starts_with(|c: char| c.is_ascii_digit()) && trimmed.contains(". ") {
+            if let Some(dot_pos) = trimmed.find(". ") {
+                let num = &trimmed[..dot_pos];
+                let rest = &trimmed[dot_pos + 2..];
+                render_styled_line(ui, &format!("  {num}. {rest}"));
+            } else {
+                render_styled_line(ui, trimmed);
+            }
+        } else {
+            render_styled_line(ui, trimmed);
+        }
+    }
+}
+
+fn render_styled_line(ui: &mut slt::Context, text: &str) {
+    let segments = parse_inline_safe(text);
+    if segments.len() <= 1 {
+        ui.text_wrap(text).fg(FG);
+    } else {
+        ui.line_wrap(|ui| {
+            for (content, style) in &segments {
+                match style {
+                    InlineStyle::Normal => {
+                        ui.styled(content.clone(), Style::new().fg(FG));
+                    }
+                    InlineStyle::Bold => {
+                        ui.styled(content.clone(), Style::new().fg(FG).bold());
+                    }
+                    InlineStyle::Code => {
+                        ui.styled(content.clone(), Style::new().fg(ACCENT));
+                    }
+                }
+            }
+        });
+    }
+}
+
+/// Parse inline formatting using byte-safe char_indices().
+/// Handles **bold** and `code`. Avoids SLT's char-as-byte-index bug.
+fn parse_inline_safe(text: &str) -> Vec<(String, InlineStyle)> {
+    let mut segments: Vec<(String, InlineStyle)> = Vec::new();
+    let mut current = String::new();
+    let mut iter = text.char_indices().peekable();
+
+    while let Some((byte_pos, ch)) = iter.next() {
+        if ch == '*' {
+            if let Some(&(star2_byte, '*')) = iter.peek() {
+                let content_start = star2_byte + 1;
+                if content_start < text.len() {
+                    if let Some(rel_end) = text[content_start..].find("**") {
+                        if !current.is_empty() {
+                            segments.push((std::mem::take(&mut current), InlineStyle::Normal));
+                        }
+                        segments.push((
+                            text[content_start..content_start + rel_end].to_string(),
+                            InlineStyle::Bold,
+                        ));
+                        let skip_to = content_start + rel_end + 2;
+                        iter.next();
+                        while iter.peek().is_some_and(|&(bp, _)| bp < skip_to) {
+                            iter.next();
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
+        if ch == '`' {
+            let content_start = byte_pos + 1;
+            if content_start < text.len() {
+                if let Some(rel_end) = text[content_start..].find('`') {
+                    if !current.is_empty() {
+                        segments.push((std::mem::take(&mut current), InlineStyle::Normal));
+                    }
+                    segments.push((
+                        text[content_start..content_start + rel_end].to_string(),
+                        InlineStyle::Code,
+                    ));
+                    let skip_to = content_start + rel_end + 1;
+                    while iter.peek().is_some_and(|&(bp, _)| bp < skip_to) {
+                        iter.next();
+                    }
+                    continue;
+                }
+            }
+        }
+
+        current.push(ch);
+    }
+
+    if !current.is_empty() {
+        segments.push((current, InlineStyle::Normal));
+    }
+
+    segments
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -1056,7 +1225,7 @@ fn render_message(
         "assistant" => {
             ui.container().pb(1).col(|ui| {
                 ui.styled("▌ assistant", Style::new().fg(ACCENT).bold());
-                ui.markdown(&msg.content);
+                render_content(ui, &msg.content);
 
                 for tool in &msg.tool_calls {
                     let icon = match tool.status.as_str() {
@@ -1603,6 +1772,8 @@ fn parse_args() -> Result<(String, String)> {
     Ok((node_path, bridge_path))
 }
 
+const MAX_BRIDGE_EVENTS_PER_FRAME: usize = 64;
+
 fn main() -> Result<()> {
     let (node_path, bridge_path) = parse_args()?;
     let (mut child, mut stdin, receiver) = spawn_bridge(&node_path, &bridge_path)?;
@@ -1617,11 +1788,6 @@ fn main() -> Result<()> {
 
     let run_result = slt::run_with(config, |ui| {
         poll_bridge(&receiver, &mut app, ui);
-        // Render first so text_input processes Char events before handle_input
-        // checks Enter. This prevents the IME race condition where a composed
-        // CJK character and Enter arrive in the same frame — text_input inserts
-        // the character into the value first, then handle_input submits the
-        // updated value.
         render_app(ui, &mut app);
         if let Err(error) = handle_input(ui, &mut app, &mut stdin) {
             app.fatal_error = Some(error.to_string());
