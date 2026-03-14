@@ -21,11 +21,11 @@ const FG: Color = Color::Rgb(230, 230, 230);
 const USER_FG: Color = Color::Rgb(255, 255, 255);
 const ACCENT: Color = Color::Rgb(247, 167, 187);
 const ACCENT_DIM: Color = Color::Rgb(160, 110, 125);
-const SUCCESS: Color = Color::Rgb(46, 204, 64);
+const SUCCESS: Color = Color::Rgb(120, 200, 140);
 const ERROR: Color = Color::Rgb(255, 55, 55);
 const MUTED: Color = Color::Rgb(80, 80, 80);
 const TOOL_MUTED: Color = Color::Rgb(60, 60, 60);
-const ORANGE: Color = Color::Rgb(255, 165, 80);
+const ORANGE: Color = Color::Rgb(230, 160, 90);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const THINKING_FRAMES: &[&str] = &["◉", "◎", "○", "◎"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
@@ -436,7 +436,7 @@ impl App {
     fn new() -> Self {
         let state = initial_state();
         Self {
-            composer: TextInputState::with_placeholder("Ask ddudu... (/ for command)"),
+            composer: TextInputState::new(),
             korean_mode: false,
             hangul: HangulComposer::new(),
             hangul_preedit_len: 0,
@@ -753,6 +753,68 @@ fn handle_input(ui: &mut slt::Context, app: &mut App, stdin: &mut ChildStdin) ->
         }
     }
 
+    if app.korean_mode && app.state.ask_user.is_none() {
+        for c in ' '..='~' {
+            if ui.key_code(KeyCode::Char(c)) {
+                if let Some(jamo) = qwerty_to_jamo(c) {
+                    app.hangul.feed_jamo(jamo);
+                    flush_hangul_committed(app);
+                } else {
+                    app.hangul.commit_current();
+                    flush_hangul_committed(app);
+                    insert_char_at_cursor(&mut app.composer, c);
+                }
+            }
+        }
+
+        if ui.key_code(KeyCode::Backspace) {
+            if !app.hangul.backspace() {
+                delete_char_before_cursor(&mut app.composer);
+            }
+        }
+
+        if ui.key_code(KeyCode::Delete) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            let len = app.composer.value.chars().count();
+            if app.composer.cursor < len {
+                let start = char_to_byte_index(&app.composer.value, app.composer.cursor);
+                let end = char_to_byte_index(&app.composer.value, app.composer.cursor + 1);
+                app.composer.value.replace_range(start..end, "");
+            }
+        }
+
+        if ui.key_code(KeyCode::Left) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = app.composer.cursor.saturating_sub(1);
+        }
+
+        if ui.key_code(KeyCode::Right) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = (app.composer.cursor + 1).min(app.composer.value.chars().count());
+        }
+
+        if ui.key_code(KeyCode::Home) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = 0;
+        }
+
+        if ui.key_code(KeyCode::End) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = app.composer.value.chars().count();
+        }
+
+        if let Some(text) = ui.paste().map(|s| s.to_string()) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            insert_str_at_cursor(&mut app.composer, &text);
+        }
+    }
+
     if ui.key_code(KeyCode::PageUp) {
         app.auto_scroll = false;
         app.transcript_scroll.scroll_up(8);
@@ -760,7 +822,7 @@ fn handle_input(ui: &mut slt::Context, app: &mut App, stdin: &mut ChildStdin) ->
     if ui.key_code(KeyCode::PageDown) {
         app.transcript_scroll.scroll_down(8);
     }
-    if ui.key_code(KeyCode::End) {
+    if !app.korean_mode && ui.key_code(KeyCode::End) {
         app.auto_scroll = true;
         app.transcript_scroll.offset = usize::MAX;
     }
@@ -768,7 +830,11 @@ fn handle_input(ui: &mut slt::Context, app: &mut App, stdin: &mut ChildStdin) ->
         app.auto_scroll = false;
     }
 
-    if ui.key_code(KeyCode::Up) && app.state.ask_user.is_none() && app.composer.value.is_empty() {
+    if ui.key_code(KeyCode::Up)
+        && app.state.ask_user.is_none()
+        && app.composer.value.is_empty()
+        && app.hangul.preedit().is_none()
+    {
         if !app.prompt_history.is_empty() {
             if app.history_stash.is_none() {
                 app.history_stash = Some(app.composer.value.clone());
@@ -913,10 +979,8 @@ fn flush_hangul_committed(app: &mut App) {
 }
 
 fn commit_hangul_composition(app: &mut App) {
-    remove_hangul_preedit(app);
     app.hangul.commit_current();
-    let committed = app.hangul.result();
-    insert_str_at_cursor(&mut app.composer, &committed);
+    flush_hangul_committed(app);
     app.hangul.reset();
     app.hangul_preedit_len = 0;
 }
@@ -1064,162 +1128,8 @@ fn validate_ask_user_input(prompt: &NativeAskUserState, value: &str) -> Option<S
 // This implementation:
 // - Uses char_indices() for byte-safe string slicing
 // - Properly tracks code block state (```...```)
-// - Handles headings, lists, block quotes, horizontal rules
-// - Uses line_wrap() for styled inline text wrapping
-
-#[derive(Clone, Copy)]
-enum InlineStyle {
-    Normal,
-    Bold,
-    Code,
-}
-
 fn render_content(ui: &mut slt::Context, text: &str) {
-    let mut in_code_block = false;
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.starts_with("```") {
-            in_code_block = !in_code_block;
-            if in_code_block {
-                let lang = trimmed.strip_prefix("```").unwrap_or("");
-                let label = if lang.is_empty() {
-                    "code".to_string()
-                } else {
-                    lang.to_string()
-                };
-                ui.styled(format!("  ┌─{label}─"), Style::new().fg(MUTED).dim());
-            } else {
-                ui.styled("  └──────", Style::new().fg(MUTED).dim());
-            }
-            continue;
-        }
-
-        if in_code_block {
-            ui.styled(format!("  │ {line}"), Style::new().fg(ACCENT));
-            continue;
-        }
-
-        if trimmed.is_empty() {
-            ui.text(" ");
-            continue;
-        }
-
-        if trimmed == "---" || trimmed == "***" || trimmed == "___" {
-            ui.styled("─".repeat(40), Style::new().fg(MUTED).dim());
-            continue;
-        }
-
-        if let Some(heading) = trimmed.strip_prefix("### ") {
-            ui.styled(heading, Style::new().fg(ACCENT).bold());
-        } else if let Some(heading) = trimmed.strip_prefix("## ") {
-            ui.styled(heading, Style::new().fg(ACCENT_DIM).bold());
-        } else if let Some(heading) = trimmed.strip_prefix("# ") {
-            ui.styled(heading, Style::new().fg(ACCENT).bold());
-        } else if let Some(quote) = trimmed.strip_prefix("> ") {
-            ui.styled(format!("  ▏ {quote}"), Style::new().fg(MUTED).italic());
-        } else if let Some(item) = trimmed
-            .strip_prefix("- ")
-            .or_else(|| trimmed.strip_prefix("* "))
-        {
-            render_styled_line(ui, &format!("  • {item}"));
-        } else if trimmed.starts_with(|c: char| c.is_ascii_digit()) && trimmed.contains(". ") {
-            if let Some(dot_pos) = trimmed.find(". ") {
-                let num = &trimmed[..dot_pos];
-                let rest = &trimmed[dot_pos + 2..];
-                render_styled_line(ui, &format!("  {num}. {rest}"));
-            } else {
-                render_styled_line(ui, trimmed);
-            }
-        } else {
-            render_styled_line(ui, trimmed);
-        }
-    }
-}
-
-fn render_styled_line(ui: &mut slt::Context, text: &str) {
-    let segments = parse_inline_safe(text);
-    if segments.len() <= 1 {
-        ui.text_wrap(text).fg(FG);
-    } else {
-        ui.line_wrap(|ui| {
-            for (content, style) in &segments {
-                match style {
-                    InlineStyle::Normal => {
-                        ui.styled(content.clone(), Style::new().fg(FG));
-                    }
-                    InlineStyle::Bold => {
-                        ui.styled(content.clone(), Style::new().fg(FG).bold());
-                    }
-                    InlineStyle::Code => {
-                        ui.styled(content.clone(), Style::new().fg(ACCENT));
-                    }
-                }
-            }
-        });
-    }
-}
-
-/// Parse inline formatting using byte-safe char_indices().
-/// Handles **bold** and `code`. Avoids SLT's char-as-byte-index bug.
-fn parse_inline_safe(text: &str) -> Vec<(String, InlineStyle)> {
-    let mut segments: Vec<(String, InlineStyle)> = Vec::new();
-    let mut current = String::new();
-    let mut iter = text.char_indices().peekable();
-
-    while let Some((byte_pos, ch)) = iter.next() {
-        if ch == '*' {
-            if let Some(&(star2_byte, '*')) = iter.peek() {
-                let content_start = star2_byte + 1;
-                if content_start < text.len() {
-                    if let Some(rel_end) = text[content_start..].find("**") {
-                        if !current.is_empty() {
-                            segments.push((std::mem::take(&mut current), InlineStyle::Normal));
-                        }
-                        segments.push((
-                            text[content_start..content_start + rel_end].to_string(),
-                            InlineStyle::Bold,
-                        ));
-                        let skip_to = content_start + rel_end + 2;
-                        iter.next();
-                        while iter.peek().is_some_and(|&(bp, _)| bp < skip_to) {
-                            iter.next();
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if ch == '`' {
-            let content_start = byte_pos + 1;
-            if content_start < text.len() {
-                if let Some(rel_end) = text[content_start..].find('`') {
-                    if !current.is_empty() {
-                        segments.push((std::mem::take(&mut current), InlineStyle::Normal));
-                    }
-                    segments.push((
-                        text[content_start..content_start + rel_end].to_string(),
-                        InlineStyle::Code,
-                    ));
-                    let skip_to = content_start + rel_end + 1;
-                    while iter.peek().is_some_and(|&(bp, _)| bp < skip_to) {
-                        iter.next();
-                    }
-                    continue;
-                }
-            }
-        }
-
-        current.push(ch);
-    }
-
-    if !current.is_empty() {
-        segments.push((current, InlineStyle::Normal));
-    }
-
-    segments
+    ui.markdown(text);
 }
 
 // Hangul Syllable Composition (Unicode §3.12)
@@ -1573,12 +1483,12 @@ fn render_app(ui: &mut slt::Context, app: &mut App) {
             ui.container()
                 .w(sidebar_width)
                 .bg(SIDEBAR_BG)
-                .border(Border::Rounded)
+                .border(Border::Single)
                 .border_left(true)
                 .border_top(false)
                 .border_bottom(false)
                 .border_right(false)
-                .border_style(Style::new().fg(MUTED))
+                .border_style(Style::new().fg(ACCENT_DIM))
                 .col(|ui| {
                     render_sidebar(ui, app, (sidebar_width as usize).saturating_sub(4));
                 });
@@ -1646,13 +1556,15 @@ fn render_message(
                         "error" | "failed" => ERROR,
                         _ => TOOL_MUTED,
                     };
-                    let summary = if tool.summary.trim().is_empty() {
-                        tool.name.clone()
+                    let tool_display = capitalize_tool_name(&tool.name);
+                    let detail = extract_tool_detail(&tool.summary);
+                    let label = if detail.is_empty() {
+                        tool_display
                     } else {
-                        format!("{}: {}", tool.name, truncate(&tool.summary, 70))
+                        format!("{} {}", tool_display, detail)
                     };
                     ui.styled(
-                        format!("  {} {}", icon, summary),
+                        truncate(&format!("  {} {}", icon, label), 70),
                         Style::new().fg(color).dim(),
                     );
                 }
@@ -1699,52 +1611,145 @@ fn render_welcome(ui: &mut slt::Context, state: &NativeTuiState) {
     } else {
         0
     };
-    let avail = term_w.saturating_sub(sidebar_w + 2);
-    let splash = if avail >= 100 {
+    let avail = term_w.saturating_sub(sidebar_w + 4);
+    let splash = if avail >= 102 {
         SPLASH_FULL
-    } else if avail >= 50 {
+    } else if avail >= 52 {
         SPLASH_COMPACT
     } else {
         &[]
     };
-    ui.container().center().col(|ui| {
-        if !splash.is_empty() {
-            ui.col(|ui| {
-                for line in splash {
-                    ui.styled((*line).to_string(), Style::new().fg(ACCENT_DIM));
-                }
-            });
-            ui.text("");
+    let splash_w = splash.iter().map(|l| l.len()).max().unwrap_or(0);
+    let pad = if splash_w > 0 {
+        avail.saturating_sub(splash_w) / 2
+    } else {
+        0
+    };
+    let prefix: String = " ".repeat(pad);
+
+    if !splash.is_empty() {
+        for line in splash {
+            ui.styled(format!("{}{}", prefix, line), Style::new().fg(ACCENT_DIM));
         }
+        ui.text("");
+    }
+
+    let ver = format!("ddudu v{}", state.version);
+    let ver_pad = " ".repeat(avail.saturating_sub(ver.len()) / 2);
+    ui.styled(
+        format!("{}{}", ver_pad, ver),
+        Style::new().fg(ACCENT).bold(),
+    );
+
+    if let Some(cwd) = state.cwd.rsplit('/').next() {
+        let cwd_str = format!("📁 {}", cwd);
+        let cwd_pad = " ".repeat(avail.saturating_sub(cwd_str.chars().count()) / 2);
         ui.styled(
-            format!("ddudu v{}", state.version),
-            Style::new().fg(ACCENT).bold(),
+            format!("{}{}", cwd_pad, cwd_str),
+            Style::new().fg(MUTED).dim(),
         );
-        ui.styled(
-            "Type a prompt and press Enter. / for commands.",
-            Style::new().fg(MUTED).italic(),
-        );
-        if let Some(cwd) = state.cwd.rsplit('/').next() {
-            ui.styled(format!("📁 {}", cwd), Style::new().fg(MUTED).dim());
-        }
-    });
+    }
     ui.spacer();
+}
+
+fn capitalize_tool_name(name: &str) -> String {
+    let base = name.trim_end_matches("_tool").trim_end_matches("Tool");
+    let mut chars = base.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+fn extract_tool_detail(summary: &str) -> String {
+    let s = summary.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for word in s.split_whitespace() {
+        if word.contains('/') || (word.contains('.') && word.len() > 2) {
+            let path = word.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+            });
+            if let Some(fname) = path.rsplit('/').next() {
+                if !fname.is_empty() {
+                    parts.push(fname.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if parts.is_empty() {
+        truncate(s, 50).to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn context_bar_color(pct: f64) -> Color {
+    if pct < 60.0 {
+        ACCENT_DIM
+    } else if pct < 80.0 {
+        ORANGE
+    } else {
+        ERROR
+    }
+}
+
+fn format_tokens_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn shorten_model(model: &str) -> &str {
+    model
+        .rsplit_once('/')
+        .map(|(_, s)| s)
+        .or_else(|| model.rsplit_once(':').map(|(_, s)| s))
+        .unwrap_or(model)
 }
 
 fn render_status_line(ui: &mut slt::Context, app: &App) {
     let state = &app.state;
     let mode = current_mode_label(state);
-    let context = format!("{:.0}%", state.context_percent.clamp(0.0, 100.0));
+    let pct = state.context_percent.clamp(0.0, 100.0);
+    let bar_color = context_bar_color(pct);
 
     ui.container().h(1).px(1).bg(BG).row(|ui| {
         ui.styled(mode, Style::new().fg(ACCENT).bold());
         ui.styled(" · ", Style::new().fg(MUTED));
-        ui.styled(state.provider.clone(), Style::new().fg(FG));
+        ui.styled(shorten_model(&state.model), Style::new().fg(ACCENT_DIM));
+
+        if let Some(est) = &state.request_estimate {
+            let cost = est.total as f64 / 1_000_000.0 * 15.0;
+            ui.styled(" · ", Style::new().fg(MUTED));
+            ui.styled(format!("${:.2}", cost), Style::new().fg(ACCENT_DIM));
+        }
+
         ui.styled(" · ", Style::new().fg(MUTED));
-        ui.styled(state.model.clone(), Style::new().fg(ACCENT_DIM));
+        let filled = (pct / 10.0) as usize;
+        let bar: String = "█".repeat(filled.min(10)) + &"░".repeat(10_usize.saturating_sub(filled));
+        ui.styled(bar, Style::new().fg(bar_color));
+        ui.styled(format!("{:.0}%", pct), Style::new().fg(bar_color));
+
+        if let Some(git_state) = &state.git {
+            if let Some(branch) = &git_state.branch {
+                ui.styled(" · ", Style::new().fg(MUTED));
+                ui.styled(format!("⎇{}", branch), Style::new().fg(FG));
+                if git_state.has_uncommitted {
+                    ui.styled("●", Style::new().fg(ORANGE));
+                }
+            }
+        }
+
         ui.spacer();
-        ui.styled(format!("ctx {}", context), Style::new().fg(ORANGE));
-        ui.styled(" · ", Style::new().fg(MUTED));
+
         if state.playing_with_fire {
             ui.text("🔥").fg(ERROR);
         } else {
@@ -1780,93 +1785,40 @@ fn render_status_line(ui: &mut slt::Context, app: &App) {
 fn render_composer(ui: &mut slt::Context, app: &mut App) {
     ui.container().bg(COMPOSER_BG).px(1).pt(1).col(|ui| {
         if app.korean_mode {
-            // Preedit stays in value so text_input renders it (visible to user).
-            // Save state WITH preedit before text_input processes events.
-            let prev_value = app.composer.value.clone();
-            let prev_cursor = app.composer.cursor;
-            let prev_preedit = app.hangul_preedit_len;
+            // Bypass text_input: SLT couples event+render in one call, causing
+            // 1-frame raw ASCII flicker on every Korean keystroke. Instead we
+            // register_focusable() + render manually, handle keys in handle_input().
+            let focused = ui.register_focusable();
 
-            ui.text_input(&mut app.composer);
+            let value = &app.composer.value;
+            let cursor_pos = app.composer.cursor;
 
-            let post_value = app.composer.value.clone();
-            let post_cursor = app.composer.cursor;
-            let prev_len = prev_value.chars().count();
-            let post_len = post_value.chars().count();
-
-            if post_len > prev_len {
-                // text_input inserted char(s) at prev_cursor (before preedit).
-                let num_inserted = post_len - prev_len;
-                let inserted: Vec<char> = post_value
-                    .chars()
-                    .skip(prev_cursor)
-                    .take(num_inserted)
-                    .collect();
-
-                // Restore clean value: strip both inserted chars and old preedit.
-                let before: String = prev_value.chars().take(prev_cursor).collect();
-                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
-                app.composer.value = format!("{}{}", before, after);
-                app.composer.cursor = prev_cursor;
-                app.hangul_preedit_len = 0;
-
-                for ch in inserted {
-                    if let Some(jamo) = qwerty_to_jamo(ch) {
-                        app.hangul.feed_jamo(jamo);
-                    } else {
-                        app.hangul.commit_current();
-                        flush_hangul_committed(app);
-                        insert_char_at_cursor(&mut app.composer, ch);
-                    }
-                }
-                flush_hangul_committed(app);
-            } else if post_len < prev_len {
-                // Backspace or Delete.
-                let before: String = prev_value.chars().take(prev_cursor).collect();
-                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
-                app.composer.value = format!("{}{}", before, after);
-                app.composer.cursor = prev_cursor;
-                app.hangul_preedit_len = 0;
-
-                if post_cursor < prev_cursor {
-                    if !app.hangul.backspace() {
-                        delete_char_before_cursor(&mut app.composer);
-                    }
-                }
-            } else if post_cursor != prev_cursor {
-                // Cursor moved (arrow/Home/End) — commit composition.
-                let before: String = prev_value.chars().take(prev_cursor).collect();
-                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
-                app.composer.value = format!("{}{}", before, after);
-                app.composer.cursor = prev_cursor;
-                app.hangul_preedit_len = 0;
-
-                app.hangul.commit_current();
-                flush_hangul_committed(app);
-                app.hangul.reset();
-
-                let clean_len = app.composer.value.chars().count();
-                if post_cursor > prev_cursor {
-                    app.composer.cursor = (app.composer.cursor + 1).min(clean_len);
+            if value.is_empty() && app.hangul.preedit().is_none() {
+                if focused {
+                    ui.styled("▎", Style::new().fg(ACCENT_DIM));
                 } else {
-                    app.composer.cursor = app.composer.cursor.saturating_sub(1);
+                    ui.styled(" ", Style::new());
                 }
             } else {
-                // No change — strip old preedit for clean reinsertion.
-                if prev_preedit > 0 {
-                    let before: String = prev_value.chars().take(prev_cursor).collect();
-                    let after: String =
-                        prev_value.chars().skip(prev_cursor + prev_preedit).collect();
-                    app.composer.value = format!("{}{}", before, after);
-                    app.hangul_preedit_len = 0;
-                }
-            }
-
-            // Re-insert current preedit at cursor.
-            app.hangul_preedit_len = 0;
-            if let Some(p) = app.hangul.preedit() {
-                let byte_pos = char_to_byte_index(&app.composer.value, app.composer.cursor);
-                app.composer.value.insert(byte_pos, p);
-                app.hangul_preedit_len = 1;
+                let before: String = value.chars().take(cursor_pos).collect();
+                let after: String = value.chars().skip(cursor_pos).collect();
+                ui.line_wrap(|ui| {
+                    if !before.is_empty() {
+                        ui.styled(before, Style::new().fg(FG));
+                    }
+                    if let Some(p) = app.hangul.preedit() {
+                        ui.styled(
+                            p.to_string(),
+                            Style::new().fg(BG).bg(ACCENT),
+                        );
+                        ui.styled("▎", Style::new().fg(COMPOSER_BG));
+                    } else if focused {
+                        ui.styled("▎", Style::new().fg(ACCENT_DIM));
+                    }
+                    if !after.is_empty() {
+                        ui.styled(after, Style::new().fg(FG));
+                    }
+                });
             }
         } else {
             if app.hangul_preedit_len > 0 {
@@ -1903,236 +1855,173 @@ fn render_composer(ui: &mut slt::Context, app: &mut App) {
 
 fn render_sidebar(ui: &mut slt::Context, app: &mut App, max_width: usize) {
     let sidebar_max = max_width.max(16);
-    let jobs = &app.state.background_jobs;
-    let todos = &app.state.todos;
-    let agent_activities = &app.state.agent_activities;
-    let artifacts = &app.state.artifacts;
-    let context_preview = app
-        .state
-        .context_preview
-        .as_deref()
-        .unwrap_or("(no context preview)");
-    let providers = &app.state.providers;
-    let mcp = &app.state.mcp;
-    let lsp = &app.state.lsp;
-    let git = &app.state.git;
-    let workspace = &app.state.workspace;
-    let verification = &app.state.verification;
-    let team_strategy = &app.state.team_run_strategy;
-    let team_task = &app.state.team_run_task;
+    let pct = app.state.context_percent.clamp(0.0, 100.0);
+    let bar_w = sidebar_max.saturating_sub(8);
+    let filled = ((pct / 100.0) * bar_w as f64) as usize;
+    let bar_color = context_bar_color(pct);
 
     let scroll = &mut app.sidebar_scroll;
     ui.scrollable(scroll).p(1).col(|ui| {
-        ui.col_gap(1, |ui| {
-            ui.container()
-                .border(Border::Rounded)
-                .title_styled("JOBS", Style::new().fg(ACCENT).bold())
-                .p(1)
-                .col(|ui| {
-                    if jobs.is_empty() {
-                        ui.styled("(no background jobs)", Style::new().fg(MUTED).dim());
-                    } else {
-                        for job in jobs.iter().take(8) {
-                            let icon = match job.status.as_str() {
-                                "done" => "✓",
-                                "error" => "✗",
-                                "cancelled" => "•",
-                                _ => {
-                                    SPINNER_FRAMES
-                                        [((ui.tick() / 6) as usize) % SPINNER_FRAMES.len()]
-                                }
-                            };
-                            ui.styled(
-                                truncate(&format!("{} {}", icon, job.label), sidebar_max),
-                                Style::new().fg(FG),
-                            );
-                        }
-                    }
-                });
+        ui.styled("• CONTEXT", Style::new().fg(ACCENT).bold());
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_w.saturating_sub(filled));
+        ui.styled(format!("  {} {:.0}%", bar, pct), Style::new().fg(bar_color));
+        ui.styled(
+            truncate(
+                &format!(
+                    "  {} / {} tokens",
+                    format_tokens_short(app.state.context_tokens),
+                    format_tokens_short(app.state.context_limit)
+                ),
+                sidebar_max,
+            ),
+            Style::new().fg(MUTED),
+        );
+        if let Some(est) = &app.state.request_estimate {
+            ui.styled(
+                truncate(
+                    &format!(
+                        "  sys:{}  hist:{}  tools:{}",
+                        format_tokens_short(est.system),
+                        format_tokens_short(est.history),
+                        format_tokens_short(est.tools)
+                    ),
+                    sidebar_max,
+                ),
+                Style::new().fg(MUTED).dim(),
+            );
+        }
+        ui.text("");
 
-            ui.container()
-                .border(Border::Rounded)
-                .title_styled("PLAN", Style::new().fg(ACCENT).bold())
-                .p(1)
-                .col(|ui| {
-                    if todos.is_empty() {
-                        ui.styled("(no todo items)", Style::new().fg(MUTED).dim());
-                    } else {
-                        for item in todos.iter().take(8) {
-                            let icon = match item.status.as_str() {
-                                "completed" | "done" => "✓",
-                                "in_progress" => "▸",
-                                "cancelled" => "×",
-                                _ => "·",
-                            };
-                            ui.styled(
-                                truncate(&format!("{} {}", icon, item.step), sidebar_max),
-                                Style::new().fg(FG),
-                            );
-                        }
-                    }
-                });
-
-            if !agent_activities.is_empty() {
-                ui.container()
-                    .border(Border::Rounded)
-                    .title_styled("AGENTS", Style::new().fg(ACCENT).bold())
-                    .p(1)
-                    .col(|ui| {
-                        for agent in agent_activities.iter().take(6) {
-                            let icon = match agent.status.as_str() {
-                                "done" | "completed" => "✓",
-                                "running" => {
-                                    SPINNER_FRAMES
-                                        [((ui.tick() / 6) as usize) % SPINNER_FRAMES.len()]
-                                }
-                                "error" | "failed" => "✗",
-                                _ => "·",
-                            };
-                            ui.styled(
-                                truncate(&format!("{} {}", icon, agent.label), sidebar_max),
-                                Style::new().fg(FG),
-                            );
-                        }
-                    });
-            }
-
-            if !artifacts.is_empty() {
-                ui.container()
-                    .border(Border::Rounded)
-                    .title_styled("ARTIFACTS", Style::new().fg(ACCENT).bold())
-                    .p(1)
-                    .col(|ui| {
-                        for art in artifacts.iter().take(4) {
-                            ui.styled(
-                                truncate(&format!("{}: {}", art.kind, art.title), sidebar_max),
-                                Style::new().fg(FG),
-                            );
-                        }
-                    });
-            }
-
-            ui.container()
-                .border(Border::Rounded)
-                .title_styled("CONTEXT", Style::new().fg(ACCENT).bold())
-                .p(1)
-                .col(|ui| {
+        if let Some(git_state) = &app.state.git {
+            if !git_state.changed_files.is_empty() {
+                ui.styled(
+                    format!("• FILES ({})", git_state.changed_files.len()),
+                    Style::new().fg(ACCENT).bold(),
+                );
+                for (i, file) in git_state.changed_files.iter().take(8).enumerate() {
+                    let _ = i;
                     ui.styled(
-                        truncate(
-                            &format!(
-                                "tokens {}/{} ({:.1}%)",
-                                app.state.context_tokens,
-                                app.state.context_limit,
-                                app.state.context_percent
-                            ),
-                            sidebar_max,
-                        ),
-                        Style::new().fg(ORANGE),
+                        truncate(&format!("  │ {}", file), sidebar_max),
+                        Style::new().fg(FG),
                     );
+                }
+                let remaining = git_state.changed_files.len().saturating_sub(8);
+                if remaining > 0 {
                     ui.styled(
-                        truncate(context_preview, sidebar_max.saturating_mul(2)),
+                        format!("  │ +{} more", remaining),
                         Style::new().fg(MUTED).dim(),
-                    )
-                    .wrap();
-                });
-
-            ui.container()
-                .border(Border::Rounded)
-                .title_styled("SYSTEMS", Style::new().fg(ACCENT).bold())
-                .p(1)
-                .col(|ui| {
-                    if let Some(ws) = workspace {
-                        ui.styled(truncate(&ws.label, sidebar_max), Style::new().fg(FG));
-                        ui.styled(
-                            truncate(&ws.path, sidebar_max),
-                            Style::new().fg(MUTED).dim(),
-                        );
-                    }
-                    if !providers.is_empty() {
-                        for provider in providers {
-                            let icon = if provider.available { "●" } else { "○" };
-                            let color = if provider.available { SUCCESS } else { MUTED };
-                            ui.styled(
-                                truncate(&format!("{} {}", icon, provider.name), sidebar_max),
-                                Style::new().fg(color),
-                            );
-                        }
-                    }
-                    if let Some(mcp_state) = mcp {
-                        ui.styled(
-                            truncate(
-                                &format!(
-                                    "mcp: {}/{} servers, {} tools",
-                                    mcp_state.connected_servers,
-                                    mcp_state.configured_servers,
-                                    mcp_state.tool_count
-                                ),
-                                sidebar_max,
-                            ),
-                            Style::new().fg(FG),
-                        );
-                    }
-                    if let Some(lsp_state) = lsp {
-                        ui.styled(
-                            truncate(
-                                &format!(
-                                    "lsp: {}/{}",
-                                    lsp_state.connected_servers, lsp_state.available_servers
-                                ),
-                                sidebar_max,
-                            ),
-                            Style::new().fg(FG),
-                        );
-                    }
-                    if let Some(git_state) = git {
-                        if let Some(branch) = &git_state.branch {
-                            ui.styled(
-                                truncate(&format!("git: {}", branch), sidebar_max),
-                                Style::new().fg(FG),
-                            );
-                        }
-                        ui.styled(
-                            truncate(
-                                &format!(
-                                    "  {} changed, {} staged",
-                                    git_state.changed_file_count, git_state.staged_file_count
-                                ),
-                                sidebar_max,
-                            ),
-                            Style::new().fg(MUTED),
-                        );
-                    }
-                    if let Some(v) = verification {
-                        let color = if v.status == "passed" {
-                            SUCCESS
-                        } else if v.status == "failed" {
-                            ERROR
-                        } else {
-                            ORANGE
-                        };
-                        ui.styled(
-                            truncate(&format!("verify: {}", v.status), sidebar_max),
-                            Style::new().fg(color),
-                        );
-                    }
-                });
-
-            if let Some(strategy) = team_strategy {
-                ui.container()
-                    .border(Border::Rounded)
-                    .title_styled("TEAM RUN", Style::new().fg(ACCENT).bold())
-                    .p(1)
-                    .col(|ui| {
-                        ui.styled(
-                            truncate(&format!("strategy: {}", strategy), sidebar_max),
-                            Style::new().fg(FG),
-                        );
-                        if let Some(task) = team_task {
-                            ui.text_wrap(truncate(task, sidebar_max)).fg(MUTED).dim();
-                        }
-                    });
+                    );
+                }
+                ui.text("");
             }
-        });
+        }
+
+        if !app.state.todos.is_empty() {
+            ui.styled("• PLAN", Style::new().fg(ACCENT).bold());
+            for item in app.state.todos.iter().take(8) {
+                let icon = match item.status.as_str() {
+                    "completed" | "done" => "✓",
+                    "in_progress" => "▸",
+                    "cancelled" => "×",
+                    _ => "·",
+                };
+                ui.styled(
+                    truncate(&format!("  │ {} {}", icon, item.step), sidebar_max),
+                    Style::new().fg(FG),
+                );
+            }
+            ui.text("");
+        }
+
+        let has_agents =
+            !app.state.agent_activities.is_empty() || !app.state.background_jobs.is_empty();
+        if has_agents {
+            ui.styled("• AGENTS", Style::new().fg(ACCENT).bold());
+            let tick = ui.tick();
+            for agent in app.state.agent_activities.iter().take(4) {
+                let icon = match agent.status.as_str() {
+                    "done" | "completed" => "✓",
+                    "running" => SPINNER_FRAMES[((tick / 6) as usize) % SPINNER_FRAMES.len()],
+                    "error" | "failed" => "✗",
+                    _ => "·",
+                };
+                ui.styled(
+                    truncate(&format!("  │ {} {}", icon, agent.label), sidebar_max),
+                    Style::new().fg(FG),
+                );
+            }
+            for job in app.state.background_jobs.iter().take(4) {
+                let icon = match job.status.as_str() {
+                    "done" => "✓",
+                    "error" => "✗",
+                    "cancelled" => "•",
+                    _ => SPINNER_FRAMES[((tick / 6) as usize) % SPINNER_FRAMES.len()],
+                };
+                ui.styled(
+                    truncate(
+                        &format!("  │ {} [{}] {}", icon, job.kind, job.label),
+                        sidebar_max,
+                    ),
+                    Style::new().fg(FG),
+                );
+            }
+            ui.text("");
+        }
+
+        ui.styled("• SYSTEMS", Style::new().fg(ACCENT).bold());
+        for provider in &app.state.providers {
+            let icon = if provider.available { "●" } else { "○" };
+            let color = if provider.available { SUCCESS } else { MUTED };
+            ui.styled(
+                truncate(&format!("  │ {} {}", icon, provider.name), sidebar_max),
+                Style::new().fg(color),
+            );
+        }
+        let mut sys_parts: Vec<String> = Vec::new();
+        if let Some(mcp_state) = &app.state.mcp {
+            sys_parts.push(format!(
+                "mcp {}/{}",
+                mcp_state.connected_servers, mcp_state.configured_servers
+            ));
+        }
+        if let Some(lsp_state) = &app.state.lsp {
+            sys_parts.push(format!(
+                "lsp {}/{}",
+                lsp_state.connected_servers, lsp_state.available_servers
+            ));
+        }
+        if !sys_parts.is_empty() {
+            ui.styled(
+                truncate(&format!("  │ {}", sys_parts.join(" · ")), sidebar_max),
+                Style::new().fg(FG),
+            );
+        }
+        if let Some(v) = &app.state.verification {
+            let (color, icon) = match v.status.as_str() {
+                "passed" => (SUCCESS, "✓"),
+                "failed" => (ERROR, "✗"),
+                _ => (ORANGE, "⠋"),
+            };
+            ui.styled(
+                truncate(&format!("  │ verify: {} {}", v.status, icon), sidebar_max),
+                Style::new().fg(color),
+            );
+        }
+
+        if let Some(strategy) = &app.state.team_run_strategy {
+            ui.text("");
+            ui.styled("• TEAM", Style::new().fg(ACCENT).bold());
+            ui.styled(
+                truncate(&format!("  │ {}", strategy), sidebar_max),
+                Style::new().fg(FG),
+            );
+            if let Some(task) = &app.state.team_run_task {
+                ui.styled(
+                    truncate(&format!("  │ {}", task), sidebar_max),
+                    Style::new().fg(MUTED),
+                );
+            }
+        }
     });
 }
 
@@ -2146,7 +2035,7 @@ fn render_ask_user(ui: &mut slt::Context, app: &mut App) {
             .w_pct(75)
             .max_w(100)
             .bg(BG)
-            .border(Border::Rounded)
+            .border(Border::Single)
             .p(1)
             .center()
             .col(|ui| {
@@ -2193,7 +2082,7 @@ fn render_fatal_error(ui: &mut slt::Context, app: &App) {
             .w_pct(70)
             .max_w(90)
             .bg(BG)
-            .border(Border::Rounded)
+            .border(Border::Single)
             .border_style(Style::new().fg(ERROR))
             .p(1)
             .center()
@@ -2291,7 +2180,9 @@ fn main() -> Result<()> {
     let config = RunConfig {
         tick_rate: Duration::from_millis(16),
         mouse: true,
+        kitty_keyboard: false,
         theme: ddudu_theme(),
+        color_depth: None,
         max_fps: Some(60),
     };
 
