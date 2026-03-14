@@ -1,61 +1,35 @@
-use std::cmp::min;
-use std::collections::HashSet;
-use std::fs::read_dir;
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
-use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags, MouseEventKind,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-};
-use crossterm::execute;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::{DefaultTerminal, Frame};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
+use slt::{
+    Border, Color, KeyCode, KeyModifiers, RunConfig, ScrollState, SpinnerState, Style,
+    TextInputState, ToastState,
+};
 
-const BG: Color = Color::Rgb(18, 18, 24);
-const SIDEBAR_BG: Color = Color::Rgb(14, 14, 20); // #0E0E14 recessed sidebar
-const COMPOSER_BG: Color = Color::Rgb(22, 22, 30); // #16161E elevated input area
-const FG: Color = Color::Rgb(248, 248, 242);
-const USER_FG: Color = Color::Rgb(255, 255, 255); // #FFFFFF pure white for user
-const ASSISTANT_FG: Color = Color::Rgb(216, 213, 216); // #D8D5D8 warm neutral for assistant
-const ACCENT: Color = Color::Rgb(247, 167, 187); // #F7A7BB original ddudu pink
+const BG: Color = Color::Rgb(0, 0, 0);
+const SIDEBAR_BG: Color = Color::Rgb(15, 15, 15);
+const COMPOSER_BG: Color = Color::Rgb(10, 10, 10);
+const FG: Color = Color::Rgb(230, 230, 230);
+const USER_FG: Color = Color::Rgb(255, 255, 255);
+const ACCENT: Color = Color::Rgb(247, 167, 187);
 const ACCENT_DIM: Color = Color::Rgb(160, 110, 125);
-const SUCCESS: Color = Color::Rgb(80, 250, 123);
-const ERROR: Color = Color::Rgb(255, 85, 85);
-const MUTED: Color = Color::Rgb(110, 100, 105);
-const MUTED_LIGHT: Color = Color::Rgb(138, 128, 136); // #8A8088 lighter muted
-const TOOL_MUTED: Color = Color::Rgb(90, 82, 88); // #5A5258 darker tool calls
-const LINK: Color = Color::Rgb(139, 233, 253);
-const PATH: Color = Color::Rgb(241, 250, 140);
-const ORANGE: Color = Color::Rgb(255, 184, 108);
-const PANEL_TOP_PADDING: u16 = 2;
+const SUCCESS: Color = Color::Rgb(120, 200, 140);
+const ERROR: Color = Color::Rgb(255, 55, 55);
+const MUTED: Color = Color::Rgb(80, 80, 80);
+const TOOL_MUTED: Color = Color::Rgb(60, 60, 60);
+const ORANGE: Color = Color::Rgb(230, 160, 90);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const THINKING_FRAMES: &[&str] = &["◉", "◎", "○", "◎"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
-const FILE_PICKER_MAX_RESULTS: usize = 8;
 const MAX_PROMPT_HISTORY: usize = 200;
-const REPO_FILE_CACHE_LIMIT: usize = 2000;
-const REPO_FILE_SCAN_DEPTH: usize = 8;
-const REPO_FILE_EXCLUDES: &[&str] = &[".git", "node_modules", "dist", "coverage", "tmp", "target"];
-const COMMON_REPO_FILES: &[&str] = &[
-    "AGENTS.md",
-    "README.md",
-    "package.json",
-    "Cargo.toml",
-    ".ddudu/DDUDU.md",
-];
 const SPLASH_FULL: &[&str] = &[
     "      d8b       d8b                d8b                    d8b       d8b                d8b",
     "      88P       88P                88P                    88P       88P                88P",
@@ -418,6 +392,7 @@ enum BridgeEvent {
     },
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum BridgeCommand {
@@ -432,5440 +407,1748 @@ enum BridgeCommand {
     AnswerAskUser { answer: AskUserAnswerPayload },
 }
 
-#[derive(Debug, Clone)]
-enum SuggestionKind {
-    Slash,
-    Mode,
-    Model,
-    File,
-}
-
-#[derive(Debug, Clone)]
-struct Suggestion {
-    kind: SuggestionKind,
-    value: String,
-    description: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SidebarTab {
-    Jobs,
-    Plan,
-    Context,
-    Systems,
-}
-
-impl SidebarTab {
-    fn all() -> [Self; 4] {
-        [Self::Jobs, Self::Plan, Self::Context, Self::Systems]
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Jobs => "Jobs",
-            Self::Plan => "Plan",
-            Self::Context => "Context",
-            Self::Systems => "Systems",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-enum SidebarTarget {
-    Agent(usize),
-    Job(usize),
-    Queue(usize),
-    Artifact(usize),
-    Plan(usize),
-    ContextOverview,
-    ContextEstimate,
-    McpSummary,
-    LspSummary,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum NoticeTone {
-    Info,
-    Success,
-    Error,
-}
-
-struct TransientNotice {
-    text: String,
-    tone: NoticeTone,
-    created_at: Instant,
-}
-
-struct PaletteState {
-    query: String,
-    selected: usize,
-}
-
-#[derive(Clone)]
-enum PaletteAction {
-    InsertSlash(String),
-    InsertText(String),
-    SwitchTab(SidebarTab),
-    OpenTarget(SidebarTarget),
-    OpenContext,
-    OpenDiff(Option<String>),
-}
-
-#[derive(Clone)]
-struct PaletteItem {
-    label: String,
-    description: String,
-    action: PaletteAction,
-}
-
-#[derive(Clone)]
-enum InspectorKind {
-    Agent(usize),
-    Job(String),
-    Queue(usize),
-    Artifact(usize),
-    Plan(usize),
-    Context,
-    McpSummary,
-    McpServer(usize),
-    LspSummary,
-    LspServer(usize),
-    Tool(usize, usize),
-    Diff { title: String, cwd: Option<String> },
-}
-
-struct InspectorState {
-    title: String,
-    body: Vec<String>,
-    footer: Option<String>,
-    scroll: usize,
-    kind: InspectorKind,
-}
-
-#[derive(Debug, Default)]
-struct ComposerState {
-    text: String,
-    cursor: usize,
-}
-
-impl ComposerState {
-    fn clear(&mut self) {
-        self.text.clear();
-        self.cursor = 0;
-    }
-
-    fn graphemes(&self) -> Vec<String> {
-        UnicodeSegmentation::graphemes(self.text.as_str(), true)
-            .map(|g| g.to_string())
-            .collect()
-    }
-
-    fn set_text(&mut self, text: String) {
-        self.text = text;
-        self.cursor = self.graphemes().len();
-    }
-
-    fn insert_text(&mut self, value: &str) {
-        let mut parts = self.graphemes();
-        let insert_parts: Vec<String> = UnicodeSegmentation::graphemes(value, true)
-            .map(|g| g.to_string())
-            .collect();
-        let insert_len = insert_parts.len();
-        parts.splice(self.cursor..self.cursor, insert_parts);
-        self.text = parts.concat();
-        self.cursor += insert_len;
-    }
-
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-
-        let mut parts = self.graphemes();
-        parts.remove(self.cursor - 1);
-        self.text = parts.concat();
-        self.cursor -= 1;
-    }
-
-    fn delete(&mut self) {
-        let mut parts = self.graphemes();
-        if self.cursor >= parts.len() {
-            return;
-        }
-
-        parts.remove(self.cursor);
-        self.text = parts.concat();
-    }
-
-    fn move_left(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-        }
-    }
-
-    fn move_right(&mut self) {
-        let len = self.graphemes().len();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    fn move_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    fn move_end(&mut self) {
-        self.cursor = self.graphemes().len();
-    }
-
-    fn trim(&self) -> String {
-        self.text.trim().to_string()
-    }
-}
-
-struct BridgeClient {
-    child: Child,
-    stdin: ChildStdin,
-    receiver: Receiver<Result<BridgeEvent>>,
-}
-
-impl BridgeClient {
-    fn spawn(node_path: &str, bridge_path: &str) -> Result<Self> {
-        let mut child = Command::new(node_path)
-            .arg(bridge_path)
-            .arg("bridge")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| format!("failed to start bridge: {bridge_path}"))?;
-
-        let stdin = child.stdin.take().context("bridge stdin unavailable")?;
-        let stdout = child.stdout.take().context("bridge stdout unavailable")?;
-        let (tx, rx) = mpsc::channel::<Result<BridgeEvent>>();
-
-        std::thread::spawn(move || {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                let outcome = match line {
-                    Ok(raw) => {
-                        let trimmed = raw.trim();
-                        if trimmed.is_empty() {
-                            continue;
-                        }
-
-                        let payload = if let Some(rest) = trimmed.strip_prefix(BRIDGE_EVENT_PREFIX)
-                        {
-                            rest
-                        } else if trimmed.starts_with('{') {
-                            trimmed
-                        } else {
-                            continue;
-                        };
-
-                        (|| -> Result<BridgeEvent> {
-                            let decoded = if payload.starts_with('{') {
-                                payload.to_owned()
-                            } else {
-                                let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
-                                    anyhow!("failed to decode bridge event: {error}")
-                                })?;
-                                String::from_utf8(bytes).map_err(|error| {
-                                    anyhow!("failed to decode bridge event utf8: {error}")
-                                })?
-                            };
-
-                            serde_json::from_str::<BridgeEvent>(&decoded)
-                                .map_err(|error| anyhow!("failed to parse bridge event: {error}"))
-                        })()
-                    }
-                    Err(error) => Err(anyhow!("failed to read bridge event: {error}")),
-                };
-
-                if tx.send(outcome).is_err() {
-                    return;
-                }
-            }
-
-            let _ = tx.send(Err(anyhow!("bridge process closed stdout")));
-        });
-
-        Ok(Self {
-            child,
-            stdin,
-            receiver: rx,
-        })
-    }
-
-    fn send(&mut self, command: BridgeCommand) -> Result<()> {
-        let raw = serde_json::to_string(&command)?;
-        writeln!(self.stdin, "{raw}")?;
-        self.stdin.flush()?;
-        Ok(())
-    }
-
-    fn try_recv(&self) -> Option<Result<BridgeEvent>> {
-        self.receiver.try_recv().ok()
-    }
-
-    fn shutdown(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 struct App {
-    bridge: BridgeClient,
     state: NativeTuiState,
-    composer: ComposerState,
-    scroll: usize,
+    composer: TextInputState,
+    korean_mode: bool,
+    hangul: HangulComposer,
+    hangul_preedit_len: usize,
+    ask_user_input: TextInputState,
+    ask_user_radio: slt::RadioState,
+    transcript_scroll: ScrollState,
+    sidebar_scroll: ScrollState,
     auto_scroll: bool,
-    spinner_index: usize,
-    splash_phase: usize,
-    selected_suggestion: usize,
-    ask_user_selection: usize,
-    sidebar_tab: SidebarTab,
-    sidebar_selection: usize,
-    palette: Option<PaletteState>,
-    inspector: Option<InspectorState>,
-    fold_tool_calls: bool,
-    fold_system_messages: bool,
-    pending_paste: Option<String>,
+    toast: ToastState,
+    spinner: SpinnerState,
     fatal_error: Option<String>,
-    last_tick: Instant,
     streaming_message_id: Option<String>,
-    streaming_token_count: usize,
-    streaming_start: Option<Instant>,
-    streaming_cursor_visible: bool,
-    streaming_cursor_tick: Instant,
-    stream_done_at: Option<Instant>,
-    next_prefetch_at: Option<Instant>,
-    pending_prefetch_input: Option<String>,
-    last_prefetched_input: Option<String>,
     prompt_history: Vec<String>,
     history_index: Option<usize>,
     history_stash: Option<String>,
-    repo_files: Vec<String>,
-    repo_files_cwd: String,
-    dirty: bool,
-    should_quit: bool,
-    notices: Vec<TransientNotice>,
+    last_mode: String,
+    last_model: String,
+    last_provider: String,
+    last_job_statuses: HashMap<String, String>,
+    last_verification_status: Option<String>,
 }
 
 impl App {
-    fn new(bridge: BridgeClient) -> Self {
+    fn new() -> Self {
+        let state = initial_state();
         Self {
-            bridge,
-            state: NativeTuiState {
-                ready: false,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                cwd: String::new(),
-                mode: "jennie".into(),
-                modes: Vec::new(),
-                provider: "anthropic".into(),
-                model: "claude-opus-4-6".into(),
-                models: Vec::new(),
-                auth_type: None,
-                auth_source: None,
-                permission_profile: "workspace-write".into(),
-                loading: false,
-                loading_label: String::new(),
-                loading_since: None,
-                playing_with_fire: false,
-                context_percent: 0.0,
-                context_tokens: 0,
-                context_limit: 0,
-                context_preview: None,
-                request_estimate: None,
-                queued_prompts: Vec::new(),
-                providers: Vec::new(),
-                mcp: None,
-                lsp: None,
-                messages: Vec::new(),
-                ask_user: None,
-                slash_commands: Vec::new(),
-                session_id: None,
-                remote_session_id: None,
-                remote_session_count: 0,
-                team_run_strategy: None,
-                team_run_task: None,
-                team_run_since: None,
-                todos: Vec::new(),
-                agent_activities: Vec::new(),
-                background_jobs: Vec::new(),
-                artifacts: Vec::new(),
-                git: None,
-                workspace: None,
-                verification: None,
-                error: None,
-            },
-            composer: ComposerState::default(),
-            scroll: 0,
+            composer: TextInputState::new(),
+            korean_mode: false,
+            hangul: HangulComposer::new(),
+            hangul_preedit_len: 0,
+            ask_user_input: TextInputState::new(),
+            ask_user_radio: slt::RadioState::new(vec!["".to_string()]),
+            transcript_scroll: ScrollState::new(),
+            sidebar_scroll: ScrollState::new(),
             auto_scroll: true,
-            spinner_index: 0,
-            splash_phase: 0,
-            selected_suggestion: 0,
-            ask_user_selection: 0,
-            sidebar_tab: SidebarTab::Jobs,
-            sidebar_selection: 0,
-            palette: None,
-            inspector: None,
-            fold_tool_calls: false,
-            fold_system_messages: false,
-            pending_paste: None,
+            toast: ToastState::new(),
+            spinner: SpinnerState::dots(),
             fatal_error: None,
-            last_tick: Instant::now(),
             streaming_message_id: None,
-            streaming_token_count: 0,
-            streaming_start: None,
-            streaming_cursor_visible: true,
-            streaming_cursor_tick: Instant::now(),
-            stream_done_at: None,
-            next_prefetch_at: None,
-            pending_prefetch_input: None,
-            last_prefetched_input: None,
             prompt_history: Vec::new(),
             history_index: None,
             history_stash: None,
-            repo_files: Vec::new(),
-            repo_files_cwd: String::new(),
-            dirty: true,
-            should_quit: false,
-            notices: Vec::new(),
+            last_mode: state.mode.clone(),
+            last_model: state.model.clone(),
+            last_provider: state.provider.clone(),
+            last_job_statuses: HashMap::new(),
+            last_verification_status: None,
+            state,
         }
     }
 
-    fn on_bridge_event(&mut self, event: BridgeEvent) {
+    fn push_prompt_history(&mut self, prompt: &str) {
+        if prompt.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().is_some_and(|p| p == prompt) {
+            return;
+        }
+        self.prompt_history.push(prompt.to_string());
+        if self.prompt_history.len() > MAX_PROMPT_HISTORY {
+            let overflow = self.prompt_history.len().saturating_sub(MAX_PROMPT_HISTORY);
+            self.prompt_history.drain(0..overflow);
+        }
+        self.history_index = None;
+        self.history_stash = None;
+    }
+
+    fn on_bridge_event(&mut self, event: BridgeEvent, tick: u64) {
         match event {
             BridgeEvent::ContentDelta { id, delta } => {
-                if let Some(message) = self.state.messages.iter_mut().find(|msg| msg.id == id) {
-                    message.content.push_str(&delta);
+                if let Some(msg) = self.state.messages.iter_mut().find(|m| m.id == id) {
+                    msg.content.push_str(&delta);
+                    msg.is_streaming = true;
                 }
-
-                if self.streaming_message_id.is_none() {
-                    self.streaming_message_id = Some(id.clone());
-                    self.streaming_start = Some(Instant::now());
-                }
-
-                if !delta.trim().is_empty() {
-                    self.streaming_token_count += delta.split_whitespace().count().max(1);
-                }
-
-                self.streaming_cursor_visible = true;
-                self.stream_done_at = None;
+                self.streaming_message_id = Some(id);
                 if self.auto_scroll {
-                    self.scroll = usize::MAX;
+                    self.transcript_scroll.offset = usize::MAX;
                 }
-                self.dirty = true;
             }
             BridgeEvent::ThinkingDelta {
                 id,
                 delta,
                 is_thinking,
             } => {
-                if let Some(message) = self.state.messages.iter_mut().find(|msg| msg.id == id) {
+                if let Some(msg) = self.state.messages.iter_mut().find(|m| m.id == id) {
                     if is_thinking {
-                        message
-                            .thinking
+                        msg.thinking
                             .get_or_insert_with(String::new)
                             .push_str(&delta);
-                        message.is_thinking = Some(true);
-                    } else {
-                        message.is_thinking = Some(false);
                     }
+                    msg.is_thinking = Some(is_thinking);
                 }
-                self.stream_done_at = None;
-                self.dirty = true;
             }
             BridgeEvent::StreamEnd { id } => {
-                let _matches_stream = self.streaming_message_id.as_deref() == Some(id.as_str());
+                if let Some(msg) = self.state.messages.iter_mut().find(|m| m.id == id) {
+                    msg.is_streaming = false;
+                    msg.is_thinking = Some(false);
+                }
                 self.streaming_message_id = None;
-                self.streaming_token_count = 0;
-                self.streaming_start = None;
-                self.streaming_cursor_visible = false;
-                self.stream_done_at = Some(Instant::now());
-                self.dirty = true;
             }
             BridgeEvent::State { state } => {
-                let was_asking = self.state.ask_user.is_some();
-                let previous_cwd = self.state.cwd.clone();
-                let previous_mode = self.state.mode.clone();
-                let previous_model = self.state.model.clone();
-                let previous_provider = self.state.provider.clone();
-                let previous_jobs = self
-                    .state
-                    .background_jobs
-                    .iter()
-                    .map(|job| (job.id.clone(), job.status.clone()))
-                    .collect::<std::collections::HashMap<_, _>>();
-                let previous_verification = self
-                    .state
-                    .verification
-                    .as_ref()
-                    .map(|item| item.status.clone());
-                self.state = state;
-
-                if !self.state.cwd.is_empty()
-                    && (self.state.cwd != previous_cwd || self.repo_files_cwd != self.state.cwd)
-                {
-                    self.repo_files = load_repo_files(&self.state.cwd);
-                    self.repo_files_cwd = self.state.cwd.clone();
-                }
-
-                if !was_asking && self.state.ask_user.is_some() {
-                    self.ask_user_selection = self
-                        .state
-                        .ask_user
-                        .as_ref()
-                        .and_then(|prompt| prompt.default_option_index)
-                        .unwrap_or(0);
-                    self.composer.clear();
-                }
-
-                if self.state.ready
-                    && (self.state.mode != previous_mode
-                        || self.state.model != previous_model
-                        || self.state.provider != previous_provider)
-                {
-                    let mode_label = self.current_mode_label();
-                    self.push_notice(
-                        format!(
-                            "{} · {} · {}",
-                            mode_label, self.state.provider, self.state.model
-                        ),
-                        NoticeTone::Info,
-                    );
-                }
-
-                let mut pending_notices: Vec<(String, NoticeTone)> = Vec::new();
-                for job in &self.state.background_jobs {
-                    let previous = previous_jobs.get(&job.id);
-                    if matches!(previous.map(|value| value.as_str()), Some("running"))
-                        && job.status == "done"
-                    {
-                        pending_notices
-                            .push((format!("{} finished", job.label), NoticeTone::Success));
-                    } else if matches!(
-                        previous.map(|value| value.as_str()),
-                        Some("running" | "done")
-                    ) && job.status == "cancelled"
-                    {
-                        pending_notices
-                            .push((format!("{} cancelled", job.label), NoticeTone::Info));
-                    } else if matches!(
-                        previous.map(|value| value.as_str()),
-                        Some("running" | "done")
-                    ) && job.status == "error"
-                    {
-                        pending_notices.push((format!("{} failed", job.label), NoticeTone::Error));
-                    }
-                }
-                for (text, tone) in pending_notices {
-                    self.push_notice(text, tone);
-                }
-
-                let current_verification = self
-                    .state
-                    .verification
-                    .as_ref()
-                    .map(|item| item.status.clone());
-                if previous_verification.as_deref() != current_verification.as_deref() {
-                    if let Some(status) = current_verification.as_deref() {
-                        match status {
-                            "passed" => self.push_notice(
-                                "verification passed".to_string(),
-                                NoticeTone::Success,
-                            ),
-                            "failed" => self
-                                .push_notice("verification failed".to_string(), NoticeTone::Error),
-                            _ => {}
-                        }
-                    }
-                }
-
-                if self.auto_scroll {
-                    self.scroll = usize::MAX;
-                }
-                self.prune_notices();
-                self.clamp_sidebar_selection();
-                self.refresh_open_inspector();
-                self.last_prefetched_input = None;
-                self.dirty = true;
+                self.apply_state(state, tick);
             }
             BridgeEvent::Fatal { message } => {
                 self.fatal_error = Some(message);
-                self.dirty = true;
             }
         }
     }
 
-    fn current_mode_label(&self) -> String {
-        self.state
-            .modes
-            .iter()
-            .find(|mode| mode.active)
-            .map(|mode| mode.label.clone())
-            .unwrap_or_else(|| self.state.mode.to_uppercase())
-    }
-
-    fn changed_file_paths(&self) -> &[String] {
-        self.state
-            .git
-            .as_ref()
-            .map(|git| git.changed_files.as_slice())
-            .unwrap_or(&[])
-    }
-
-    fn current_file_query(&self) -> Option<String> {
-        let input = self.composer.text.trim_end();
-        let token = input.split_whitespace().last()?;
-        token.strip_prefix('@').map(|value| value.to_string())
-    }
-
-    fn ranked_file_paths(&self, query: &str, limit: usize) -> Vec<String> {
-        let mut ordered = Vec::new();
-        let mut seen = HashSet::new();
-
-        for path in self.changed_file_paths() {
-            if seen.insert(path.clone()) {
-                ordered.push(path.clone());
-            }
-        }
-
-        for path in COMMON_REPO_FILES {
-            let path = (*path).to_string();
-            if seen.insert(path.clone()) {
-                ordered.push(path);
-            }
-        }
-
-        for path in &self.repo_files {
-            if seen.insert(path.clone()) {
-                ordered.push(path.clone());
-            }
-        }
-
-        let mut matches = ordered
-            .into_iter()
-            .filter_map(|path| {
-                score_repo_file_path(&path, query, self.changed_file_paths())
-                    .map(|score| (score, path))
-            })
-            .collect::<Vec<_>>();
-
-        matches.sort_by(|left, right| {
-            right
-                .0
-                .cmp(&left.0)
-                .then_with(|| left.1.len().cmp(&right.1.len()))
-                .then_with(|| left.1.cmp(&right.1))
-        });
-
-        matches
-            .into_iter()
-            .take(limit)
-            .map(|(_, path)| path)
-            .collect()
-    }
-
-    fn current_file_suggestions(&self, query: &str) -> Vec<Suggestion> {
-        self.ranked_file_paths(query, FILE_PICKER_MAX_RESULTS)
-            .into_iter()
-            .map(|path| Suggestion {
-                kind: SuggestionKind::File,
-                description: if self.changed_file_paths().iter().any(|item| item == &path) {
-                    "changed file".to_string()
-                } else {
-                    "file path".to_string()
-                },
-                value: path,
-            })
-            .collect()
-    }
-
-    fn replace_trailing_token(&mut self, replacement: &str) {
-        let split = self
-            .composer
-            .text
-            .char_indices()
-            .rev()
-            .find(|(_, ch)| ch.is_whitespace())
-            .map(|(index, ch)| index + ch.len_utf8())
-            .unwrap_or(0);
-        let prefix = &self.composer.text[..split];
-        self.composer.set_text(format!("{prefix}{replacement}"));
-    }
-
-    fn ask_user_shortcut_index(&self, prompt: &NativeAskUserState, key: char) -> Option<usize> {
-        if prompt.kind != "confirm" && prompt.kind != "single_select" {
-            return None;
-        }
-
-        if let Some(index) = key.to_digit(10) {
-            let resolved = index.saturating_sub(1) as usize;
-            if resolved < prompt.options.len() {
-                return Some(resolved);
-            }
-        }
-
-        let lower = key.to_ascii_lowercase().to_string();
-        prompt
-            .options
-            .iter()
-            .enumerate()
-            .find_map(|(index, option)| {
-                option
-                    .shortcut
-                    .as_ref()
-                    .filter(|shortcut| shortcut.eq_ignore_ascii_case(&lower))
-                    .map(|_| index)
-            })
-    }
-
-    fn send_ask_user_answer(
-        &mut self,
-        value: String,
-        source: &str,
-        option_index: Option<usize>,
-        option_label: Option<String>,
-    ) -> Result<()> {
-        self.bridge.send(BridgeCommand::AnswerAskUser {
-            answer: AskUserAnswerPayload {
-                value,
-                source: source.to_string(),
-                option_index,
-                option_label,
-            },
-        })
-    }
-
-    fn submit_selected_ask_user_choice(
-        &mut self,
-        prompt: &NativeAskUserState,
-        index: usize,
-        source: &str,
-    ) -> Result<()> {
-        let Some(choice) = prompt.options.get(index) else {
-            return Ok(());
-        };
-        self.send_ask_user_answer(
-            choice.value.clone(),
-            source,
-            Some(index),
-            Some(choice.label.clone()),
-        )
-    }
-
-    fn submit_default_ask_user_answer(&mut self, prompt: &NativeAskUserState) -> Result<bool> {
-        if let Some(default_value) = &prompt.default_value {
-            let option_index = prompt
-                .options
-                .iter()
-                .position(|option| option.value == *default_value);
-            let option_label = option_index
-                .and_then(|index| prompt.options.get(index).map(|item| item.label.clone()));
-            self.send_ask_user_answer(
-                default_value.clone(),
-                "default",
-                option_index,
-                option_label,
-            )?;
-            return Ok(true);
-        }
-
-        if let Some(index) = prompt.default_option_index {
-            self.submit_selected_ask_user_choice(prompt, index, "default")?;
-            return Ok(true);
-        }
-
-        Ok(false)
-    }
-
-    fn validate_ask_user_input(&self, prompt: &NativeAskUserState, value: &str) -> Option<String> {
-        let trimmed = value.trim();
-
-        if prompt.required
-            && trimmed.is_empty()
-            && prompt.default_value.is_none()
-            && prompt.options.is_empty()
-        {
-            return Some("answer required".to_string());
-        }
-
-        if prompt.kind == "number" && !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
-            return Some(
-                prompt
-                    .validation
-                    .as_ref()
-                    .and_then(|validation| validation.message.clone())
-                    .unwrap_or_else(|| "enter a valid number".to_string()),
-            );
-        }
-
-        if prompt.kind == "path" && !trimmed.is_empty() && trimmed.contains('\0') {
-            return Some(
-                prompt
-                    .validation
-                    .as_ref()
-                    .and_then(|validation| validation.message.clone())
-                    .unwrap_or_else(|| "enter a valid path".to_string()),
-            );
-        }
-
-        if let Some(validation) = &prompt.validation {
-            if let Some(min_length) = validation.min_length {
-                if trimmed.len() < min_length as usize {
-                    return Some(
-                        validation
-                            .message
-                            .clone()
-                            .unwrap_or_else(|| format!("enter at least {} characters", min_length)),
-                    );
-                }
-            }
-
-            if let Some(max_length) = validation.max_length {
-                if trimmed.len() > max_length as usize {
-                    return Some(validation.message.clone().unwrap_or_else(|| {
-                        format!("keep the answer under {} characters", max_length)
-                    }));
-                }
-            }
-
-            if let Some(pattern) = &validation.pattern {
-                match regex::Regex::new(pattern) {
-                    Ok(regex) => {
-                        if !regex.is_match(trimmed) {
-                            return Some(validation.message.clone().unwrap_or_else(|| {
-                                "answer format does not match the requirement".to_string()
-                            }));
-                        }
-                    }
-                    Err(_) => {}
-                }
-            }
-        }
-
-        None
-    }
-
-    fn push_notice(&mut self, text: String, tone: NoticeTone) {
-        self.notices.push(TransientNotice {
-            text,
-            tone,
-            created_at: Instant::now(),
-        });
-        if self.notices.len() > 4 {
-            let overflow = self.notices.len().saturating_sub(4);
-            self.notices.drain(0..overflow);
-        }
-        self.dirty = true;
-    }
-
-    fn prune_notices(&mut self) {
-        let before = self.notices.len();
-        self.notices
-            .retain(|notice| notice.created_at.elapsed() <= Duration::from_secs(4));
-        if self.notices.len() != before {
-            self.dirty = true;
-        }
-    }
-
-    fn sync_bridge(&mut self) {
-        while let Some(event) = self.bridge.try_recv() {
-            match event {
-                Ok(event) => self.on_bridge_event(event),
-                Err(error) => {
-                    self.fatal_error = Some(error.to_string());
-                    break;
-                }
-            }
-        }
-    }
-
-    fn should_animate(&self) -> bool {
-        self.state.loading
-            || self.state.messages.is_empty()
-            || self.streaming_message_id.is_some()
-            || self
-                .stream_done_at
-                .is_some_and(|done_at| done_at.elapsed() <= Duration::from_millis(1200))
-            || !self.notices.is_empty()
-            || self.pending_paste.is_some()
-    }
-
-    fn animation_interval(&self) -> Duration {
-        if self.streaming_message_id.is_some() {
-            Duration::from_millis(50)
-        } else if self.state.loading {
-            Duration::from_millis(90)
-        } else if self.should_animate() {
-            Duration::from_millis(140)
-        } else {
-            Duration::from_millis(450)
-        }
-    }
-
-    fn clear_context_prefetch(&mut self) {
-        self.next_prefetch_at = None;
-        self.pending_prefetch_input = None;
-    }
-
-    fn refresh_context_prefetch(&mut self) {
-        let trimmed = self.composer.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('/')
-            || self.pending_paste.is_some()
-            || self.state.ask_user.is_some()
-        {
-            self.clear_context_prefetch();
-            return;
-        }
-
-        self.pending_prefetch_input = Some(trimmed);
-        self.next_prefetch_at = Some(Instant::now() + Duration::from_millis(220));
-    }
-
-    fn dispatch_context_prefetch(&mut self) -> Result<()> {
-        let Some(deadline) = self.next_prefetch_at else {
-            return Ok(());
-        };
-        if Instant::now() < deadline {
-            return Ok(());
-        }
-
-        self.next_prefetch_at = None;
-        let Some(content) = self.pending_prefetch_input.take() else {
-            return Ok(());
-        };
-        if self.last_prefetched_input.as_deref() == Some(content.as_str()) {
-            return Ok(());
-        }
-
-        self.bridge.send(BridgeCommand::PrefetchContext {
-            content: content.clone(),
-        })?;
-        self.last_prefetched_input = Some(content);
-        Ok(())
-    }
-
-    fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
-        while !self.should_quit {
-            self.sync_bridge();
-            self.prune_notices();
-            self.dispatch_context_prefetch()?;
-
-            let animation_interval = self.animation_interval();
-            if self.last_tick.elapsed() >= animation_interval {
-                self.spinner_index = (self.spinner_index + 1) % SPINNER_FRAMES.len();
-                self.splash_phase = self.splash_phase.wrapping_add(1);
-                if self.streaming_cursor_tick.elapsed() >= Duration::from_millis(500) {
-                    self.streaming_cursor_visible = !self.streaming_cursor_visible;
-                    self.streaming_cursor_tick = Instant::now();
-                }
-                if self
-                    .stream_done_at
-                    .is_some_and(|done_at| done_at.elapsed() > Duration::from_millis(1200))
-                {
-                    self.stream_done_at = None;
-                }
-                self.last_tick = Instant::now();
-                self.dirty = true;
-            }
-
-            if self.dirty {
-                terminal.draw(|frame| self.render(frame))?;
-                self.dirty = false;
-            }
-
-            let mut timeout = animation_interval.saturating_sub(self.last_tick.elapsed());
-            if timeout > Duration::from_millis(300) {
-                timeout = Duration::from_millis(300);
-            }
-            if let Some(deadline) = self.next_prefetch_at {
-                timeout = min(timeout, deadline.saturating_duration_since(Instant::now()));
-            }
-            if timeout.is_zero() {
-                timeout = Duration::from_millis(10);
-            }
-
-            if event::poll(timeout)? {
-                let ev = event::read()?;
-                self.handle_event(ev)?;
-                self.dirty = true;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn render(&mut self, frame: &mut Frame) {
-        frame.render_widget(
-            Block::default().style(Style::default().bg(BG).fg(FG)),
-            frame.area(),
-        );
-
-        let sidebar_width = if frame.area().width >= 124 {
-            44
-        } else if frame.area().width >= 104 {
-            40
-        } else if frame.area().width >= 88 {
-            34
-        } else {
-            0
-        };
-        let root = if sidebar_width > 0 {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(20), Constraint::Length(sidebar_width)])
-                .split(frame.area())
-        } else {
-            Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([Constraint::Min(20)])
-                .split(frame.area())
-        };
-        let show_sidebar = root.len() > 1;
-        let main = root[0];
-        let queue_height = if !self.state.queued_prompts.is_empty() && self.state.ask_user.is_none()
-        {
-            let visible = self.state.queued_prompts.len().min(3);
-            let more_row = usize::from(self.state.queued_prompts.len() > visible);
-            (visible + more_row + 1) as u16
-        } else {
-            0
-        };
-        let ask_user_extra_rows = self
-            .state
-            .ask_user
-            .as_ref()
-            .map(|prompt| {
-                let detail_rows = u16::from(
-                    prompt
-                        .detail
-                        .as_ref()
-                        .is_some_and(|detail| !detail.trim().is_empty()),
-                );
-                let meta_rows = u16::from(
-                    prompt.kind != "input"
-                        || prompt.default_value.is_some()
-                        || prompt.validation.is_some()
-                        || prompt.required,
-                );
-                let placeholder_rows = u16::from(
-                    prompt.allow_custom_answer
-                        && prompt
-                            .placeholder
-                            .as_ref()
-                            .is_some_and(|placeholder| !placeholder.trim().is_empty()),
-                );
-                let option_rows = if prompt.options.is_empty() {
-                    0
-                } else {
-                    prompt.options.len().min(3) as u16 + 2
-                };
-                detail_rows + meta_rows + placeholder_rows + option_rows
-            })
-            .unwrap_or(0);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(6),
-                Constraint::Length(1),
-                Constraint::Length(queue_height),
-                Constraint::Length(6 + ask_user_extra_rows),
-            ])
-            .split(main);
-
-        self.render_transcript(frame, chunks[0]);
-        self.render_status_line(frame, chunks[1]);
-        self.render_queue_preview(frame, chunks[2]);
-        let composer_metrics = self.render_composer(frame, chunks[3]);
-
-        if show_sidebar {
-            frame.render_widget(
-                Block::default().style(Style::default().bg(SIDEBAR_BG)),
-                root[1],
-            );
-            self.draw_sidebar_divider(frame, root[1].x, frame.area());
-            self.render_sidebar(frame, root[1]);
-        }
-
-        if let Some((popup_area, suggestions)) = self.render_popup(frame, chunks[1]) {
-            frame.render_widget(Clear, popup_area);
-            let selected_index = self
-                .palette
-                .as_ref()
-                .map(|palette| palette.selected)
-                .unwrap_or(self.selected_suggestion);
-            let lines: Vec<Line> = suggestions
-                .iter()
-                .enumerate()
-                .map(|(index, suggestion)| {
-                    let selected = index == selected_index;
-                    let marker = if selected { "› " } else { "  " };
-                    let style = if selected {
-                        Style::default()
-                            .fg(BG)
-                            .bg(ACCENT)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(FG)
-                    };
-                    Line::from(vec![
-                        Span::styled(marker, style),
-                        Span::styled(
-                            format!("{} ", suggestion.value),
-                            style.add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(&suggestion.description, style),
-                    ])
-                })
-                .collect();
-
-            let block = Paragraph::new(Text::from(lines))
-                .block(Block::default().style(Style::default().bg(BG).fg(ACCENT)));
-            frame.render_widget(block, popup_area);
-        }
-
-        self.render_notices(frame);
-
-        if let Some(inspector) = &self.inspector {
-            self.render_inspector(frame, inspector);
-        }
-
-        if let Some(error) = &self.fatal_error {
-            let area = centered_rect(70, 5, frame.area());
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![
-                    Line::from(Span::styled(
-                        "Bridge Error",
-                        Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
-                    )),
-                    Line::from(Span::raw("")),
-                    Line::from(Span::styled(error, Style::default().fg(FG))),
-                ]))
-                .block(Block::default().style(Style::default().bg(BG).fg(FG))),
-                area,
-            );
-        }
-
-        if self.palette.is_none() && self.inspector.is_none() && self.fatal_error.is_none() {
-            frame.set_cursor_position((composer_metrics.0, composer_metrics.1));
-        }
-    }
-    fn draw_sidebar_divider(&self, frame: &mut Frame, x: u16, area: Rect) {
-        for row in area.top()..area.bottom() {
-            frame.buffer_mut().cell_mut((x, row)).map(|cell| {
-                cell.set_symbol("│").set_fg(MUTED).set_bg(SIDEBAR_BG);
-            });
-        }
-    }
-
-    fn render_transcript(&mut self, frame: &mut Frame, area: Rect) {
-        let area = top_padded_rect(area, PANEL_TOP_PADDING);
-        let available_width = area.width.saturating_sub(1) as usize;
-        let lines = build_transcript_lines(
-            &self.state.messages,
-            available_width,
-            self.fold_tool_calls,
-            self.fold_system_messages,
-            self.spinner_index,
-            self.streaming_message_id.as_deref(),
-            self.streaming_cursor_visible,
-        );
-        let height = area.height as usize;
-        let max_scroll = lines.len().saturating_sub(height);
-
-        if self.scroll == usize::MAX || (self.auto_scroll && self.scroll > max_scroll) {
-            self.scroll = max_scroll;
-        } else {
-            self.scroll = self.scroll.min(max_scroll);
-        }
-
-        let visible = if lines.is_empty() {
-            build_welcome_lines(available_width, self.splash_phase)
-        } else {
-            lines
-                .iter()
-                .skip(self.scroll)
-                .take(height)
-                .cloned()
-                .collect::<Vec<_>>()
-        };
-
-        frame.render_widget(
-            Paragraph::new(Text::from(visible))
-                .style(Style::default().bg(BG))
-                .block(Block::default().style(Style::default().bg(BG))),
-            area,
-        );
-    }
-
-    fn render_sidebar(&mut self, frame: &mut Frame, area: Rect) {
-        let inner = top_padded_rect(
-            Rect {
-                x: area.x + 2,
-                y: area.y,
-                width: area.width.saturating_sub(2),
-                height: area.height,
-            },
-            PANEL_TOP_PADDING,
-        );
-
-        let mut lines = Vec::new();
-        let (run_title, run_detail) = current_run_summary(&self.state);
-        lines.push(sidebar_header("Run"));
-        push_sidebar_rail_item(
-            &mut lines,
-            if self.state.loading {
-                SPINNER_FRAMES[self.spinner_index]
-            } else {
-                "·"
-            },
-            if self.state.loading {
-                ACCENT
-            } else {
-                ACCENT_DIM
-            },
-            run_title,
-            run_detail,
-            FG,
-            ACCENT_DIM,
-        );
-        lines.push(Line::from(Span::raw("")));
-        self.render_sidebar_git_tab(&mut lines);
-        let mut item_index = 0usize;
-        lines.push(Line::from(Span::raw("")));
-        self.render_sidebar_plan_tab(&mut lines, &mut item_index);
-        lines.push(Line::from(Span::raw("")));
-        self.render_sidebar_jobs_tab(&mut lines, &mut item_index);
-        lines.push(Line::from(Span::raw("")));
-        self.render_sidebar_context_tab(&mut lines, &mut item_index);
-        lines.push(Line::from(Span::raw("")));
-        self.render_sidebar_systems_tab(&mut lines, &mut item_index);
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().bg(SIDEBAR_BG)),
-            inner,
-        );
-    }
-
-    fn render_sidebar_jobs_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
-        if self.state.agent_activities.is_empty()
-            && self.state.background_jobs.is_empty()
-            && !self.state.loading
-        {
-            return;
-        }
-
-        let active_job = active_sidebar_job(&self.state);
-        if !self.state.agent_activities.is_empty() {
-            lines.push(sidebar_header("Workers"));
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "specialist workers".to_string(),
-                worker_pool_summary(&self.state, active_job),
-                FG,
-                ACCENT_DIM,
-            );
-            lines.push(Line::from(Span::raw("")));
-        }
-        for (index, item) in self.state.agent_activities.iter().enumerate().take(4) {
-            let (marker, color) = match item.status.as_str() {
-                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
-                "verifying" => ("◌", ACCENT),
-                "done" => ("✓", SUCCESS),
-                "error" => ("!", ERROR),
-                "cancelled" => ("×", ACCENT_DIM),
-                "queued" => ("•", ACCENT_DIM),
-                _ => ("·", ACCENT_DIM),
-            };
-            let title = if !item.label.trim().is_empty() {
-                item.label.clone()
-            } else {
-                match (&item.mode, &item.purpose) {
-                    (Some(mode), Some(purpose)) => {
-                        format!(
-                            "{} · {}",
-                            title_case_label(mode),
-                            display_purpose_role(purpose)
-                        )
-                    }
-                    (Some(mode), None) => title_case_label(mode),
-                    (None, Some(purpose)) => display_purpose_role(purpose),
-                    (None, None) => "워커".to_string(),
-                }
-            };
-            let todo_ref = item
-                .checklist_id
-                .as_ref()
-                .and_then(|id| active_job.and_then(|job| checklist_todo_ref(&job.checklist, id)));
-            let title = if let Some(todo_ref) = &todo_ref {
-                format!("{todo_ref} · {}", preview_line(&title, 18))
-            } else {
-                title
-            };
-            let linked_detail = match item.detail.as_ref() {
-                Some(detail) if !detail.trim().is_empty() => Some(format!(
-                    "{} · {}",
-                    worker_status_word(&item.status),
-                    preview_line(detail, 18)
-                )),
-                _ => Some(worker_status_word(&item.status).to_string()),
-            };
-            push_sidebar_selectable_item(
-                lines,
-                *item_index == self.sidebar_selection,
-                marker,
-                color,
-                preview_line(&title, 28),
-                linked_detail
-                    .map(|detail| preview_line(&detail, 28))
-                    .or_else(|| {
-                        item.workspace_path
-                            .as_ref()
-                            .map(|path| preview_line(path, 28))
-                    }),
-                FG,
-                ACCENT_DIM,
-            );
-            *item_index += 1;
-            if index >= 3 {
-                break;
-            }
-        }
-
-        if !self.state.background_jobs.is_empty() {
-            if !self.state.agent_activities.is_empty() {
-                lines.push(Line::from(Span::raw("")));
-            }
-            lines.push(sidebar_header("Background"));
-        }
-        for job in self.state.background_jobs.iter().take(4) {
-            let (marker, color) = match job.status.as_str() {
-                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
-                "done" => ("✓", SUCCESS),
-                "error" => ("!", ERROR),
-                "cancelled" => ("×", ACCENT_DIM),
-                _ => ("·", ACCENT_DIM),
-            };
-            let elapsed = format_elapsed(Some(job.started_at));
-            let retry = job
-                .attempt
-                .filter(|attempt| *attempt > 0)
-                .map(|attempt| format!(" · retry {}", format_count(attempt)));
-            push_sidebar_selectable_item(
-                lines,
-                *item_index == self.sidebar_selection,
-                marker,
-                color,
+    fn apply_state(&mut self, next_state: NativeTuiState, tick: u64) {
+        let mode_changed = self.last_mode != next_state.mode
+            || self.last_model != next_state.model
+            || self.last_provider != next_state.provider;
+        if mode_changed && next_state.ready {
+            self.toast.info(
                 format!(
-                    "{}{} {elapsed}",
-                    preview_line(&job.label, 18),
-                    retry.as_deref().unwrap_or("")
+                    "{} · {} · {}",
+                    current_mode_label(&next_state),
+                    next_state.provider,
+                    next_state.model
                 ),
-                checklist_progress(&job.checklist)
-                    .or_else(|| job.detail.clone())
-                    .map(|detail| preview_line(&detail, 28))
-                    .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
-                    .or_else(|| {
-                        job.result_preview
-                            .as_ref()
-                            .map(|detail| preview_line(detail, 28))
-                    })
-                    .or_else(|| {
-                        job.workspace_path
-                            .as_ref()
-                            .map(|path| preview_line(path, 28))
-                    }),
-                FG,
-                ACCENT_DIM,
-            );
-            *item_index += 1;
-        }
-    }
-
-    fn render_sidebar_plan_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
-        lines.push(sidebar_header("Current Run"));
-        let run_title = if let Some(job) = active_sidebar_job(&self.state) {
-            job.prompt_preview
-                .as_ref()
-                .map(|preview| preview_line(preview, 28))
-                .unwrap_or_else(|| preview_line(&job.label, 28))
-        } else if self.state.loading && !self.state.loading_label.trim().is_empty() {
-            preview_line(&self.state.loading_label, 28)
-        } else {
-            preview_line(&self.state.cwd, 28)
-        };
-        let run_detail = if let Some(job) = active_sidebar_job(&self.state) {
-            {
-                let blocked = job
-                    .checklist
-                    .iter()
-                    .filter(|item| item.status == "blocked")
-                    .count();
-                let mut parts = Vec::new();
-                if let Some(strategy) = &job.strategy {
-                    parts.push(strategy.clone());
-                }
-                if let Some(progress) = checklist_progress(&job.checklist) {
-                    parts.push(progress);
-                }
-                if blocked > 0 {
-                    parts.push(format!("{} blocked", format_count(blocked as u64)));
-                }
-                if parts.is_empty() {
-                    None
-                } else {
-                    Some(parts.join(" · "))
-                }
-            }
-            .or_else(|| job.detail.as_ref().map(|detail| preview_line(detail, 28)))
-        } else if let Some(workspace) = &self.state.workspace {
-            Some(preview_line(&workspace.label, 28))
-        } else if self.state.loading {
-            worker_pool_summary(&self.state, None)
-                .or_else(|| Some("active foreground run".to_string()))
-        } else {
-            None
-        };
-        push_sidebar_rail_item(
-            lines, "·", ACCENT_DIM, run_title, run_detail, FG, ACCENT_DIM,
-        );
-        if let Some(verification) = &self.state.verification {
-            let (marker, color) = match verification.status.as_str() {
-                "running" => (SPINNER_FRAMES[self.spinner_index], ACCENT),
-                "passed" => ("✓", SUCCESS),
-                "failed" => ("!", ERROR),
-                _ => ("·", ACCENT_DIM),
-            };
-            push_sidebar_rail_item(
-                lines,
-                marker,
-                color,
-                format!("verify {}", verification.status),
-                verification
-                    .summary
-                    .as_ref()
-                    .map(|summary| preview_line(summary, 28))
-                    .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 28))),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-        if let Some(active_job) = active_sidebar_job(&self.state) {
-            lines.push(Line::from(Span::raw("")));
-            lines.push(sidebar_header("Run Checklist"));
-            let worker_count = active_job
-                .checklist
-                .iter()
-                .filter(|item| item.id.starts_with("agent:") || item.id == "execute")
-                .count();
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                preview_line(&active_job.label, 28),
-                Some(
-                    [
-                        active_job
-                            .strategy
-                            .as_ref()
-                            .map(|strategy| format!("{strategy}")),
-                        (worker_count > 0)
-                            .then(|| format!("{} workers", format_count(worker_count as u64))),
-                        checklist_progress(&active_job.checklist),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                ),
-                FG,
-                ACCENT_DIM,
-            );
-
-            for (index, item) in active_job.checklist.iter().enumerate().take(6) {
-                let (marker, color) = checklist_status_marker(&item.status, self.spinner_index);
-                let title = if let Some(owner) = &item.owner {
-                    format!(
-                        "{}. {} · {}",
-                        index + 1,
-                        item.label,
-                        preview_line(owner, 10)
-                    )
-                } else {
-                    format!("{}. {}", index + 1, item.label)
-                };
-                push_sidebar_rail_item(
-                    lines,
-                    marker,
-                    color,
-                    preview_line(&title, 28),
-                    item.detail.as_ref().map(|detail| preview_line(detail, 28)),
-                    FG,
-                    ACCENT_DIM,
-                );
-            }
-        } else if self.state.loading {
-            let synthetic = synthetic_foreground_checklist(&self.state);
-            if !synthetic.is_empty() {
-                lines.push(Line::from(Span::raw("")));
-                lines.push(sidebar_header("Run Checklist"));
-                for (index, (label, status, color, detail)) in synthetic.into_iter().enumerate() {
-                    let marker = match status {
-                        "completed" => "[x]",
-                        "in_progress" => SPINNER_FRAMES[self.spinner_index],
-                        "blocked" => "[-]",
-                        "error" => "[!]",
-                        _ => "[ ]",
-                    };
-                    push_sidebar_rail_item(
-                        lines,
-                        marker,
-                        color,
-                        format!("{}. {}", index + 1, preview_line(&label, 28)),
-                        detail,
-                        FG,
-                        ACCENT_DIM,
-                    );
-                }
-            }
-        }
-
-        if !self.state.todos.is_empty() {
-            lines.push(Line::from(Span::raw("")));
-            lines.push(sidebar_header("Todo Board"));
-            let completed = self
-                .state
-                .todos
-                .iter()
-                .filter(|item| item.status == "completed")
-                .count();
-            let in_progress = self
-                .state
-                .todos
-                .iter()
-                .filter(|item| item.status == "in_progress")
-                .count();
-            let total = self.state.todos.len();
-            let todo_summary = [
-                Some(format!(
-                    "{}/{} done",
-                    format_count(completed as u64),
-                    format_count(total as u64)
-                )),
-                (in_progress > 0).then(|| format!("{} active", format_count(in_progress as u64))),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "shared execution plan".to_string(),
-                Some(todo_summary),
-                FG,
-                ACCENT_DIM,
-            );
-            for item in self.state.todos.iter().take(6) {
-                let (marker, color) = match item.status.as_str() {
-                    "completed" => ("[x]", SUCCESS),
-                    "in_progress" => ("[~]", ACCENT),
-                    _ => ("[ ]", ACCENT_DIM),
-                };
-                push_sidebar_selectable_item(
-                    lines,
-                    *item_index == self.sidebar_selection,
-                    marker,
-                    color,
-                    preview_line(&item.step, 28),
-                    item.owner
-                        .as_ref()
-                        .map(|owner| format!("{} · {}", owner, preview_line(&item.id, 8)))
-                        .or_else(|| Some(preview_line(&item.id, 8))),
-                    FG,
-                    ACCENT_DIM,
-                );
-                *item_index += 1;
-            }
-        }
-    }
-
-    fn render_sidebar_context_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
-        lines.push(sidebar_header("Context"));
-        if !self.state.ready {
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "starting runtime".to_string(),
-                Some("discovering auth, model bindings, and context".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-            return;
-        }
-        push_sidebar_selectable_item(
-            lines,
-            *item_index == self.sidebar_selection,
-            "◉",
-            ACCENT,
-            format!("{:>5.1}% footprint", self.state.context_percent * 100.0),
-            Some(format!(
-                "{}  {} / {}",
-                context_meter(self.state.context_percent, 10),
-                format_count(self.state.context_tokens),
-                format_count(self.state.context_limit)
-            )),
-            FG,
-            ACCENT_DIM,
-        );
-        *item_index += 1;
-        if let Some(estimate) = &self.state.request_estimate {
-            push_sidebar_selectable_item(
-                lines,
-                *item_index == self.sidebar_selection,
-                "→",
-                ACCENT,
-                "next request".to_string(),
-                Some(format!(
-                    "{} total · prompt {}",
-                    format_count(estimate.total),
-                    format_count(estimate.prompt),
-                )),
-                FG,
-                ACCENT_DIM,
-            );
-            *item_index += 1;
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "request mix".to_string(),
-                Some(format!(
-                    "system {} · history {} · tools {}",
-                    format_count(estimate.system),
-                    format_count(estimate.history),
-                    format_count(estimate.tools),
-                )),
-                FG,
-                ACCENT_DIM,
+                tick,
             );
         }
 
-        if let Some(preview) = &self.state.context_preview {
-            push_sidebar_rail_item(
-                lines,
-                "≡",
-                ACCENT_DIM,
-                "context snapshot".to_string(),
-                Some(preview_line(preview, 28)),
-                FG,
-                ACCENT_DIM,
-            );
-        }
-    }
-
-    fn render_sidebar_systems_tab(&self, lines: &mut Vec<Line<'static>>, item_index: &mut usize) {
-        lines.push(sidebar_header("Systems"));
-        push_sidebar_rail_item(
-            lines,
-            "·",
-            ACCENT_DIM,
-            format!("ddudu v{}", self.state.version),
-            Some(if self.state.permission_profile == "permissionless" {
-                "fire on (permissionless)".to_string()
-            } else {
-                format!("fire off ({})", self.state.permission_profile)
-            }),
-            FG,
-            ACCENT_DIM,
-        );
-        if !self.state.ready {
-            lines.push(Line::from(Span::raw("")));
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "runtime booting".to_string(),
-                Some("waiting for native controller state".to_string()),
-                FG,
-                ACCENT_DIM,
-            );
-            return;
-        }
-        lines.push(Line::from(Span::raw("")));
-        if let Some(mcp) = &self.state.mcp {
-            if mcp.configured_servers == 0 {
-                push_sidebar_rail_item(
-                    lines,
-                    "○",
-                    ACCENT_DIM,
-                    "MCP not configured".to_string(),
-                    Some("set servers in ~/.ddudu/config.yaml or .ddudu/config.yaml".to_string()),
-                    FG,
-                    ACCENT_DIM,
-                );
-            } else {
-                let title = if mcp.connected_servers > 0 {
-                    format!("MCP {} active", format_count(mcp.connected_servers))
-                } else {
-                    format!("MCP {} configured", format_count(mcp.configured_servers))
-                };
-                let detail = if mcp.connected_servers > 0 {
-                    Some(format!(
-                        "{} tools · {}",
-                        format_count(mcp.tool_count),
-                        preview_line(&mcp.connected_names.join(" · "), 28)
-                    ))
-                } else {
-                    Some(format!(
-                        "0 connected · {}",
-                        preview_line(&mcp.server_names.join(" · "), 28)
-                    ))
-                };
-                push_sidebar_selectable_item(
-                    lines,
-                    *item_index == self.sidebar_selection,
-                    if mcp.connected_servers > 0 {
-                        "◎"
-                    } else {
-                        "○"
-                    },
-                    if mcp.connected_servers > 0 {
-                        ACCENT
-                    } else {
-                        ACCENT_DIM
-                    },
-                    title,
-                    detail,
-                    FG,
-                    ACCENT_DIM,
-                );
-                *item_index += 1;
-            }
-        } else {
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "no mcp servers".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        }
-
-        if let Some(lsp) = &self.state.lsp {
-            if lsp.available_servers == 0 {
-                push_sidebar_rail_item(
-                    lines,
-                    "○",
-                    ACCENT_DIM,
-                    "semantic tools only".to_string(),
-                    Some("fallback search active".to_string()),
-                    FG,
-                    ACCENT_DIM,
-                );
-            } else {
-                let title = if lsp.connected_servers > 0 {
-                    format!("LSP {} active", format_count(lsp.connected_servers))
-                } else {
-                    format!("LSP {} available", format_count(lsp.available_servers))
-                };
-                let detail = if lsp.connected_servers > 0 {
-                    Some(preview_line(&lsp.connected_labels.join(" · "), 28))
-                } else {
-                    Some(format!(
-                        "available · {}",
-                        preview_line(&lsp.server_labels.join(" · "), 28)
-                    ))
-                };
-                push_sidebar_selectable_item(
-                    lines,
-                    *item_index == self.sidebar_selection,
-                    if lsp.connected_servers > 0 {
-                        "◎"
-                    } else {
-                        "○"
-                    },
-                    if lsp.connected_servers > 0 {
-                        ACCENT
-                    } else {
-                        ACCENT_DIM
-                    },
-                    title,
-                    detail,
-                    FG,
-                    ACCENT_DIM,
-                );
-                *item_index += 1;
-            }
-        } else {
-            push_sidebar_rail_item(
-                lines,
-                "·",
-                ACCENT_DIM,
-                "no language servers".to_string(),
-                None,
-                FG,
-                ACCENT_DIM,
-            );
-        }
-    }
-
-    fn render_sidebar_git_tab(&self, lines: &mut Vec<Line<'static>>) {
-        let Some(git) = &self.state.git else {
-            return;
-        };
-
-        lines.push(sidebar_header("Git"));
-
-        let branch_name = git.branch.as_deref().unwrap_or("detached");
-        let branch_display = preview_line(branch_name, 24);
-        push_sidebar_rail_item(lines, "⎇", ACCENT, branch_display, None, FG, ACCENT_DIM);
-
-        if git.changed_file_count > 0 || git.staged_file_count > 0 {
-            let marker = if git.has_uncommitted { "●" } else { "○" };
-            let color = if git.has_uncommitted { ORANGE } else { MUTED };
-            let title =
-                if git.staged_file_count > 0 && git.changed_file_count > git.staged_file_count {
-                    format!(
-                        "{} staged · {} unstaged",
-                        format_count(git.staged_file_count),
-                        format_count(git.changed_file_count - git.staged_file_count)
-                    )
-                } else if git.staged_file_count > 0 {
-                    format!("{} staged", format_count(git.staged_file_count))
-                } else {
-                    format!("{} changed", format_count(git.changed_file_count))
-                };
-            push_sidebar_rail_item(lines, marker, color, title, None, FG, ACCENT_DIM);
-
-            for file in git.changed_files.iter().take(5) {
-                let display_name = file.rsplit('/').next().unwrap_or(file);
-                push_sidebar_rail_item(
-                    lines,
-                    "·",
-                    MUTED,
-                    preview_line(display_name, 28),
-                    Some(preview_line(file, 28)),
-                    PATH,
-                    MUTED,
-                );
-            }
-            if git.changed_files.len() > 5 {
-                push_sidebar_rail_item(
-                    lines,
-                    "·",
-                    MUTED,
-                    format!("… +{} more", git.changed_files.len() - 5),
-                    None,
-                    MUTED,
-                    MUTED,
-                );
-            }
-        } else {
-            push_sidebar_rail_item(lines, "✓", SUCCESS, "clean".to_string(), None, MUTED, MUTED);
-        }
-    }
-
-    fn sidebar_targets(&self) -> Vec<SidebarTarget> {
-        let mut targets = Vec::new();
-        targets.extend(
-            self.state
-                .todos
-                .iter()
-                .enumerate()
-                .take(10)
-                .map(|(index, _)| SidebarTarget::Plan(index)),
-        );
-        targets.extend(
-            self.state
-                .agent_activities
-                .iter()
-                .enumerate()
-                .take(4)
-                .map(|(index, _)| SidebarTarget::Agent(index)),
-        );
-        targets.extend(
-            self.state
-                .background_jobs
-                .iter()
-                .enumerate()
-                .take(4)
-                .map(|(index, _)| SidebarTarget::Job(index)),
-        );
-        targets.push(SidebarTarget::ContextOverview);
-        if self.state.request_estimate.is_some() {
-            targets.push(SidebarTarget::ContextEstimate);
-        }
-        if self.state.mcp.is_some() {
-            targets.push(SidebarTarget::McpSummary);
-        }
-        if self.state.lsp.is_some() {
-            targets.push(SidebarTarget::LspSummary);
-        }
-        targets
-    }
-
-    fn clamp_sidebar_selection(&mut self) {
-        let total = self.sidebar_targets().len();
-        if total == 0 {
-            self.sidebar_selection = 0;
-        } else if self.sidebar_selection >= total {
-            self.sidebar_selection = total - 1;
-        }
-    }
-
-    fn set_sidebar_tab(&mut self, tab: SidebarTab) {
-        self.sidebar_tab = tab;
-        self.sidebar_selection = self.section_start_index(tab);
-        self.clamp_sidebar_selection();
-    }
-
-    fn section_start_index(&self, tab: SidebarTab) -> usize {
-        let plan_len = self.state.todos.iter().take(10).count();
-        let jobs_len = self.state.agent_activities.iter().take(4).count()
-            + self.state.background_jobs.iter().take(4).count();
-        let context_len = 1 + usize::from(self.state.request_estimate.is_some());
-        match tab {
-            SidebarTab::Plan => 0,
-            SidebarTab::Jobs => plan_len,
-            SidebarTab::Context => plan_len + jobs_len,
-            SidebarTab::Systems => plan_len + jobs_len + context_len,
-        }
-    }
-
-    fn render_notices(&self, frame: &mut Frame) {
-        if self.notices.is_empty() {
-            return;
-        }
-
-        let width = self
-            .notices
+        let current_jobs: HashMap<String, String> = next_state
+            .background_jobs
             .iter()
-            .map(|notice| notice.text.width() + 4)
-            .max()
-            .unwrap_or(24)
-            .min(frame.area().width.saturating_sub(4) as usize) as u16;
-
-        for (index, notice) in self.notices.iter().rev().take(3).enumerate() {
-            let area = Rect {
-                x: frame.area().right().saturating_sub(width + 2),
-                y: frame.area().y + 1 + (index as u16 * 3),
-                width,
-                height: 3,
-            };
-            frame.render_widget(Clear, area);
-            let color = match notice.tone {
-                NoticeTone::Info => ACCENT,
-                NoticeTone::Success => SUCCESS,
-                NoticeTone::Error => ERROR,
-            };
-            frame.render_widget(
-                Paragraph::new(Text::from(vec![Line::from(Span::styled(
-                    preview_line(&notice.text, width.saturating_sub(4) as usize),
-                    Style::default().fg(FG),
-                ))]))
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .style(Style::default().bg(BG).fg(color))
-                        .border_style(Style::default().fg(color)),
-                ),
-                area,
-            );
-        }
-    }
-
-    fn render_inspector(&self, frame: &mut Frame, inspector: &InspectorState) {
-        let area = centered_rect(
-            72,
-            frame.area().height.saturating_sub(6).min(24),
-            frame.area(),
-        );
-        frame.render_widget(Clear, area);
-        let inner = Rect {
-            x: area.x + 1,
-            y: area.y + 1,
-            width: area.width.saturating_sub(2),
-            height: area.height.saturating_sub(2),
-        };
-
-        let body_height = inner.height.saturating_sub(2) as usize;
-        let max_scroll = inspector.body.len().saturating_sub(body_height);
-        let scroll = inspector.scroll.min(max_scroll);
-        let visible = inspector
-            .body
-            .iter()
-            .skip(scroll)
-            .take(body_height)
-            .map(|line| render_inspector_line(line, inner.width as usize))
-            .collect::<Vec<_>>();
-
-        let footer = inspector
-            .footer
-            .as_ref()
-            .map(|footer| {
-                Line::from(Span::styled(
-                    footer.clone(),
-                    Style::default().fg(ACCENT_DIM),
-                ))
-            })
-            .unwrap_or_else(|| Line::from(Span::raw("")));
-
-        let mut content = vec![Line::from(Span::styled(
-            inspector.title.clone(),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ))];
-        content.extend(visible);
-        content.push(footer);
-
-        frame.render_widget(
-            Paragraph::new(Text::from(content)).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .style(Style::default().bg(BG).fg(FG))
-                    .border_style(Style::default().fg(ACCENT)),
-            ),
-            inner,
-        );
-    }
-
-    fn render_status_line(&self, frame: &mut Frame, area: Rect) {
-        let mut spans = Vec::new();
-
-        if self.state.loading {
-            let elapsed = format_elapsed(self.state.loading_since);
-            spans.push(Span::styled(
-                format!("{} ", SPINNER_FRAMES[self.spinner_index]),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                format!("running {elapsed}"),
-                Style::default().fg(FG),
-            ));
-            if !self.state.loading_label.is_empty() {
-                spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-                spans.push(Span::styled(
-                    &self.state.loading_label,
-                    Style::default().fg(ACCENT_DIM),
-                ));
-            }
-            spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            spans.push(Span::styled(
-                "Esc interrupt",
-                Style::default().fg(ACCENT_DIM),
-            ));
-        } else if let Some(prompt) = &self.state.ask_user {
-            spans.push(Span::styled(
-                "ask",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled("  ", Style::default().fg(ACCENT_DIM)));
-            spans.push(Span::styled(&prompt.question, Style::default().fg(FG)));
-        } else if let Some(error) = &self.state.error {
-            spans.push(Span::styled(error, Style::default().fg(ERROR)));
-        } else if !self.state.ready {
-            spans.push(Span::styled("booting…", Style::default().fg(ACCENT_DIM)));
-        } else {
-            let idle_hint = if self.state.queued_prompts.is_empty() {
-                "Ctrl+K commands  ·  Ctrl+Y sessions  ·  Shift+Tab mode"
-            } else {
-                "Ctrl+K commands  ·  Ctrl+Y sessions  ·  /queue inspect"
-            };
-            spans.push(Span::styled(idle_hint, Style::default().fg(ACCENT_DIM)));
-        }
-
-        if let Some(started_at) = self.streaming_start {
-            let elapsed = started_at.elapsed().as_secs_f64();
-            let safe_elapsed = elapsed.max(0.001);
-            let tok_per_sec = self.streaming_token_count as f64 / safe_elapsed;
-            if !spans.is_empty() {
-                spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            }
-            spans.push(Span::styled("⟩ ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{}", self.streaming_token_count),
-                Style::default().fg(ACCENT),
-            ));
-            spans.push(Span::styled(" tokens · ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{tok_per_sec:.0}"),
-                Style::default().fg(ACCENT),
-            ));
-            spans.push(Span::styled(" tok/s · ", Style::default().fg(MUTED)));
-            spans.push(Span::styled(
-                format!("{elapsed:.1}s"),
-                Style::default().fg(ACCENT),
-            ));
-        } else if let Some(done_at) = self.stream_done_at {
-            let elapsed = done_at.elapsed();
-            if elapsed <= Duration::from_millis(1200) {
-                let done_style = if elapsed <= Duration::from_millis(350) {
-                    Style::default().fg(ACCENT)
-                } else if elapsed <= Duration::from_millis(800) {
-                    Style::default().fg(ACCENT_DIM)
-                } else {
-                    Style::default().fg(MUTED)
-                };
-                if !spans.is_empty() {
-                    spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-                }
-                spans.push(Span::styled("done", done_style));
-            }
-        }
-
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
-            area,
-        );
-    }
-
-    fn render_queue_preview(&self, frame: &mut Frame, area: Rect) {
-        if area.height == 0 || self.state.queued_prompts.is_empty() || self.state.ask_user.is_some()
-        {
-            return;
-        }
-
-        let mut lines = vec![Line::from(vec![
-            Span::styled(
-                "Queue ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(
-                    "{} waiting",
-                    format_count(self.state.queued_prompts.len() as u64)
-                ),
-                Style::default().fg(ACCENT_DIM),
-            ),
-        ])];
-
-        let preview_rows = self.state.queued_prompts.len().min(3);
-        for (index, prompt) in self
-            .state
-            .queued_prompts
-            .iter()
-            .take(preview_rows)
-            .enumerate()
-        {
-            let marker = format!("{:>2}. ", index + 1);
-            let marker_width = marker.width();
-            lines.push(Line::from(vec![
-                Span::styled(marker, Style::default().fg(ACCENT_DIM)),
-                Span::styled(
-                    preview_line(
-                        prompt,
-                        area.width.saturating_sub(marker_width as u16) as usize,
-                    ),
-                    Style::default().fg(FG),
-                ),
-            ]));
-        }
-
-        let remaining = self.state.queued_prompts.len().saturating_sub(preview_rows);
-        if remaining > 0 {
-            lines.push(Line::from(vec![
-                Span::styled("… ", Style::default().fg(ACCENT_DIM)),
-                Span::styled(
-                    format!("+{} more queued", format_count(remaining as u64)),
-                    Style::default().fg(ACCENT_DIM),
-                ),
-            ]));
-        }
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
-            area,
-        );
-    }
-
-    fn render_composer(&self, frame: &mut Frame, area: Rect) -> (u16, u16) {
-        let divider = Span::styled(
-            "─".repeat(area.width as usize),
-            Style::default().fg(ACCENT_DIM),
-        );
-        frame.render_widget(
-            Paragraph::new(Line::from(divider)).style(Style::default().bg(COMPOSER_BG)),
-            Rect {
-                x: area.x,
-                y: area.y,
-                width: area.width,
-                height: 1,
-            },
-        );
-        frame.render_widget(
-            Block::default().style(Style::default().bg(COMPOSER_BG)),
-            Rect {
-                x: area.x,
-                y: area.y + 1,
-                width: area.width,
-                height: area.height.saturating_sub(1),
-            },
-        );
-
-        let inner = Rect {
-            x: area.x,
-            y: area.y + 1,
-            width: area.width,
-            height: area.height.saturating_sub(1),
-        };
-
-        let prompt_prefix = if self.state.ask_user.is_some() {
-            "? ".to_string()
-        } else {
-            "› ".to_string()
-        };
-
-        let prompt_style = Style::default().fg(ACCENT).add_modifier(Modifier::BOLD);
-        let content_width = inner.width.saturating_sub(prompt_prefix.width() as u16) as usize;
-        let paste_visible = self.pending_paste.is_some();
-        let ask_option_rows = self
-            .state
-            .ask_user
-            .as_ref()
-            .map(|prompt| {
-                let detail_rows = usize::from(
-                    prompt
-                        .detail
-                        .as_ref()
-                        .is_some_and(|detail| !detail.trim().is_empty()),
-                );
-                let meta_rows = usize::from(
-                    prompt.kind != "input"
-                        || prompt.default_value.is_some()
-                        || prompt.validation.is_some()
-                        || prompt.required,
-                );
-                let placeholder_rows = usize::from(
-                    prompt.allow_custom_answer
-                        && prompt
-                            .placeholder
-                            .as_ref()
-                            .is_some_and(|placeholder| !placeholder.trim().is_empty()),
-                );
-                let option_rows = if prompt.options.is_empty() {
-                    0usize
-                } else {
-                    prompt.options.len().min(3) + 1
-                };
-                detail_rows + meta_rows + placeholder_rows + option_rows
-            })
-            .unwrap_or(0);
-        let footer_rows = 1usize + ask_option_rows;
-        let metrics = wrap_editor_text(
-            &self.composer.text,
-            self.composer.cursor,
-            content_width.max(1),
-        );
-        let max_visible = inner
-            .height
-            .saturating_sub((footer_rows + usize::from(paste_visible)) as u16)
-            as usize;
-        let start = metrics
-            .lines
-            .len()
-            .saturating_sub(max_visible.max(1))
-            .min(metrics.cursor_row);
-        let visible_lines = metrics
-            .lines
-            .iter()
-            .skip(start)
-            .take(max_visible.max(1))
-            .cloned()
-            .collect::<Vec<_>>();
-
-        let mut lines = Vec::new();
-        if paste_visible {
-            let line_count = self
-                .pending_paste
-                .as_ref()
-                .map(|value| value.lines().count().max(1))
-                .unwrap_or(1);
-            lines.push(Line::from(vec![
-                Span::styled("[Paste ", Style::default().fg(ACCENT_DIM)),
-                Span::styled(
-                    format!("{} Lines", format_count(line_count as u64)),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    "] Enter insert · Esc cancel",
-                    Style::default().fg(ACCENT_DIM),
-                ),
-            ]));
-        }
-
-        if visible_lines.is_empty() {
-            lines.push(Line::from(vec![
-                Span::styled(prompt_prefix.clone(), prompt_style),
-                Span::styled("", Style::default().fg(FG)),
-            ]));
-        } else {
-            for (index, line) in visible_lines.iter().enumerate() {
-                let prefix = if index == 0 {
-                    prompt_prefix.clone()
-                } else {
-                    " ".repeat(prompt_prefix.width())
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, prompt_style),
-                    Span::styled(line.clone(), Style::default().fg(FG)),
-                ]));
-            }
-        }
-
-        if let Some(prompt) = &self.state.ask_user {
-            if let Some(detail) = &prompt.detail {
-                if !detail.trim().is_empty() {
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            "Context ",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(detail.clone(), Style::default().fg(ACCENT_DIM)),
-                    ]));
-                }
-            }
-
-            let input_kind = match prompt.kind.as_str() {
-                "confirm" => "confirm",
-                "single_select" => "single-select",
-                "number" => "number",
-                "path" => "path",
-                _ => "text",
-            };
-            let meta_parts = [
-                Some(format!("type {input_kind}")),
-                Some(if prompt.required {
-                    "required".to_string()
-                } else {
-                    "optional".to_string()
-                }),
-                prompt
-                    .default_value
-                    .as_ref()
-                    .map(|value| format!("default {value}")),
-                prompt
-                    .validation
-                    .as_ref()
-                    .and_then(|validation| validation.message.clone())
-                    .or_else(|| {
-                        prompt.validation.as_ref().map(|validation| {
-                            let mut parts = Vec::new();
-                            if let Some(min_length) = validation.min_length {
-                                parts.push(format!("min {}", min_length));
-                            }
-                            if let Some(max_length) = validation.max_length {
-                                parts.push(format!("max {}", max_length));
-                            }
-                            if validation.pattern.is_some() {
-                                parts.push("pattern".to_string());
-                            }
-                            parts.join(", ")
-                        })
-                    })
-                    .filter(|value| !value.is_empty()),
-            ]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-            if !meta_parts.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Input ",
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(meta_parts.join(" · "), Style::default().fg(ACCENT_DIM)),
-                ]));
-            }
-
-            if !prompt.options.is_empty() {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        if prompt.allow_custom_answer {
-                            "Suggested answers "
-                        } else {
-                            "Choices "
-                        },
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if prompt.kind == "confirm" || prompt.kind == "single_select" {
-                            "↑/↓ choose · 1-9 shortcut · Enter confirm"
-                        } else if prompt.allow_custom_answer {
-                            "↑/↓ choose · Enter use selection · type your own answer"
-                        } else {
-                            "↑/↓ choose · Enter confirm"
-                        },
-                        Style::default().fg(ACCENT_DIM),
-                    ),
-                ]));
-
-                let visible_count = prompt.options.len().min(3);
-                let start = self
-                    .ask_user_selection
-                    .saturating_add(1)
-                    .saturating_sub(visible_count)
-                    .min(prompt.options.len().saturating_sub(visible_count));
-
-                for (index, option) in prompt
-                    .options
-                    .iter()
-                    .enumerate()
-                    .skip(start)
-                    .take(visible_count)
-                {
-                    let selected = index == self.ask_user_selection;
-                    let marker = if selected { "› " } else { "  " };
-                    let marker_style = if selected {
-                        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(ACCENT_DIM)
-                    };
-                    let option_color = if option.danger {
-                        ERROR
-                    } else if option.recommended {
-                        SUCCESS
-                    } else {
-                        FG
-                    };
-                    let option_style = if selected {
-                        Style::default()
-                            .fg(option_color)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(option_color)
-                    };
-                    let badges = [
-                        option.shortcut.as_ref().map(|value| format!("[{}]", value)),
-                        option.recommended.then(|| "recommended".to_string()),
-                        option.danger.then(|| "danger".to_string()),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                    lines.push(Line::from(vec![
-                        Span::styled(marker, marker_style),
-                        Span::styled(option.label.clone(), option_style),
-                        Span::styled(
-                            if badges.is_empty() {
-                                String::new()
-                            } else {
-                                format!("  {badges}")
-                            },
-                            Style::default().fg(ACCENT_DIM),
-                        ),
-                        Span::styled(
-                            option
-                                .description
-                                .as_ref()
-                                .map(|desc| format!("  {desc}"))
-                                .unwrap_or_default(),
-                            Style::default().fg(ACCENT_DIM),
-                        ),
-                    ]));
-                }
-            }
-
-            if prompt.allow_custom_answer {
-                if let Some(placeholder) = &prompt.placeholder {
-                    if !placeholder.trim().is_empty() {
-                        lines.push(Line::from(vec![
-                            Span::styled(
-                                "Custom answer ",
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                            ),
-                            Span::styled(placeholder.clone(), Style::default().fg(ACCENT_DIM)),
-                        ]));
-                    }
+            .map(|job| (job.id.clone(), job.status.clone()))
+            .collect();
+        for job in &next_state.background_jobs {
+            if let Some(prev) = self.last_job_statuses.get(&job.id) {
+                if prev == "running" && job.status == "done" {
+                    self.toast.success(format!("{} finished", job.label), tick);
+                } else if (prev == "running" || prev == "done") && job.status == "cancelled" {
+                    self.toast.info(format!("{} cancelled", job.label), tick);
+                } else if (prev == "running" || prev == "done") && job.status == "error" {
+                    self.toast.error(format!("{} failed", job.label), tick);
                 }
             }
         }
 
-        let mut footer_spans = build_mode_badge_spans(&self.state);
-        if self.state.ask_user.is_some() {
-            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            footer_spans.push(Span::styled(
+        let verification_status = next_state.verification.as_ref().map(|v| v.status.clone());
+        if self.last_verification_status.as_deref() != verification_status.as_deref() {
+            if let Some(status) = verification_status.as_deref() {
+                if status == "passed" {
+                    self.toast.success("verification passed", tick);
+                } else if status == "failed" {
+                    self.toast.error("verification failed", tick);
+                }
+            }
+        }
+
+        let had_ask_user = self.state.ask_user.is_some();
+        let has_ask_user = next_state.ask_user.is_some();
+        self.state = next_state;
+
+        if !had_ask_user && has_ask_user {
+            self.ask_user_input = TextInputState::with_placeholder(
                 self.state
                     .ask_user
                     .as_ref()
-                    .and_then(|prompt| prompt.submit_label.clone())
-                    .unwrap_or_else(|| {
-                        if self
-                            .state
-                            .ask_user
-                            .as_ref()
-                            .is_some_and(|prompt| prompt.allow_custom_answer)
-                        {
-                            "Enter send".to_string()
-                        } else {
-                            "Enter select".to_string()
-                        }
-                    }),
-                Style::default().fg(ACCENT_DIM),
-            ));
-        } else {
-            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            footer_spans.push(Span::styled(
-                "Ctrl+K palette",
-                Style::default().fg(ACCENT_DIM),
-            ));
-            footer_spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
-            footer_spans.push(Span::styled(
-                "Ctrl+P @file",
-                Style::default().fg(ACCENT_DIM),
-            ));
-        }
-        if self.state.context_percent > 0.0 {
-            footer_spans.push(Span::styled("  ", Style::default()));
-            let pct = (self.state.context_percent * 100.0) as u8;
-            let meter_color = if pct >= 80 {
-                ERROR
-            } else if pct >= 60 {
-                ORANGE
-            } else {
-                MUTED
-            };
-            footer_spans.push(Span::styled(
-                format!("ctx {pct}%"),
-                Style::default().fg(meter_color),
-            ));
-        }
-        lines.push(Line::from(footer_spans));
-
-        frame.render_widget(
-            Paragraph::new(Text::from(lines)).style(Style::default().bg(BG)),
-            inner,
-        );
-
-        let cursor_x = inner.x + prompt_prefix.width() as u16 + metrics.cursor_col as u16;
-        let cursor_y = inner.y + (metrics.cursor_row.saturating_sub(start) as u16);
-        (
-            cursor_x.min(inner.right().saturating_sub(1)),
-            cursor_y.min(inner.bottom().saturating_sub(2)),
-        )
-    }
-
-    fn render_popup(&self, _frame: &mut Frame, body_area: Rect) -> Option<(Rect, Vec<Suggestion>)> {
-        if let Some(palette) = &self.palette {
-            let items = self.current_palette_items(&palette.query);
-            let _width = items
-                .iter()
-                .map(|item| item.label.width() + item.description.width() + 6)
-                .max()
-                .unwrap_or(28)
-                .min(body_area.width.saturating_sub(6) as usize) as u16;
-            let height = min(items.len().max(1), 10) as u16;
-            let area = centered_rect(
-                72,
-                height
-                    .saturating_add(3)
-                    .min(body_area.height.saturating_sub(1)),
-                body_area,
+                    .and_then(|a| a.placeholder.clone())
+                    .unwrap_or_else(|| "answer".to_string()),
             );
-            return Some((
-                area,
-                items
-                    .into_iter()
-                    .take(10)
-                    .map(|item| Suggestion {
-                        kind: SuggestionKind::Slash,
-                        value: item.label,
-                        description: item.description,
-                    })
-                    .collect(),
-            ));
-        }
-
-        let suggestions = self.current_suggestions();
-        if suggestions.is_empty() {
-            return None;
-        }
-
-        let width = suggestions
-            .iter()
-            .map(|item| item.value.width() + item.description.width() + 6)
-            .max()
-            .unwrap_or(20)
-            .min(body_area.width.saturating_sub(4) as usize) as u16;
-        let height = min(suggestions.len(), 8) as u16;
-        let area = Rect {
-            x: body_area.x + 2,
-            y: body_area.bottom().saturating_sub(height + 2),
-            width: width + 2,
-            height: height + 1,
-        };
-
-        Some((area, suggestions.into_iter().take(8).collect()))
-    }
-
-    fn current_suggestions(&self) -> Vec<Suggestion> {
-        let input = self.composer.trim();
-        if input.is_empty() {
-            return Vec::new();
-        }
-
-        if input == "/mode" || input.starts_with("/mode ") {
-            let query = input.strip_prefix("/mode").unwrap_or("").trim();
-            let query_lower = query.to_lowercase();
-            return self
+            self.ask_user_input.value = self
                 .state
-                .modes
-                .iter()
-                .filter(|mode| {
-                    query_lower.is_empty()
-                        || mode.name.starts_with(&query_lower)
-                        || mode.label.to_lowercase().starts_with(&query_lower)
-                })
-                .map(|mode| Suggestion {
-                    kind: SuggestionKind::Mode,
-                    value: mode.name.clone(),
-                    description: format!("{} · {}", mode.label, mode.tagline),
-                })
-                .collect();
+                .ask_user
+                .as_ref()
+                .and_then(|a| a.default_value.clone())
+                .unwrap_or_default();
+            self.ask_user_input.cursor = self.ask_user_input.value.chars().count();
+            sync_ask_user_radio(&self.state.ask_user, &mut self.ask_user_radio);
         }
 
-        if input == "/model" || input.starts_with("/model ") {
-            let query = input.strip_prefix("/model").unwrap_or("").trim();
-            return self
-                .state
-                .models
-                .iter()
-                .filter(|model| query.is_empty() || model.starts_with(query))
-                .map(|model| Suggestion {
-                    kind: SuggestionKind::Model,
-                    value: model.clone(),
-                    description: self.state.provider.clone(),
-                })
-                .collect();
-        }
+        self.last_mode = self.state.mode.clone();
+        self.last_model = self.state.model.clone();
+        self.last_provider = self.state.provider.clone();
+        self.last_job_statuses = current_jobs;
+        self.last_verification_status = verification_status;
 
-        if let Some(query) = self.current_file_query() {
-            return self.current_file_suggestions(&query);
-        }
-
-        if !input.starts_with('/') || input.contains(' ') {
-            return Vec::new();
-        }
-
-        self.state
-            .slash_commands
-            .iter()
-            .filter(|command| command.value.starts_with(&input.to_lowercase()))
-            .map(|command| Suggestion {
-                kind: SuggestionKind::Slash,
-                value: command.value.clone(),
-                description: command.description.clone(),
-            })
-            .collect()
-    }
-
-    fn current_palette_items(&self, query: &str) -> Vec<PaletteItem> {
-        let q = query.trim().to_lowercase();
-        let mut items = Vec::new();
-
-        if q.is_empty()
-            || "resume session".contains(&q)
-            || "saved session".contains(&q)
-            || "/session pick".contains(&q)
-        {
-            items.push(PaletteItem {
-                label: "Resume saved session".to_string(),
-                description: "sessions".to_string(),
-                action: PaletteAction::InsertSlash("/session pick".to_string()),
-            });
-        }
-
-        if q.is_empty() || "queued prompts".contains(&q) || "/queue".contains(&q) {
-            items.push(PaletteItem {
-                label: "Inspect queued prompts".to_string(),
-                description: "queue".to_string(),
-                action: PaletteAction::InsertSlash("/queue".to_string()),
-            });
-        }
-
-        if q.is_empty() || "detached jobs".contains(&q) || "/jobs".contains(&q) {
-            items.push(PaletteItem {
-                label: "Inspect detached jobs".to_string(),
-                description: "jobs".to_string(),
-                action: PaletteAction::InsertSlash("/jobs".to_string()),
-            });
-        }
-
-        if q.is_empty() || "recent artifacts".contains(&q) || "/artifacts".contains(&q) {
-            items.push(PaletteItem {
-                label: "Inspect recent artifacts".to_string(),
-                description: "artifacts".to_string(),
-                action: PaletteAction::InsertSlash("/artifacts".to_string()),
-            });
-        }
-
-        if q.is_empty() || "context inspector".contains(&q) || "injected context".contains(&q) {
-            items.push(PaletteItem {
-                label: "Inspect injected context".to_string(),
-                description: "context".to_string(),
-                action: PaletteAction::OpenContext,
-            });
-        }
-
-        if q.is_empty() || "diff viewer".contains(&q) || "workspace changes".contains(&q) {
-            items.push(PaletteItem {
-                label: "Inspect workspace changes".to_string(),
-                description: "workspace".to_string(),
-                action: PaletteAction::OpenDiff(None),
-            });
-        }
-
-        for (index, artifact) in self.state.artifacts.iter().enumerate().take(6) {
-            let label = format!("Inspect artifact · {}", preview_line(&artifact.title, 28));
-            let haystack = format!(
-                "{label} {} {} {}",
-                artifact.kind, artifact.source, artifact.summary
-            )
-            .to_lowercase();
-            if q.is_empty() || haystack.contains(&q) {
-                items.push(PaletteItem {
-                    label,
-                    description: format!("{} · {}", artifact.kind, artifact.source),
-                    action: PaletteAction::OpenTarget(SidebarTarget::Artifact(index)),
-                });
-            }
-        }
-
-        for path in self.ranked_file_paths(&q, 6) {
-            let label = format!("Insert file path · {}", preview_line(&path, 32));
-            items.push(PaletteItem {
-                label,
-                description: "files".to_string(),
-                action: PaletteAction::InsertText(format!("@{path}")),
-            });
-        }
-
-        for (index, job) in self.state.background_jobs.iter().enumerate().take(6) {
-            let label = format!("Inspect job · {}", preview_line(&job.label, 28));
-            if q.is_empty() || label.to_lowercase().contains(&q) {
-                items.push(PaletteItem {
-                    label,
-                    description: job.status.clone(),
-                    action: PaletteAction::OpenTarget(SidebarTarget::Job(index)),
-                });
-            }
-        }
-
-        for (index, prompt) in self.state.queued_prompts.iter().enumerate().take(6) {
-            let label = format!("Inspect queue {} · {}", index + 1, preview_line(prompt, 28));
-            if q.is_empty() || label.to_lowercase().contains(&q) {
-                items.push(PaletteItem {
-                    label,
-                    description: "queued prompt".to_string(),
-                    action: PaletteAction::OpenTarget(SidebarTarget::Queue(index)),
-                });
-            }
-        }
-
-        items.extend(self.state.slash_commands.iter().filter_map(|command| {
-            let haystack = format!("{} {}", command.value, command.description).to_lowercase();
-            if !q.is_empty() && !haystack.contains(&q) {
-                return None;
-            }
-            Some(PaletteItem {
-                label: command.value.clone(),
-                description: command.description.clone(),
-                action: PaletteAction::InsertSlash(command.value.clone()),
-            })
-        }));
-
-        for tab in SidebarTab::all() {
-            let label = format!("Jump to {} section", tab.label());
-            if q.is_empty() || label.to_lowercase().contains(&q) {
-                items.push(PaletteItem {
-                    label,
-                    description: "sidebar".to_string(),
-                    action: PaletteAction::SwitchTab(tab),
-                });
-            }
-        }
-
-        items
-    }
-
-    fn handle_event(&mut self, event: Event) -> Result<()> {
-        match event {
-            Event::Key(key) => {
-                let result = self.handle_key(key);
-                self.refresh_context_prefetch();
-                result
-            }
-            Event::Mouse(mouse) => {
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => {
-                        self.auto_scroll = false;
-                        self.scroll = self.scroll.saturating_sub(3);
-                    }
-                    MouseEventKind::ScrollDown => {
-                        self.auto_scroll = false;
-                        self.scroll = self.scroll.saturating_add(3);
-                    }
-                    _ => {}
-                }
-                Ok(())
-            }
-            Event::Paste(text) => {
-                if text.contains('\n') || text.contains('\r') {
-                    self.pending_paste = Some(text);
-                    let line_count = self
-                        .pending_paste
-                        .as_ref()
-                        .map(|value| value.lines().count().max(1))
-                        .unwrap_or(1);
-                    self.push_notice(
-                        format!("paste held · {} lines", format_count(line_count as u64)),
-                        NoticeTone::Info,
-                    );
-                } else {
-                    self.composer.insert_text(&text);
-                }
-                self.refresh_context_prefetch();
-                Ok(())
-            }
-            _ => Ok(()),
+        if self.auto_scroll {
+            self.transcript_scroll.offset = usize::MAX;
         }
     }
+}
 
-    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
-        let suggestions = self.current_suggestions();
-        let popup_visible = self.palette.is_some() || !suggestions.is_empty();
-        let composer_empty = self.composer.trim().is_empty();
+fn initial_state() -> NativeTuiState {
+    NativeTuiState {
+        ready: false,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        cwd: String::new(),
+        mode: "jennie".to_string(),
+        modes: Vec::new(),
+        provider: "anthropic".to_string(),
+        model: "claude-opus-4-6".to_string(),
+        models: Vec::new(),
+        auth_type: None,
+        auth_source: None,
+        permission_profile: "workspace-write".to_string(),
+        loading: false,
+        loading_label: String::new(),
+        loading_since: None,
+        playing_with_fire: false,
+        context_percent: 0.0,
+        context_tokens: 0,
+        context_limit: 0,
+        context_preview: None,
+        request_estimate: None,
+        queued_prompts: Vec::new(),
+        providers: Vec::new(),
+        mcp: None,
+        lsp: None,
+        messages: Vec::new(),
+        ask_user: None,
+        slash_commands: Vec::new(),
+        session_id: None,
+        remote_session_id: None,
+        remote_session_count: 0,
+        team_run_strategy: None,
+        team_run_task: None,
+        team_run_since: None,
+        todos: Vec::new(),
+        agent_activities: Vec::new(),
+        background_jobs: Vec::new(),
+        artifacts: Vec::new(),
+        git: None,
+        workspace: None,
+        verification: None,
+        error: None,
+    }
+}
 
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
-            if self.state.loading {
-                self.bridge.send(BridgeCommand::Abort)?;
-            } else {
-                self.should_quit = true;
-            }
-            return Ok(());
-        }
+fn spawn_bridge(
+    node_path: &str,
+    bridge_path: &str,
+) -> Result<(Child, ChildStdin, Receiver<Result<BridgeEvent>>)> {
+    let mut child = Command::new(node_path)
+        .arg(bridge_path)
+        .arg("bridge")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("failed to start bridge: {bridge_path}"))?;
 
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('k') {
-            if self.palette.is_some() {
-                self.palette = None;
-            } else {
-                self.palette = Some(PaletteState {
-                    query: String::new(),
-                    selected: 0,
-                });
-                self.inspector = None;
-            }
-            return Ok(());
-        }
+    let stdin = child.stdin.take().context("bridge stdin unavailable")?;
+    let stdout = child.stdout.take().context("bridge stdout unavailable")?;
+    let (tx, rx) = mpsc::channel::<Result<BridgeEvent>>();
 
-        if self.inspector.is_some() {
-            return self.handle_inspector_key(key);
-        }
-
-        if self.palette.is_some() {
-            return self.handle_palette_key(key);
-        }
-
-        if self.pending_paste.is_some() {
-            match key.code {
-                KeyCode::Enter => {
-                    if let Some(paste) = self.pending_paste.take() {
-                        self.composer.insert_text(&paste);
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines() {
+            let outcome = match line {
+                Ok(raw) => {
+                    let trimmed = raw.trim();
+                    if trimmed.is_empty() {
+                        continue;
                     }
-                    return Ok(());
-                }
-                KeyCode::Esc => {
-                    self.pending_paste = None;
-                    return Ok(());
-                }
-                _ => return Ok(()),
-            }
-        }
-
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
-            self.bridge.send(BridgeCommand::ClearMessages)?;
-            return Ok(());
-        }
-
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('y') {
-            self.execute_slash_command("/session pick")?;
-            self.push_notice("session picker".to_string(), NoticeTone::Info);
-            return Ok(());
-        }
-
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('p') {
-            if self.composer.trim().is_empty() {
-                self.composer.set_text("@".to_string());
-            } else if self
-                .composer
-                .text
-                .chars()
-                .last()
-                .is_some_and(|ch| ch.is_whitespace())
-            {
-                self.composer.insert_text("@");
-            } else {
-                self.composer.insert_text(" @");
-            }
-            self.selected_suggestion = 0;
-            self.push_notice("file picker".to_string(), NoticeTone::Info);
-            return Ok(());
-        }
-
-        if key.code == KeyCode::BackTab
-            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-        {
-            self.bridge
-                .send(BridgeCommand::CycleMode { direction: 1 })?;
-            return Ok(());
-        }
-
-        if key.code == KeyCode::Esc {
-            if self.state.loading {
-                self.bridge.send(BridgeCommand::Abort)?;
-            } else {
-                self.composer.clear();
-                self.selected_suggestion = 0;
-            }
-            return Ok(());
-        }
-
-        if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('j') {
-            self.composer.insert_text("\n");
-            return Ok(());
-        }
-
-        if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::SHIFT) {
-            self.composer.insert_text("\n");
-            return Ok(());
-        }
-
-        if let Some(prompt) = self.state.ask_user.clone() {
-            if matches!(key.code, KeyCode::Up) && composer_empty && !prompt.options.is_empty() {
-                if self.ask_user_selection > 0 {
-                    self.ask_user_selection -= 1;
-                }
-                return Ok(());
-            }
-
-            if matches!(key.code, KeyCode::Down) && composer_empty && !prompt.options.is_empty() {
-                if self.ask_user_selection + 1 < prompt.options.len() {
-                    self.ask_user_selection += 1;
-                }
-                return Ok(());
-            }
-
-            if composer_empty && key.modifiers.is_empty() && matches!(key.code, KeyCode::Char(_)) {
-                let KeyCode::Char(ch) = key.code else {
-                    unreachable!()
-                };
-                if let Some(index) = self.ask_user_shortcut_index(&prompt, ch) {
-                    self.ask_user_selection = index;
-                    self.submit_selected_ask_user_choice(&prompt, index, "choice")?;
-                    self.composer.clear();
-                    self.clear_context_prefetch();
-                    return Ok(());
-                }
-            }
-        }
-
-        if !popup_visible && self.state.ask_user.is_none() && composer_empty {
-            match key.code {
-                KeyCode::Up => {
-                    if !self.prompt_history.is_empty() {
-                        let new_index = match self.history_index {
-                            None => {
-                                self.history_stash = Some(self.composer.text.clone());
-                                self.prompt_history.len() - 1
-                            }
-                            Some(i) if i > 0 => i - 1,
-                            Some(i) => i,
-                        };
-                        self.history_index = Some(new_index);
-                        self.composer
-                            .set_text(self.prompt_history[new_index].clone());
+                    let payload = if let Some(rest) = trimmed.strip_prefix(BRIDGE_EVENT_PREFIX) {
+                        rest
+                    } else if trimmed.starts_with('{') {
+                        trimmed
                     } else {
-                        self.auto_scroll = false;
-                        self.scroll = self.scroll.saturating_sub(1);
-                    }
-                    return Ok(());
-                }
-                KeyCode::Down => {
-                    if let Some(i) = self.history_index {
-                        if i + 1 < self.prompt_history.len() {
-                            let new_index = i + 1;
-                            self.history_index = Some(new_index);
-                            self.composer
-                                .set_text(self.prompt_history[new_index].clone());
+                        continue;
+                    };
+
+                    (|| -> Result<BridgeEvent> {
+                        let decoded = if payload.starts_with('{') {
+                            payload.to_string()
                         } else {
-                            self.history_index = None;
-                            self.composer
-                                .set_text(self.history_stash.take().unwrap_or_default());
-                        }
-                    } else {
-                        self.auto_scroll = false;
-                        self.scroll = self.scroll.saturating_add(1);
-                    }
-                    return Ok(());
+                            let bytes = BASE64_STANDARD.decode(payload).map_err(|error| {
+                                anyhow!("failed to decode bridge event: {error}")
+                            })?;
+                            String::from_utf8(bytes).map_err(|error| {
+                                anyhow!("failed to decode bridge event utf8: {error}")
+                            })?
+                        };
+
+                        serde_json::from_str::<BridgeEvent>(&decoded)
+                            .map_err(|error| anyhow!("failed to parse bridge event: {error}"))
+                    })()
                 }
-                _ => {}
-            }
-        }
-
-        if popup_visible && key.code == KeyCode::Up {
-            if self.selected_suggestion > 0 {
-                self.selected_suggestion -= 1;
-            }
-            return Ok(());
-        }
-
-        if popup_visible && key.code == KeyCode::Down {
-            if self.selected_suggestion + 1 < suggestions.len() {
-                self.selected_suggestion += 1;
-            }
-            return Ok(());
-        }
-
-        match key.code {
-            KeyCode::Enter => self.submit_or_accept(popup_visible, &suggestions),
-            KeyCode::Tab => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.bridge
-                        .send(BridgeCommand::CycleMode { direction: 1 })?;
-                    return Ok(());
-                }
-                if popup_visible {
-                    self.accept_suggestion(&suggestions)?;
-                } else {
-                    self.composer.insert_text("  ");
-                }
-                Ok(())
-            }
-            KeyCode::Backspace => {
-                self.composer.backspace();
-                self.selected_suggestion = 0;
-                Ok(())
-            }
-            KeyCode::Delete => {
-                self.composer.delete();
-                self.selected_suggestion = 0;
-                Ok(())
-            }
-            KeyCode::Left => {
-                self.composer.move_left();
-                Ok(())
-            }
-            KeyCode::Right => {
-                self.composer.move_right();
-                Ok(())
-            }
-            KeyCode::Home => {
-                self.composer.move_home();
-                Ok(())
-            }
-            KeyCode::End => {
-                self.composer.move_end();
-                self.auto_scroll = true;
-                Ok(())
-            }
-            KeyCode::PageUp => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_sub(10);
-                Ok(())
-            }
-            KeyCode::PageDown => {
-                self.auto_scroll = false;
-                self.scroll = self.scroll.saturating_add(10);
-                Ok(())
-            }
-            KeyCode::Char(ch) => {
-                if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    return Ok(());
-                }
-                self.composer.insert_text(&ch.to_string());
-                self.selected_suggestion = 0;
-                Ok(())
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn submit_or_accept(&mut self, popup_visible: bool, suggestions: &[Suggestion]) -> Result<()> {
-        if popup_visible {
-            let input = self.composer.trim();
-            if suggestions
-                .get(self.selected_suggestion)
-                .map(|suggestion| {
-                    matches!(suggestion.kind, SuggestionKind::Slash)
-                        && (input != suggestion.value
-                            || suggestion.value == "/mode"
-                            || suggestion.value == "/model")
-                })
-                .unwrap_or(false)
-            {
-                self.accept_suggestion(suggestions)?;
-                return Ok(());
-            }
-
-            if suggestions
-                .get(self.selected_suggestion)
-                .map(|suggestion| {
-                    matches!(
-                        suggestion.kind,
-                        SuggestionKind::Mode | SuggestionKind::Model
-                    )
-                })
-                .unwrap_or(false)
-            {
-                self.accept_suggestion(suggestions)?;
-                return Ok(());
-            }
-        }
-
-        let trimmed = self.composer.trim();
-        if trimmed.is_empty() {
-            if let Some(prompt) = self.state.ask_user.clone() {
-                if self.submit_default_ask_user_answer(&prompt)? {
-                    self.composer.clear();
-                    self.clear_context_prefetch();
-                    return Ok(());
-                }
-
-                if let Some(choice_index) = prompt
-                    .default_option_index
-                    .or_else(|| (!prompt.options.is_empty()).then_some(self.ask_user_selection))
-                {
-                    self.submit_selected_ask_user_choice(&prompt, choice_index, "choice")?;
-                } else if !prompt.required {
-                    self.send_ask_user_answer(String::new(), "default", None, None)?;
-                }
-            }
-            self.composer.clear();
-            self.clear_context_prefetch();
-            return Ok(());
-        }
-
-        if let Some(prompt) = self.state.ask_user.clone() {
-            if prompt.allow_custom_answer {
-                if let Some(message) = self.validate_ask_user_input(&prompt, &trimmed) {
-                    self.push_notice(message, NoticeTone::Error);
-                    return Ok(());
-                }
-                self.send_ask_user_answer(trimmed.clone(), "custom", None, None)?;
-            } else if let Some(choice_index) = prompt
-                .default_option_index
-                .or_else(|| (!prompt.options.is_empty()).then_some(self.ask_user_selection))
-            {
-                self.submit_selected_ask_user_choice(&prompt, choice_index, "choice")?;
-            }
-            self.composer.clear();
-            self.clear_context_prefetch();
-            return Ok(());
-        }
-
-        if trimmed.starts_with('/') {
-            self.execute_slash_command(&trimmed)?;
-            self.composer.clear();
-            self.clear_context_prefetch();
-            return Ok(());
-        }
-
-        self.bridge.send(BridgeCommand::Submit {
-            content: trimmed.clone(),
-        })?;
-        if self.prompt_history.last().map(|s| s.as_str()) != Some(&trimmed) {
-            if self.prompt_history.len() >= MAX_PROMPT_HISTORY {
-                self.prompt_history.remove(0);
-            }
-            self.prompt_history.push(trimmed);
-        }
-        self.history_index = None;
-        self.history_stash = None;
-        self.composer.clear();
-        self.clear_context_prefetch();
-        self.auto_scroll = true;
-        Ok(())
-    }
-
-    fn accept_suggestion(&mut self, suggestions: &[Suggestion]) -> Result<()> {
-        let Some(selected) = suggestions.get(self.selected_suggestion).cloned() else {
-            return Ok(());
-        };
-
-        match selected.kind {
-            SuggestionKind::Slash => {
-                if selected.value == "/mode" || selected.value == "/model" {
-                    self.composer.set_text(format!("{} ", selected.value));
-                } else {
-                    self.composer.set_text(selected.value);
-                }
-            }
-            SuggestionKind::Mode => {
-                self.bridge.send(BridgeCommand::SetMode {
-                    mode: selected.value,
-                })?;
-                self.composer.clear();
-            }
-            SuggestionKind::Model => {
-                self.bridge.send(BridgeCommand::SetModel {
-                    model: selected.value,
-                })?;
-                self.composer.clear();
-            }
-            SuggestionKind::File => {
-                self.replace_trailing_token(&format!("@{}", selected.value));
-            }
-        }
-
-        self.selected_suggestion = 0;
-        Ok(())
-    }
-
-    fn execute_slash_command(&mut self, command: &str) -> Result<()> {
-        if matches!(command.trim(), "/quit" | "/exit") {
-            self.should_quit = true;
-            return Ok(());
-        }
-
-        self.bridge.send(BridgeCommand::RunSlash {
-            command: command.to_string(),
-        })?;
-
-        Ok(())
-    }
-
-    fn handle_palette_key(&mut self, key: KeyEvent) -> Result<()> {
-        let mut apply: Option<PaletteAction> = None;
-        let Some((mut query, mut selected)) = self
-            .palette
-            .as_ref()
-            .map(|palette| (palette.query.clone(), palette.selected))
-        else {
-            return Ok(());
-        };
-
-        match key.code {
-            KeyCode::Esc => {
-                self.palette = None;
-                return Ok(());
-            }
-            KeyCode::Up => {
-                selected = selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                let len = self.current_palette_items(&query).len();
-                if selected + 1 < len {
-                    selected += 1;
-                }
-            }
-            KeyCode::Backspace => {
-                query.pop();
-                selected = 0;
-            }
-            KeyCode::Enter => {
-                let items = self.current_palette_items(&query);
-                if let Some(item) = items.get(selected) {
-                    apply = Some(item.action.clone());
-                }
-            }
-            KeyCode::Char(ch) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                    query.push(ch);
-                    selected = 0;
-                }
-            }
-            _ => return Ok(()),
-        }
-
-        if let Some(palette) = &mut self.palette {
-            palette.query = query;
-            palette.selected = selected;
-        }
-
-        if let Some(action) = apply {
-            self.palette = None;
-            self.execute_palette_action(action)?;
-        }
-
-        Ok(())
-    }
-
-    fn execute_palette_action(&mut self, action: PaletteAction) -> Result<()> {
-        match action {
-            PaletteAction::InsertSlash(command) => {
-                self.composer.set_text(command);
-                self.selected_suggestion = 0;
-            }
-            PaletteAction::InsertText(value) => {
-                if self.current_file_query().is_some() {
-                    self.replace_trailing_token(&value);
-                } else if self.composer.trim().is_empty() {
-                    self.composer.set_text(value);
-                } else if self
-                    .composer
-                    .text
-                    .chars()
-                    .last()
-                    .is_some_and(|ch| ch.is_whitespace())
-                {
-                    self.composer.insert_text(&value);
-                } else {
-                    self.composer.insert_text(&format!(" {value}"));
-                }
-                self.selected_suggestion = 0;
-            }
-            PaletteAction::SwitchTab(tab) => self.set_sidebar_tab(tab),
-            PaletteAction::OpenTarget(target) => self.open_sidebar_target(target)?,
-            PaletteAction::OpenContext => self.open_context_inspector(),
-            PaletteAction::OpenDiff(cwd) => {
-                self.open_diff_viewer(cwd, "Workspace Diff".to_string())?
-            }
-        }
-        Ok(())
-    }
-
-    fn handle_inspector_key(&mut self, key: KeyEvent) -> Result<()> {
-        let mut close = false;
-        let mut open_diff: Option<(Option<String>, String)> = None;
-        let mut run_command: Option<String> = None;
-
-        if let Some(inspector) = &mut self.inspector {
-            match key.code {
-                KeyCode::Esc => close = true,
-                KeyCode::Up => {
-                    inspector.scroll = inspector.scroll.saturating_sub(1);
-                }
-                KeyCode::Down => {
-                    inspector.scroll = inspector.scroll.saturating_add(1);
-                }
-                KeyCode::PageUp => {
-                    inspector.scroll = inspector.scroll.saturating_sub(8);
-                }
-                KeyCode::PageDown => {
-                    inspector.scroll = inspector.scroll.saturating_add(8);
-                }
-                KeyCode::Char('v') => match &inspector.kind {
-                    InspectorKind::Job(job_id) => {
-                        if let Some(job) = self
-                            .state
-                            .background_jobs
-                            .iter()
-                            .find(|item| item.id == *job_id)
-                        {
-                            open_diff = Some((
-                                job.workspace_path.clone(),
-                                format!("Job Diff · {}", preview_line(&job.label, 24)),
-                            ));
-                        }
-                    }
-                    InspectorKind::Diff { .. } => close = true,
-                    _ => {
-                        open_diff = Some((None, "Workspace Diff".to_string()));
-                    }
-                },
-                KeyCode::Char('r') => match &inspector.kind {
-                    InspectorKind::Job(job_id) => {
-                        run_command = Some(format!("/jobs retry {}", short_job_ref(job_id)));
-                    }
-                    InspectorKind::Queue(index) => {
-                        run_command = Some(format!("/queue run {}", index + 1));
-                    }
-                    _ => {}
-                },
-                KeyCode::Char('p') => match &inspector.kind {
-                    InspectorKind::Job(job_id) => {
-                        run_command = Some(format!("/jobs promote {}", short_job_ref(job_id)));
-                    }
-                    InspectorKind::Queue(index) => {
-                        run_command = Some(format!("/queue promote {}", index + 1));
-                    }
-                    _ => {}
-                },
-                KeyCode::Char('d') => {
-                    if let InspectorKind::Queue(index) = &inspector.kind {
-                        run_command = Some(format!("/queue drop {}", index + 1));
-                    }
-                }
-                KeyCode::Char('c') => {
-                    if let InspectorKind::Job(job_id) = &inspector.kind {
-                        run_command = Some(format!("/jobs cancel {}", short_job_ref(job_id)));
-                    }
-                }
-                KeyCode::Char('l') => {
-                    if let InspectorKind::Job(job_id) = &inspector.kind {
-                        run_command = Some(format!("/jobs logs {}", short_job_ref(job_id)));
-                    }
-                }
-                KeyCode::Char('o') => {
-                    if let InspectorKind::Job(job_id) = &inspector.kind {
-                        run_command = Some(format!("/jobs result {}", short_job_ref(job_id)));
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        if let Some(command) = run_command {
-            self.execute_slash_command(&command)?;
-            self.push_notice(command, NoticeTone::Info);
-        }
-        if let Some((cwd, title)) = open_diff {
-            self.open_diff_viewer(cwd, title)?;
-        }
-        if close {
-            self.inspector = None;
-        }
-
-        Ok(())
-    }
-
-    fn open_sidebar_target(&mut self, target: SidebarTarget) -> Result<()> {
-        let inspector = match target {
-            SidebarTarget::Agent(index) => self.build_agent_inspector(index),
-            SidebarTarget::Job(index) => self.build_job_inspector(index),
-            SidebarTarget::Queue(index) => self.build_queue_inspector(index),
-            SidebarTarget::Artifact(index) => self.build_artifact_inspector(index),
-            SidebarTarget::Plan(index) => self.build_plan_inspector(index),
-            SidebarTarget::ContextOverview | SidebarTarget::ContextEstimate => {
-                Some(self.build_context_inspector())
-            }
-            SidebarTarget::McpSummary => self.build_mcp_summary_inspector(),
-            SidebarTarget::LspSummary => self.build_lsp_summary_inspector(),
-        };
-        self.inspector = inspector;
-        Ok(())
-    }
-
-    fn open_context_inspector(&mut self) {
-        self.inspector = Some(self.build_context_inspector());
-    }
-
-    fn open_diff_viewer(&mut self, cwd: Option<String>, title: String) -> Result<()> {
-        let target_cwd = cwd.unwrap_or_else(|| self.state.cwd.clone());
-        let body = load_git_diff(&target_cwd)
-            .with_context(|| format!("failed to load git diff for {target_cwd}"))?;
-        if body.trim().is_empty() {
-            self.push_notice("no diff to show".to_string(), NoticeTone::Info);
-            return Ok(());
-        }
-
-        self.inspector = Some(InspectorState {
-            title,
-            body: body.lines().map(|line| line.to_string()).collect(),
-            footer: Some("Esc close · ↑↓ scroll · v close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Diff {
-                title: "Workspace Diff".to_string(),
-                cwd: Some(target_cwd),
-            },
-        });
-        Ok(())
-    }
-
-    fn build_agent_inspector(&self, index: usize) -> Option<InspectorState> {
-        let item = self.state.agent_activities.get(index)?;
-        Some(InspectorState {
-            title: format!("Subagent · {}", item.label),
-            body: vec![
-                format!("status: {}", item.status),
-                format!(
-                    "mode: {}",
-                    item.mode
-                        .as_ref()
-                        .map(|mode| title_case_label(mode))
-                        .unwrap_or_else(|| "n/a".to_string())
-                ),
-                format!(
-                    "purpose: {}",
-                    item.purpose
-                        .clone()
-                        .unwrap_or_else(|| "general".to_string())
-                ),
-                format!("updated: {}", item.updated_at),
-                item.detail
-                    .clone()
-                    .unwrap_or_else(|| "detail: n/a".to_string()),
-                item.workspace_path
-                    .as_ref()
-                    .map(|path| format!("workspace: {path}"))
-                    .unwrap_or_else(|| "workspace: n/a".to_string()),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Agent(index),
-        })
-    }
-
-    fn build_job_inspector(&self, index: usize) -> Option<InspectorState> {
-        let job = self.state.background_jobs.get(index)?;
-        Some(InspectorState {
-            title: format!("Job · {}", job.label),
-            body: vec![
-                format!("status: {}", job.status),
-                format!("kind: {}", job.kind),
-                format!("attempt: {}", format_count(job.attempt.unwrap_or(0))),
-                format!(
-                    "mode: {}",
-                    job.preferred_mode
-                        .as_ref()
-                        .map(|mode| title_case_label(mode))
-                        .unwrap_or_else(|| "n/a".to_string())
-                ),
-                format!(
-                    "purpose: {}",
-                    job.purpose.clone().unwrap_or_else(|| "general".to_string())
-                ),
-                format!("started: {}", job.started_at),
-                format!("updated: {}", job.updated_at),
-                job.detail
-                    .as_ref()
-                    .map(|detail| format!("detail: {detail}"))
-                    .unwrap_or_else(|| "detail: n/a".to_string()),
-                job.result_preview
-                    .as_ref()
-                    .map(|detail| format!("result: {detail}"))
-                    .unwrap_or_else(|| "result: n/a".to_string()),
-                job.workspace_path
-                    .as_ref()
-                    .map(|path| format!("workspace: {path}"))
-                    .unwrap_or_else(|| "workspace: n/a".to_string()),
-            ],
-            footer: Some(
-                "r retry · p promote · c cancel · l logs · o result · v diff · Esc close"
-                    .to_string(),
-            ),
-            scroll: 0,
-            kind: InspectorKind::Job(job.id.clone()),
-        })
-    }
-
-    fn build_queue_inspector(&self, index: usize) -> Option<InspectorState> {
-        let prompt = self.state.queued_prompts.get(index)?;
-        Some(InspectorState {
-            title: format!("Queue {}", index + 1),
-            body: vec!["queued prompt".to_string(), String::new(), prompt.clone()],
-            footer: Some("r run · p promote · d drop · Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Queue(index),
-        })
-    }
-
-    fn build_artifact_inspector(&self, index: usize) -> Option<InspectorState> {
-        let artifact = self.state.artifacts.get(index)?;
-        let mut body = vec![
-            format!("kind: {}", artifact.kind),
-            format!("source: {}", artifact.source),
-            format!("created: {}", artifact.created_at),
-            artifact
-                .mode
-                .as_ref()
-                .map(|mode| format!("mode: {}", title_case_label(mode)))
-                .unwrap_or_else(|| "mode: n/a".to_string()),
-        ];
-        if !artifact.summary.trim().is_empty() {
-            body.push(String::new());
-            body.extend(artifact.summary.lines().map(|line| line.to_string()));
-        }
-        Some(InspectorState {
-            title: format!("Artifact · {}", artifact.title),
-            body,
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Artifact(index),
-        })
-    }
-
-    fn build_plan_inspector(&self, index: usize) -> Option<InspectorState> {
-        let item = self.state.todos.get(index)?;
-        Some(InspectorState {
-            title: format!("Plan {}", index + 1),
-            body: vec![
-                format!("status: {}", item.status),
-                format!("step: {}", item.step),
-                format!(
-                    "owner: {}",
-                    item.owner.clone().unwrap_or_else(|| "n/a".to_string())
-                ),
-                format!("id: {}", item.id),
-                format!("updated: {}", item.updated_at),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Plan(index),
-        })
-    }
-
-    fn build_context_inspector(&self) -> InspectorState {
-        let mut body = vec![
-            format!("mode: {}", self.current_mode_label()),
-            format!("provider: {}", self.state.provider),
-            format!("model: {}", display_model_name(&self.state.model)),
-            format!("permission: {}", self.state.permission_profile),
-            format!(
-                "footprint: {:>5.1}% · {} / {}",
-                self.state.context_percent * 100.0,
-                format_count(self.state.context_tokens),
-                format_count(self.state.context_limit)
-            ),
-        ];
-        if let Some(estimate) = &self.state.request_estimate {
-            body.push(String::new());
-            body.push(format!("request mode: {}", estimate.mode));
-            body.push(format!(
-                "system {} · history {} · tools {} · prompt {} · total {}",
-                format_count(estimate.system),
-                format_count(estimate.history),
-                format_count(estimate.tools),
-                format_count(estimate.prompt),
-                format_count(estimate.total),
-            ));
-        }
-        if let Some(preview) = &self.state.context_preview {
-            body.push(String::new());
-            body.push("injected context".to_string());
-            body.extend(preview.lines().map(|line| line.to_string()));
-        }
-        InspectorState {
-            title: "Injected Context".to_string(),
-            body,
-            footer: Some("v workspace diff · Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Context,
-        }
-    }
-
-    fn build_mcp_summary_inspector(&self) -> Option<InspectorState> {
-        let mcp = self.state.mcp.as_ref()?;
-        Some(InspectorState {
-            title: "MCP".to_string(),
-            body: vec![
-                format!("configured: {}", format_count(mcp.configured_servers)),
-                format!("connected: {}", format_count(mcp.connected_servers)),
-                format!("tools: {}", format_count(mcp.tool_count)),
-                String::new(),
-                format!("servers: {}", mcp.server_names.join(", ")),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::McpSummary,
-        })
-    }
-
-    fn build_mcp_server_inspector(&self, index: usize) -> Option<InspectorState> {
-        let mcp = self.state.mcp.as_ref()?;
-        let server = mcp.server_names.get(index)?;
-        let connected = mcp.connected_names.iter().any(|name| name == server);
-        Some(InspectorState {
-            title: format!("MCP Server · {server}"),
-            body: vec![
-                format!(
-                    "status: {}",
-                    if connected { "connected" } else { "configured" }
-                ),
-                format!("server: {server}"),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::McpServer(index),
-        })
-    }
-
-    fn build_lsp_summary_inspector(&self) -> Option<InspectorState> {
-        let lsp = self.state.lsp.as_ref()?;
-        Some(InspectorState {
-            title: "LSP".to_string(),
-            body: vec![
-                format!("available: {}", format_count(lsp.available_servers)),
-                format!("connected: {}", format_count(lsp.connected_servers)),
-                String::new(),
-                format!("servers: {}", lsp.server_labels.join(", ")),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::LspSummary,
-        })
-    }
-
-    fn build_lsp_server_inspector(&self, index: usize) -> Option<InspectorState> {
-        let lsp = self.state.lsp.as_ref()?;
-        let server = lsp.server_labels.get(index)?;
-        let connected = lsp.connected_labels.iter().any(|item| item == server);
-        Some(InspectorState {
-            title: format!("LSP Server · {server}"),
-            body: vec![
-                format!(
-                    "status: {}",
-                    if connected { "connected" } else { "available" }
-                ),
-                format!("server: {server}"),
-            ],
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::LspServer(index),
-        })
-    }
-
-    fn build_tool_inspector(
-        &self,
-        message_index: usize,
-        tool_index: usize,
-    ) -> Option<InspectorState> {
-        let tool = self
-            .state
-            .messages
-            .get(message_index)?
-            .tool_calls
-            .get(tool_index)?;
-        let mut body = vec![
-            format!("status: {}", tool.status),
-            format!("tool: {}", tool.name),
-            format!("summary: {}", tool.summary),
-        ];
-        if !tool.args.trim().is_empty() {
-            body.push(String::new());
-            body.push("args".to_string());
-            body.extend(tool.args.lines().map(|line| line.to_string()));
-        }
-        if let Some(result) = &tool.result {
-            body.push(String::new());
-            body.push("result".to_string());
-            body.extend(result.lines().map(|line| line.to_string()));
-        }
-        Some(InspectorState {
-            title: format!("Tool · {}", tool.name),
-            body,
-            footer: Some("Esc close".to_string()),
-            scroll: 0,
-            kind: InspectorKind::Tool(message_index, tool_index),
-        })
-    }
-
-    fn refresh_open_inspector(&mut self) {
-        let Some(existing) = &self.inspector else {
-            return;
-        };
-        let scroll = existing.scroll;
-        let replacement = match existing.kind.clone() {
-            InspectorKind::Agent(index) => self.build_agent_inspector(index),
-            InspectorKind::Job(job_id) => self
-                .state
-                .background_jobs
-                .iter()
-                .position(|job| job.id == job_id)
-                .and_then(|index| self.build_job_inspector(index)),
-            InspectorKind::Queue(index) => self.build_queue_inspector(index),
-            InspectorKind::Artifact(index) => self.build_artifact_inspector(index),
-            InspectorKind::Plan(index) => self.build_plan_inspector(index),
-            InspectorKind::Context => Some(self.build_context_inspector()),
-            InspectorKind::McpSummary => self.build_mcp_summary_inspector(),
-            InspectorKind::McpServer(index) => self.build_mcp_server_inspector(index),
-            InspectorKind::LspSummary => self.build_lsp_summary_inspector(),
-            InspectorKind::LspServer(index) => self.build_lsp_server_inspector(index),
-            InspectorKind::Tool(message_index, tool_index) => {
-                self.build_tool_inspector(message_index, tool_index)
-            }
-            InspectorKind::Diff { title, cwd } => {
-                let body = cwd
-                    .as_ref()
-                    .and_then(|path| load_git_diff(path).ok())
-                    .unwrap_or_default();
-                Some(InspectorState {
-                    title,
-                    body: body.lines().map(|line| line.to_string()).collect(),
-                    footer: Some("Esc close · ↑↓ scroll · v close".to_string()),
-                    scroll,
-                    kind: InspectorKind::Diff {
-                        title: "Workspace Diff".to_string(),
-                        cwd,
-                    },
-                })
-            }
-        };
-
-        self.inspector = replacement.map(|mut inspector| {
-            inspector.scroll = scroll;
-            inspector
-        });
-    }
-}
-
-struct WrappedEditor {
-    lines: Vec<String>,
-    cursor_row: usize,
-    cursor_col: usize,
-}
-
-fn wrap_editor_text(text: &str, cursor: usize, width: usize) -> WrappedEditor {
-    let graphemes: Vec<String> = UnicodeSegmentation::graphemes(text, true)
-        .map(|g| g.to_string())
-        .collect();
-    let width = width.max(1);
-    let mut lines = vec![String::new()];
-    let mut row = 0usize;
-    let mut col = 0usize;
-    let mut cursor_row = 0usize;
-    let mut cursor_col = 0usize;
-
-    for (index, grapheme) in graphemes.iter().enumerate() {
-        if index == cursor {
-            cursor_row = row;
-            cursor_col = col;
-        }
-
-        if grapheme == "\n" {
-            lines.push(String::new());
-            row += 1;
-            col = 0;
-            continue;
-        }
-
-        let grapheme_width = UnicodeWidthStr::width(grapheme.as_str()).max(1);
-        if col + grapheme_width > width && !lines[row].is_empty() {
-            lines.push(String::new());
-            row += 1;
-            col = 0;
-        }
-
-        lines[row].push_str(grapheme);
-        col += grapheme_width;
-    }
-
-    if cursor == graphemes.len() {
-        cursor_row = row;
-        cursor_col = col;
-    }
-
-    WrappedEditor {
-        lines,
-        cursor_row,
-        cursor_col,
-    }
-}
-
-fn wrap_plain(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
-
-    let width = width.max(1);
-    let graphemes: Vec<&str> = UnicodeSegmentation::graphemes(text, true).collect();
-    let mut lines = vec![String::new()];
-    let mut current_width = 0usize;
-
-    for grapheme in graphemes {
-        if grapheme == "\n" {
-            lines.push(String::new());
-            current_width = 0;
-            continue;
-        }
-
-        let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
-        if current_width + grapheme_width > width && !lines.last().unwrap().is_empty() {
-            lines.push(String::new());
-            current_width = 0;
-        }
-
-        lines.last_mut().unwrap().push_str(grapheme);
-        current_width += grapheme_width;
-    }
-
-    lines
-}
-
-fn pad_art_lines(lines: &[&str]) -> Vec<String> {
-    let max_width = lines
-        .iter()
-        .map(|line| UnicodeWidthStr::width(*line))
-        .max()
-        .unwrap_or(0);
-
-    lines
-        .iter()
-        .map(|line| {
-            let pad = max_width.saturating_sub(UnicodeWidthStr::width(*line));
-            format!("{line}{}", " ".repeat(pad))
-        })
-        .collect()
-}
-
-fn shimmer_centered_line(
-    line: &str,
-    width: usize,
-    phase: usize,
-    offset: usize,
-    base: Color,
-    highlight: Color,
-) -> Line<'static> {
-    let mut spans = Vec::new();
-    let content_width = UnicodeWidthStr::width(line);
-    let left_pad = width.saturating_sub(content_width) / 2;
-    if left_pad > 0 {
-        spans.push(Span::raw(" ".repeat(left_pad)));
-    }
-
-    let graphemes = UnicodeSegmentation::graphemes(line, true).collect::<Vec<_>>();
-    let cycle_width = graphemes.len().saturating_add(10).max(1);
-    let sweep = ((phase + offset * 4) % cycle_width) as isize - 5;
-    for (index, grapheme) in graphemes.iter().enumerate() {
-        let distance = (index as isize - sweep).abs();
-        let style = if distance <= 1 {
-            Style::default().fg(highlight).add_modifier(Modifier::BOLD)
-        } else if distance <= 4 {
-            Style::default().fg(base).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(ACCENT_DIM)
-        };
-        spans.push(Span::styled((*grapheme).to_string(), style));
-    }
-
-    Line::from(spans)
-}
-
-fn build_welcome_lines(width: usize, phase: usize) -> Vec<Line<'static>> {
-    let art = if width < 64 {
-        Vec::new()
-    } else if width < 100 {
-        pad_art_lines(SPLASH_COMPACT)
-    } else {
-        pad_art_lines(SPLASH_FULL)
-    };
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::raw("")));
-    lines.push(Line::from(Span::raw("")));
-    for (index, line) in art.into_iter().enumerate() {
-        lines.push(shimmer_centered_line(
-            &line, width, phase, index, ACCENT, FG,
-        ));
-    }
-
-    if !lines.is_empty() {
-        lines.push(Line::from(Span::raw("")));
-    }
-    lines.push(shimmer_centered_line(
-        "BL4CKP1NK 1N Y0UR AREA",
-        width,
-        phase + 6,
-        0,
-        ACCENT,
-        FG,
-    ));
-    lines.push(Line::from(Span::raw("")));
-    lines
-}
-
-fn preview_line(text: &str, max_width: usize) -> String {
-    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.chars().count() <= max_width {
-        return normalized;
-    }
-
-    normalized
-        .chars()
-        .take(max_width.saturating_sub(1))
-        .collect::<String>()
-        + "…"
-}
-
-fn format_count(value: u64) -> String {
-    let raw = value.to_string();
-    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
-
-    for (index, ch) in raw.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            out.push(',');
-        }
-        out.push(ch);
-    }
-
-    out.chars().rev().collect()
-}
-
-fn checklist_progress(checklist: &[NativeJobChecklistItem]) -> Option<String> {
-    if checklist.is_empty() {
-        return None;
-    }
-
-    let total = checklist.len();
-    let completed = checklist
-        .iter()
-        .filter(|item| item.status == "completed")
-        .count();
-    let active = checklist
-        .iter()
-        .filter(|item| item.status == "in_progress")
-        .count();
-    let blocked = checklist
-        .iter()
-        .filter(|item| item.status == "blocked")
-        .count();
-    let failed = checklist
-        .iter()
-        .filter(|item| item.status == "error")
-        .count();
-
-    let summary = [
-        Some(format!("{completed}/{total} done")),
-        (active > 0).then(|| format!("{active} active")),
-        (blocked > 0).then(|| format!("{blocked} blocked")),
-        (failed > 0).then(|| format!("{failed} failed")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
-
-    Some(summary)
-}
-
-fn checklist_status_marker(status: &str, spinner_index: usize) -> (&'static str, Color) {
-    match status {
-        "completed" => ("[x]", SUCCESS),
-        "in_progress" => (SPINNER_FRAMES[spinner_index], ACCENT),
-        "blocked" => ("[-]", ACCENT_DIM),
-        "error" => ("[!]", ERROR),
-        _ => ("[ ]", ACCENT_DIM),
-    }
-}
-
-fn checklist_todo_ref(checklist: &[NativeJobChecklistItem], item_id: &str) -> Option<String> {
-    checklist
-        .iter()
-        .position(|item| item.id == item_id)
-        .map(|index| format!("todo #{}", index + 1))
-}
-
-fn active_sidebar_job<'a>(state: &'a NativeTuiState) -> Option<&'a NativeBackgroundJobState> {
-    state
-        .background_jobs
-        .iter()
-        .find(|job| job.status == "running" && !job.checklist.is_empty())
-        .or_else(|| {
-            state
-                .background_jobs
-                .iter()
-                .find(|job| !job.checklist.is_empty())
-        })
-}
-
-fn worker_status_word(status: &str) -> &'static str {
-    match status {
-        "running" => "running",
-        "verifying" => "verifying",
-        "done" => "done",
-        "error" => "failed",
-        "cancelled" => "cancelled",
-        "queued" => "queued",
-        _ => "pending",
-    }
-}
-
-fn worker_pool_summary(
-    state: &NativeTuiState,
-    active_job: Option<&NativeBackgroundJobState>,
-) -> Option<String> {
-    if state.agent_activities.is_empty() {
-        return None;
-    }
-
-    let total = state.agent_activities.len();
-    let active = state
-        .agent_activities
-        .iter()
-        .filter(|item| item.status == "running" || item.status == "verifying")
-        .count();
-    let queued = state
-        .agent_activities
-        .iter()
-        .filter(|item| item.status == "queued")
-        .count();
-    let blocked = active_job
-        .map(|job| {
-            job.checklist
-                .iter()
-                .filter(|item| item.status == "blocked" && item.id.starts_with("agent:"))
-                .count()
-        })
-        .unwrap_or(0);
-    let strategy = active_job
-        .and_then(|job| job.strategy.clone())
-        .or_else(|| state.team_run_strategy.clone());
-
-    let mut parts = Vec::new();
-    if let Some(strategy) = strategy {
-        parts.push(strategy);
-    }
-    parts.push(format!("{} assigned", format_count(total as u64)));
-    parts.push(format!("{} active", format_count(active as u64)));
-    if queued > 0 {
-        parts.push(format!("{} queued", format_count(queued as u64)));
-    }
-    if blocked > 0 {
-        parts.push(format!("{} blocked", format_count(blocked as u64)));
-    }
-
-    Some(parts.join(" · "))
-}
-
-fn agent_task_status(status: &str) -> &'static str {
-    match status {
-        "done" => "completed",
-        "running" | "verifying" => "in_progress",
-        "error" => "error",
-        _ => "pending",
-    }
-}
-
-fn synthetic_foreground_checklist(
-    state: &NativeTuiState,
-) -> Vec<(String, &'static str, Color, Option<String>)> {
-    if !state.loading {
-        return Vec::new();
-    }
-
-    let mut items: Vec<(String, &'static str, Color, Option<String>)> = state
-        .agent_activities
-        .iter()
-        .take(6)
-        .map(|activity| {
-            let status = agent_task_status(&activity.status);
-            let color = match status {
-                "completed" => SUCCESS,
-                "in_progress" => ACCENT,
-                "error" => ERROR,
-                _ => ACCENT_DIM,
+                Err(error) => Err(anyhow!("failed to read bridge event: {error}")),
             };
-            let detail = activity
-                .detail
-                .as_ref()
-                .map(|detail| preview_line(detail, 28))
-                .or_else(|| {
-                    activity
-                        .workspace_path
-                        .as_ref()
-                        .map(|path| preview_line(path, 28))
-                });
-            (preview_line(&activity.label, 28), status, color, detail)
-        })
-        .collect();
 
-    if state.team_run_strategy.is_some() && !items.is_empty() {
-        let workers_done = state
-            .agent_activities
-            .iter()
-            .all(|activity| matches!(activity.status.as_str(), "done" | "error"));
-        let synthesis_status = if state.verification.is_some() {
-            "completed"
-        } else if workers_done {
-            "in_progress"
-        } else {
-            "pending"
-        };
-        let synthesis_color = match synthesis_status {
-            "completed" => SUCCESS,
-            "in_progress" => ACCENT,
-            "error" => ERROR,
-            _ => ACCENT_DIM,
-        };
-        items.push((
-            "merge worker output".to_string(),
-            synthesis_status,
-            synthesis_color,
-            state
-                .team_run_strategy
-                .as_ref()
-                .map(|strategy| format!("{strategy} team synthesis")),
-        ));
-    }
-
-    if let Some(verification) = &state.verification {
-        let verify_status = match verification.status.as_str() {
-            "running" => "in_progress",
-            "passed" => "completed",
-            "failed" => "error",
-            _ => "pending",
-        };
-        let verify_color = match verify_status {
-            "completed" => SUCCESS,
-            "in_progress" => ACCENT,
-            "error" => ERROR,
-            _ => ACCENT_DIM,
-        };
-        items.push((
-            "verify result".to_string(),
-            verify_status,
-            verify_color,
-            verification
-                .summary
-                .as_ref()
-                .map(|summary| preview_line(summary, 28))
-                .or_else(|| verification.cwd.as_ref().map(|cwd| preview_line(cwd, 28))),
-        ));
-    }
-
-    if items.is_empty() {
-        items.push((
-            "run current task".to_string(),
-            "in_progress",
-            ACCENT,
-            Some(preview_line(&state.loading_label, 28)),
-        ));
-    }
-
-    items
-}
-
-fn title_case_label(value: &str) -> String {
-    let lower = value.trim().to_lowercase();
-    let mut chars = lower.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-
-    format!("{}{}", first.to_uppercase(), chars.collect::<String>())
-}
-
-fn default_model_for_mode(mode: &str) -> &'static str {
-    match mode {
-        "lisa" => "gpt-5.4",
-        "rosé" => "claude-sonnet-4-6",
-        "jisoo" => "gemini-2.5-pro",
-        _ => "claude-opus-4-6",
-    }
-}
-
-fn display_purpose_role(value: &str) -> String {
-    match value {
-        "execution" => "executor".to_string(),
-        "planning" => "planner".to_string(),
-        "research" => "research".to_string(),
-        "review" => "review".to_string(),
-        "design" => "design".to_string(),
-        "oracle" => "oracle".to_string(),
-        "general" => "delegate".to_string(),
-        other => other.replace('_', " "),
-    }
-}
-
-fn display_model_name(model: &str) -> String {
-    if let Some(version) = model.strip_prefix("claude-opus-") {
-        return format!("Opus {}", version.replace('-', "."));
-    }
-
-    if let Some(version) = model.strip_prefix("claude-sonnet-") {
-        return format!("Sonnet {}", version.replace('-', "."));
-    }
-
-    if let Some(version) = model.strip_prefix("claude-haiku-") {
-        return format!("Haiku {}", version.replace('-', "."));
-    }
-
-    if let Some(version) = model.strip_prefix("gpt-") {
-        return format!("GPT-{}", version);
-    }
-
-    if let Some(version) = model.strip_prefix("gemini-") {
-        let pretty = version
-            .split('-')
-            .map(|segment| match segment {
-                "pro" => "Pro".to_string(),
-                "flash" => "Flash".to_string(),
-                value => value.to_string(),
-            })
-            .collect::<Vec<_>>()
-            .join(" ");
-        return format!("Gemini {}", pretty);
-    }
-
-    model.to_string()
-}
-
-fn build_mode_badge_spans(state: &NativeTuiState) -> Vec<Span<'static>> {
-    if let Some(mode) = state.modes.iter().find(|mode| mode.active) {
-        return vec![
-            Span::styled(
-                "● ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                title_case_label(&mode.label),
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" (", Style::default().fg(ACCENT_DIM)),
-            Span::styled(mode.tagline.clone(), Style::default().fg(FG)),
-            Span::styled(" - ", Style::default().fg(ACCENT_DIM)),
-            Span::styled(
-                display_model_name(&mode.model),
-                Style::default().fg(ACCENT_DIM),
-            ),
-            Span::styled(")", Style::default().fg(ACCENT_DIM)),
-        ];
-    }
-
-    vec![Span::styled(
-        format!(
-            "● {} ({})",
-            title_case_label(&state.mode),
-            display_model_name(if state.model.trim().is_empty() {
-                default_model_for_mode(&state.mode)
-            } else {
-                &state.model
-            })
-        ),
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-    )]
-}
-
-fn current_run_summary(state: &NativeTuiState) -> (String, Option<String>) {
-    if !state.ready {
-        return (
-            format!("{} · booting", title_case_label(&state.mode)),
-            Some("discovering auth and runtime".to_string()),
-        );
-    }
-
-    if let Some(job) = active_sidebar_job(state) {
-        let status = match job.status.as_str() {
-            "running" => "running",
-            "done" => "done",
-            "cancelled" => "cancelled",
-            "error" => "blocked",
-            _ => job.status.as_str(),
-        };
-        return (
-            format!("{} · {}", preview_line(&job.label, 20), status),
-            job.prompt_preview
-                .as_ref()
-                .map(|preview| preview_line(preview, 28))
-                .or_else(|| checklist_progress(&job.checklist))
-                .or_else(|| job.detail.clone()),
-        );
-    }
-
-    if state.loading {
-        return (
-            format!("{} · running", title_case_label(&state.mode)),
-            Some(preview_line(&state.loading_label, 28)),
-        );
-    }
-
-    (
-        format!("{} · ready", title_case_label(&state.mode)),
-        Some("idle".to_string()),
-    )
-}
-
-fn sidebar_header(title: &str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled("• ", Style::default().fg(MUTED)),
-        Span::styled(
-            title.to_string(),
-            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-        ),
-    ])
-}
-
-fn push_sidebar_rail_item(
-    lines: &mut Vec<Line<'static>>,
-    marker: &str,
-    marker_color: Color,
-    title: String,
-    detail: Option<String>,
-    title_color: Color,
-    detail_color: Color,
-) {
-    lines.push(Line::from(vec![
-        Span::styled(format!("{marker} "), Style::default().fg(marker_color)),
-        Span::styled(title, Style::default().fg(title_color)),
-    ]));
-
-    if let Some(detail) = detail {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", Style::default().fg(marker_color)),
-            Span::styled(detail, Style::default().fg(detail_color)),
-        ]));
-    }
-}
-
-fn push_sidebar_selectable_item(
-    lines: &mut Vec<Line<'static>>,
-    _selected: bool,
-    marker: &str,
-    marker_color: Color,
-    title: String,
-    detail: Option<String>,
-    title_color: Color,
-    detail_color: Color,
-) {
-    let selected_style = Style::default();
-    lines.push(Line::from(vec![
-        Span::styled(format!("{marker} "), selected_style.fg(marker_color)),
-        Span::styled(title, selected_style.fg(title_color)),
-    ]));
-
-    if let Some(detail) = detail {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", selected_style.fg(marker_color)),
-            Span::styled(detail, selected_style.fg(detail_color)),
-        ]));
-    }
-}
-
-fn render_inspector_line(raw: &str, width: usize) -> Line<'static> {
-    let style = if raw.starts_with("+++") || raw.starts_with("---") || raw.starts_with("@@") {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else if raw.starts_with('+') {
-        Style::default().fg(SUCCESS)
-    } else if raw.starts_with('-') {
-        Style::default().fg(ERROR)
-    } else if raw.ends_with(':') {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(FG)
-    };
-
-    Line::from(Span::styled(preview_line(raw, width.max(1)), style))
-}
-
-fn context_meter(percent: f64, width: usize) -> String {
-    let width = width.max(4);
-    let filled = ((percent.clamp(0.0, 1.0)) * width as f64).round() as usize;
-    let filled = filled.min(width);
-    format!(
-        "{}{}",
-        "■".repeat(filled),
-        "·".repeat(width.saturating_sub(filled))
-    )
-}
-
-fn looks_like_path_token(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
-        )
-    });
-    if trimmed.is_empty() {
-        return false;
-    }
-
-    trimmed.starts_with("./")
-        || trimmed.starts_with("../")
-        || trimmed.starts_with("~/")
-        || trimmed.starts_with('/')
-        || (trimmed.contains('/') && trimmed.contains('.'))
-}
-
-fn looks_like_url_token(token: &str) -> bool {
-    let trimmed = token.trim_matches(|ch: char| {
-        matches!(
-            ch,
-            '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
-        )
-    });
-
-    trimmed.starts_with("http://") || trimmed.starts_with("https://")
-}
-
-fn format_elapsed(started_at_ms: Option<u64>) -> String {
-    let Some(started_at_ms) = started_at_ms else {
-        return "00:00".into();
-    };
-
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or(started_at_ms);
-    let elapsed_secs = now_ms.saturating_sub(started_at_ms) / 1000;
-    let minutes = elapsed_secs / 60;
-    let seconds = elapsed_secs % 60;
-
-    format!("{minutes:02}:{seconds:02}")
-}
-
-fn short_job_ref(job_id: &str) -> &str {
-    job_id.get(..8).unwrap_or(job_id)
-}
-
-fn walk_repo_files(root: &Path, dir: &Path, depth: usize, files: &mut Vec<String>) {
-    if depth > REPO_FILE_SCAN_DEPTH || files.len() >= REPO_FILE_CACHE_LIMIT {
-        return;
-    }
-
-    let Ok(entries) = read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        if files.len() >= REPO_FILE_CACHE_LIMIT {
-            break;
-        }
-
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if kind.is_dir() {
-            if REPO_FILE_EXCLUDES.iter().any(|value| *value == name) {
-                continue;
+            if tx.send(outcome).is_err() {
+                return;
             }
-            walk_repo_files(root, &path, depth + 1, files);
-            continue;
         }
 
-        if !kind.is_file() {
-            continue;
-        }
+        let _ = tx.send(Err(anyhow!("bridge process closed stdout")));
+    });
 
-        let Ok(relative) = path.strip_prefix(root) else {
-            continue;
-        };
-        let value = relative.to_string_lossy().replace('\\', "/");
-        if !value.is_empty() {
-            files.push(value);
+    Ok((child, stdin, rx))
+}
+
+fn send_command(stdin: &mut ChildStdin, command: BridgeCommand) -> Result<()> {
+    let raw = serde_json::to_string(&command)?;
+    writeln!(stdin, "{raw}")?;
+    stdin.flush()?;
+    Ok(())
+}
+
+fn poll_bridge(receiver: &Receiver<Result<BridgeEvent>>, app: &mut App, ui: &mut slt::Context) {
+    for _ in 0..MAX_BRIDGE_EVENTS_PER_FRAME {
+        match receiver.try_recv() {
+            Ok(Ok(ev)) => app.on_bridge_event(ev, ui.tick()),
+            Ok(Err(error)) => {
+                app.fatal_error = Some(error.to_string());
+                break;
+            }
+            Err(_) => break,
         }
     }
 }
 
-fn load_repo_files(cwd: &str) -> Vec<String> {
-    if let Ok(output) = Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-        .current_dir(cwd)
-        .output()
-    {
-        if output.status.success() {
-            let mut files = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(|line| line.replace('\\', "/"))
-                .collect::<Vec<_>>();
-            files.sort();
-            files.dedup();
-            files.truncate(REPO_FILE_CACHE_LIMIT);
-            return files;
-        }
+fn handle_input(ui: &mut slt::Context, app: &mut App, stdin: &mut ChildStdin) -> Result<()> {
+    if ui.key_mod('q', KeyModifiers::CONTROL) {
+        ui.quit();
     }
 
-    let mut files = Vec::new();
-    walk_repo_files(Path::new(cwd), Path::new(cwd), 0, &mut files);
-    files.sort();
-    files.dedup();
-    files.truncate(REPO_FILE_CACHE_LIMIT);
-    files
-}
-
-fn score_repo_file_path(path: &str, query: &str, changed_files: &[String]) -> Option<i32> {
-    let normalized_path = path.to_lowercase();
-    let normalized_name = normalized_path
-        .rsplit('/')
-        .next()
-        .unwrap_or(normalized_path.as_str());
-    let query = query.trim().trim_start_matches('@').to_lowercase();
-    let is_changed = changed_files.iter().any(|item| item == path);
-    let is_common = COMMON_REPO_FILES.iter().any(|item| *item == path);
-
-    if query.is_empty() {
-        let mut score = 10;
-        if is_changed {
-            score += 200;
-        }
-        if is_common {
-            score += 120;
-        }
-        if normalized_path.starts_with("src/") {
-            score += 20;
-        }
-        return Some(score);
+    if ui.key_mod('l', KeyModifiers::CONTROL) {
+        send_command(stdin, BridgeCommand::ClearMessages)?;
+        app.auto_scroll = true;
+        app.transcript_scroll.offset = usize::MAX;
     }
 
-    let mut score = 0;
-    if normalized_path == query {
-        score += 300;
+    if ui.key_code(KeyCode::BackTab) {
+        send_command(stdin, BridgeCommand::CycleMode { direction: 1 })?;
     }
-    if normalized_path.starts_with(&query) {
-        score += 220;
-    }
-    if normalized_name.starts_with(&query) {
-        score += 190;
-    }
-    if normalized_path.contains(&format!("/{query}")) {
-        score += 150;
-    }
-    if normalized_path.contains(&query) {
-        score += 90;
-    }
-    if score == 0 {
-        return None;
-    }
-    if is_changed {
-        score += 40;
-    }
-    if is_common {
-        score += 20;
-    }
-    Some(score)
-}
 
-fn load_git_diff(cwd: &str) -> Result<String> {
-    let output = Command::new("git")
-        .args(["diff", "--no-ext-diff", "--stat=120", "--patch", "--"])
-        .current_dir(cwd)
-        .output()
-        .with_context(|| format!("failed to run git diff in {cwd}"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(if stderr.is_empty() {
-            "git diff failed".to_string()
+    if ui.key_mod(' ', KeyModifiers::CONTROL) {
+        if app.korean_mode {
+            app.korean_mode = false;
+            commit_hangul_composition(app);
         } else {
-            stderr
-        }));
+            app.korean_mode = true;
+            app.hangul.reset();
+            app.hangul_preedit_len = 0;
+        }
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    if app.korean_mode && app.state.ask_user.is_none() {
+        for c in ' '..='~' {
+            if ui.key_code(KeyCode::Char(c)) {
+                if let Some(jamo) = qwerty_to_jamo(c) {
+                    app.hangul.feed_jamo(jamo);
+                    flush_hangul_committed(app);
+                } else {
+                    app.hangul.commit_current();
+                    flush_hangul_committed(app);
+                    insert_char_at_cursor(&mut app.composer, c);
+                }
+            }
+        }
+
+        if ui.key_code(KeyCode::Backspace) {
+            if !app.hangul.backspace() {
+                delete_char_before_cursor(&mut app.composer);
+            }
+        }
+
+        if ui.key_code(KeyCode::Delete) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            let len = app.composer.value.chars().count();
+            if app.composer.cursor < len {
+                let start = char_to_byte_index(&app.composer.value, app.composer.cursor);
+                let end = char_to_byte_index(&app.composer.value, app.composer.cursor + 1);
+                app.composer.value.replace_range(start..end, "");
+            }
+        }
+
+        if ui.key_code(KeyCode::Left) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = app.composer.cursor.saturating_sub(1);
+        }
+
+        if ui.key_code(KeyCode::Right) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = (app.composer.cursor + 1).min(app.composer.value.chars().count());
+        }
+
+        if ui.key_code(KeyCode::Home) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = 0;
+        }
+
+        if ui.key_code(KeyCode::End) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            app.composer.cursor = app.composer.value.chars().count();
+        }
+
+        if let Some(text) = ui.paste().map(|s| s.to_string()) {
+            app.hangul.commit_current();
+            flush_hangul_committed(app);
+            insert_str_at_cursor(&mut app.composer, &text);
+        }
+    }
+
+    if ui.key_code(KeyCode::PageUp) {
+        app.auto_scroll = false;
+        app.transcript_scroll.scroll_up(8);
+    }
+    if ui.key_code(KeyCode::PageDown) {
+        app.transcript_scroll.scroll_down(8);
+    }
+    if !app.korean_mode && ui.key_code(KeyCode::End) {
+        app.auto_scroll = true;
+        app.transcript_scroll.offset = usize::MAX;
+    }
+    if ui.scroll_up() {
+        app.auto_scroll = false;
+    }
+
+    if ui.key_code(KeyCode::Up)
+        && app.state.ask_user.is_none()
+        && app.composer.value.is_empty()
+        && app.hangul.preedit().is_none()
+    {
+        if !app.prompt_history.is_empty() {
+            if app.history_stash.is_none() {
+                app.history_stash = Some(app.composer.value.clone());
+            }
+            let next = match app.history_index {
+                None => app.prompt_history.len().saturating_sub(1),
+                Some(index) => index.saturating_sub(1),
+            };
+            app.history_index = Some(next);
+            app.composer.value = app.prompt_history[next].clone();
+            app.composer.cursor = app.composer.value.chars().count();
+        }
+    } else if ui.key_code(KeyCode::Down) && app.state.ask_user.is_none() {
+        if let Some(index) = app.history_index {
+            if index + 1 < app.prompt_history.len() {
+                let next = index + 1;
+                app.history_index = Some(next);
+                app.composer.value = app.prompt_history[next].clone();
+            } else {
+                app.history_index = None;
+                app.composer.value = app.history_stash.take().unwrap_or_default();
+            }
+            app.composer.cursor = app.composer.value.chars().count();
+        }
+    }
+
+    if ui.key_code(KeyCode::Esc) {
+        if app.state.loading {
+            send_command(stdin, BridgeCommand::Abort)?;
+        } else {
+            app.composer.value.clear();
+            app.composer.cursor = 0;
+            app.hangul.reset();
+            app.hangul_preedit_len = 0;
+            app.history_index = None;
+            app.history_stash = None;
+        }
+    }
+
+    if ui.key_code(KeyCode::Enter) {
+        if app.state.ask_user.is_some() {
+            submit_ask_user(app, stdin)?;
+            return Ok(());
+        }
+
+        if app.korean_mode {
+            commit_hangul_composition(app);
+        }
+
+        let prompt = app.composer.value.trim().to_string();
+        if prompt.is_empty() {
+            return Ok(());
+        }
+
+        if prompt.starts_with('/') {
+            send_command(
+                stdin,
+                BridgeCommand::RunSlash {
+                    command: prompt.clone(),
+                },
+            )?;
+        } else {
+            send_command(
+                stdin,
+                BridgeCommand::Submit {
+                    content: prompt.clone(),
+                },
+            )?;
+            send_command(
+                stdin,
+                BridgeCommand::PrefetchContext {
+                    content: prompt.clone(),
+                },
+            )?;
+        }
+        app.push_prompt_history(&prompt);
+        app.composer.value.clear();
+        app.composer.cursor = 0;
+        app.hangul.reset();
+        app.hangul_preedit_len = 0;
+        app.history_index = None;
+        app.history_stash = None;
+        app.auto_scroll = true;
+        app.transcript_scroll.offset = usize::MAX;
+    }
+
+    Ok(())
 }
 
-fn push_run(runs: &mut Vec<(Style, String)>, style: Style, text: &str) {
+fn char_to_byte_index(s: &str, char_idx: usize) -> usize {
+    s.char_indices()
+        .nth(char_idx)
+        .map(|(byte_idx, _)| byte_idx)
+        .unwrap_or(s.len())
+}
+
+fn insert_char_at_cursor(input: &mut TextInputState, ch: char) {
+    let byte_pos = char_to_byte_index(&input.value, input.cursor);
+    input.value.insert(byte_pos, ch);
+    input.cursor += 1;
+}
+
+fn insert_str_at_cursor(input: &mut TextInputState, text: &str) {
     if text.is_empty() {
         return;
     }
-
-    if let Some((last_style, last_text)) = runs.last_mut() {
-        if *last_style == style {
-            last_text.push_str(text);
-            return;
-        }
-    }
-
-    runs.push((style, text.to_string()));
+    let byte_pos = char_to_byte_index(&input.value, input.cursor);
+    input.value.insert_str(byte_pos, text);
+    input.cursor += text.chars().count();
 }
 
-fn push_token_run(runs: &mut Vec<(Style, String)>, base_style: Style, token: &str) {
-    if token.is_empty() {
+fn delete_char_before_cursor(input: &mut TextInputState) {
+    if input.cursor == 0 {
         return;
     }
 
-    let style = if looks_like_url_token(token) {
-        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
-    } else if looks_like_path_token(token) {
-        Style::default().fg(PATH)
-    } else {
-        base_style
-    };
-
-    push_run(runs, style, token);
+    let start = char_to_byte_index(&input.value, input.cursor - 1);
+    let end = char_to_byte_index(&input.value, input.cursor);
+    input.value.replace_range(start..end, "");
+    input.cursor -= 1;
 }
 
-fn push_plain_runs(runs: &mut Vec<(Style, String)>, text: &str, base_style: Style) {
-    let mut token = String::new();
-    let mut whitespace = String::new();
+fn remove_hangul_preedit(app: &mut App) {
+    if app.hangul_preedit_len == 0 {
+        return;
+    }
 
-    for ch in text.chars() {
-        if ch.is_whitespace() {
-            if !token.is_empty() {
-                push_token_run(runs, base_style, &token);
-                token.clear();
+    let start = char_to_byte_index(&app.composer.value, app.composer.cursor);
+    let end = char_to_byte_index(
+        &app.composer.value,
+        app.composer.cursor + app.hangul_preedit_len,
+    );
+    if start < end {
+        app.composer.value.replace_range(start..end, "");
+    }
+    app.hangul_preedit_len = 0;
+}
+
+fn flush_hangul_committed(app: &mut App) {
+    let committed = std::mem::take(&mut app.hangul.committed);
+    insert_str_at_cursor(&mut app.composer, &committed);
+}
+
+fn commit_hangul_composition(app: &mut App) {
+    app.hangul.commit_current();
+    flush_hangul_committed(app);
+    app.hangul.reset();
+    app.hangul_preedit_len = 0;
+}
+
+fn submit_ask_user(app: &mut App, stdin: &mut ChildStdin) -> Result<()> {
+    let Some(prompt) = app.state.ask_user.as_ref() else {
+        return Ok(());
+    };
+
+    if !prompt.options.is_empty() {
+        if let Some(index) = prompt.default_option_index {
+            if app.ask_user_radio.items.len() == prompt.options.len() {
+                app.ask_user_radio.selected = app
+                    .ask_user_radio
+                    .selected
+                    .min(prompt.options.len().saturating_sub(1));
+            } else {
+                app.ask_user_radio.selected = index.min(prompt.options.len().saturating_sub(1));
             }
-            whitespace.push(ch);
-            continue;
         }
-
-        if !whitespace.is_empty() {
-            push_run(runs, base_style, &whitespace);
-            whitespace.clear();
-        }
-        token.push(ch);
     }
 
-    if !token.is_empty() {
-        push_token_run(runs, base_style, &token);
+    if prompt.allow_custom_answer {
+        let value = app.ask_user_input.value.trim().to_string();
+        if let Some(error) = validate_ask_user_input(prompt, &value) {
+            app.toast.warning(error, 0);
+            return Ok(());
+        }
+
+        if !value.is_empty() {
+            send_command(
+                stdin,
+                BridgeCommand::AnswerAskUser {
+                    answer: AskUserAnswerPayload {
+                        value,
+                        source: "custom".to_string(),
+                        option_index: None,
+                        option_label: None,
+                    },
+                },
+            )?;
+            return Ok(());
+        }
     }
-    if !whitespace.is_empty() {
-        push_run(runs, base_style, &whitespace);
+
+    if !prompt.options.is_empty() {
+        let index = app
+            .ask_user_radio
+            .selected
+            .min(prompt.options.len().saturating_sub(1));
+        let choice = &prompt.options[index];
+        send_command(
+            stdin,
+            BridgeCommand::AnswerAskUser {
+                answer: AskUserAnswerPayload {
+                    value: choice.value.clone(),
+                    source: "choice".to_string(),
+                    option_index: Some(index),
+                    option_label: Some(choice.label.clone()),
+                },
+            },
+        )?;
+        return Ok(());
+    }
+
+    if let Some(default_value) = &prompt.default_value {
+        send_command(
+            stdin,
+            BridgeCommand::AnswerAskUser {
+                answer: AskUserAnswerPayload {
+                    value: default_value.clone(),
+                    source: "default".to_string(),
+                    option_index: None,
+                    option_label: None,
+                },
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_ask_user_input(prompt: &NativeAskUserState, value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if prompt.required
+        && trimmed.is_empty()
+        && prompt.default_value.is_none()
+        && prompt.options.is_empty()
+    {
+        return Some("answer required".to_string());
+    }
+
+    if prompt.kind == "number" && !trimmed.is_empty() && trimmed.parse::<f64>().is_err() {
+        return Some(
+            prompt
+                .validation
+                .as_ref()
+                .and_then(|v| v.message.clone())
+                .unwrap_or_else(|| "enter a valid number".to_string()),
+        );
+    }
+
+    if let Some(validation) = &prompt.validation {
+        if let Some(min) = validation.min_length {
+            if trimmed.len() < min as usize {
+                return Some(
+                    validation
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| format!("enter at least {min} characters")),
+                );
+            }
+        }
+        if let Some(max) = validation.max_length {
+            if trimmed.len() > max as usize {
+                return Some(
+                    validation
+                        .message
+                        .clone()
+                        .unwrap_or_else(|| format!("keep the answer under {max} characters")),
+                );
+            }
+        }
+        if let Some(pattern) = &validation.pattern {
+            if let Ok(regex) = Regex::new(pattern) {
+                if !regex.is_match(trimmed) {
+                    return Some(validation.message.clone().unwrap_or_else(|| {
+                        "answer format does not match the requirement".to_string()
+                    }));
+                }
+            }
+        }
+    }
+
+    None
+}
+
+// ── Safe markdown renderer (replaces SLT's buggy markdown()) ────────
+//
+// SLT 0.6.1's parse_inline_segments uses char index as byte index,
+// which panics on multi-byte text (Korean, CJK) with inline formatting.
+// The panic leaves an unmatched BeginContainer on the command stack,
+// corrupting the entire layout for the rest of the frame.
+//
+// This implementation:
+// - Uses char_indices() for byte-safe string slicing
+// - Properly tracks code block state (```...```)
+fn render_content(ui: &mut slt::Context, text: &str) {
+    ui.markdown(text);
+}
+
+// Hangul Syllable Composition (Unicode §3.12)
+const S_BASE: u32 = 0xAC00; // 가
+const L_BASE: u32 = 0x1100; // ㄱ (first leading consonant)
+const V_BASE: u32 = 0x1161; // ㅏ (first vowel)
+const T_BASE: u32 = 0x11A7; // sentinel (one before first trailing consonant)
+const L_COUNT: u32 = 19;
+const V_COUNT: u32 = 21;
+const T_COUNT: u32 = 28; // 27 trailing + 1 for no trailing
+const N_COUNT: u32 = V_COUNT * T_COUNT; // 588
+const S_COUNT: u32 = L_COUNT * N_COUNT; // 11172
+
+#[derive(Debug, Clone)]
+enum HangulState {
+    Empty,
+    Choseong(u32),
+    ChoseongJungseong(u32, u32),
+    Complete(u32, u32, u32),
+}
+
+struct HangulComposer {
+    state: HangulState,
+    /// The committed text accumulated so far in the current composition session
+    committed: String,
+}
+
+impl HangulComposer {
+    fn new() -> Self {
+        Self {
+            state: HangulState::Empty,
+            committed: String::new(),
+        }
+    }
+
+    fn reset(&mut self) {
+        self.state = HangulState::Empty;
+        self.committed.clear();
+    }
+
+    fn compose_syllable(l: u32, v: u32, t: u32) -> char {
+        debug_assert_eq!(T_BASE + 1, 0x11A8);
+        if l >= L_COUNT || v >= V_COUNT || t >= T_COUNT {
+            return '?';
+        }
+
+        let code = S_BASE + l * N_COUNT + v * T_COUNT + t;
+        if code >= S_BASE + S_COUNT {
+            return '?';
+        }
+
+        char::from_u32(code).unwrap_or('?')
+    }
+
+    fn commit_current(&mut self) {
+        let ch = match self.state.clone() {
+            HangulState::Empty => None,
+            HangulState::Choseong(l) => char::from_u32(L_BASE + l),
+            HangulState::ChoseongJungseong(l, v) => Some(Self::compose_syllable(l, v, 0)),
+            HangulState::Complete(l, v, t) => Some(Self::compose_syllable(l, v, t)),
+        };
+
+        if let Some(ch) = ch {
+            self.committed.push(ch);
+        }
+        self.state = HangulState::Empty;
+    }
+
+    fn preedit(&self) -> Option<char> {
+        match self.state {
+            HangulState::Empty => None,
+            HangulState::Choseong(l) => char::from_u32(L_BASE + l),
+            HangulState::ChoseongJungseong(l, v) => Some(Self::compose_syllable(l, v, 0)),
+            HangulState::Complete(l, v, t) => Some(Self::compose_syllable(l, v, t)),
+        }
+    }
+
+    fn feed_jamo(&mut self, jamo: Jamo) {
+        match (self.state.clone(), jamo) {
+            (HangulState::Empty, Jamo::Choseong(l)) => {
+                self.state = HangulState::Choseong(l);
+            }
+            (HangulState::Empty, Jamo::Jungseong(v)) => {
+                let ch = char::from_u32(V_BASE + v).unwrap_or('?');
+                self.committed.push(ch);
+                self.state = HangulState::Empty;
+            }
+
+            (HangulState::Choseong(l), Jamo::Choseong(l2)) => {
+                let ch = char::from_u32(L_BASE + l).unwrap_or('?');
+                self.committed.push(ch);
+                self.state = HangulState::Choseong(l2);
+            }
+            (HangulState::Choseong(l), Jamo::Jungseong(v)) => {
+                self.state = HangulState::ChoseongJungseong(l, v);
+            }
+
+            (HangulState::ChoseongJungseong(l, v), Jamo::Jungseong(v2)) => {
+                if let Some(combined) = try_combine_vowel(v, v2) {
+                    self.state = HangulState::ChoseongJungseong(l, combined);
+                } else {
+                    self.committed.push(Self::compose_syllable(l, v, 0));
+                    self.state = HangulState::Empty;
+                    self.feed_jamo(Jamo::Jungseong(v2));
+                }
+            }
+            (HangulState::ChoseongJungseong(l, v), Jamo::Choseong(c)) => {
+                if let Some(t) = choseong_to_jongseong(c) {
+                    self.state = HangulState::Complete(l, v, t);
+                } else {
+                    self.committed.push(Self::compose_syllable(l, v, 0));
+                    self.state = HangulState::Choseong(c);
+                }
+            }
+
+            (HangulState::Complete(l, v, t), Jamo::Choseong(c)) => {
+                if let Some(combined_t) = try_combine_jongseong(t, c) {
+                    self.state = HangulState::Complete(l, v, combined_t);
+                } else {
+                    self.committed.push(Self::compose_syllable(l, v, t));
+                    self.state = HangulState::Choseong(c);
+                }
+            }
+            (HangulState::Complete(l, v, t), Jamo::Jungseong(v2)) => {
+                if let Some((t_remain, new_l)) = split_composite_jongseong(t) {
+                    self.committed.push(Self::compose_syllable(l, v, t_remain));
+                    self.state = HangulState::ChoseongJungseong(new_l, v2);
+                } else if let Some(new_l) = jongseong_to_choseong(t) {
+                    self.committed.push(Self::compose_syllable(l, v, 0));
+                    self.state = HangulState::ChoseongJungseong(new_l, v2);
+                } else {
+                    self.committed.push(Self::compose_syllable(l, v, t));
+                    self.state = HangulState::Empty;
+                    self.feed_jamo(Jamo::Jungseong(v2));
+                }
+            }
+        }
+    }
+
+    fn backspace(&mut self) -> bool {
+        match self.state.clone() {
+            HangulState::Empty => false,
+            HangulState::Choseong(_) => {
+                self.state = HangulState::Empty;
+                true
+            }
+            HangulState::ChoseongJungseong(l, v) => {
+                if let Some((v_head, _)) = split_composite_vowel(v) {
+                    self.state = HangulState::ChoseongJungseong(l, v_head);
+                } else {
+                    self.state = HangulState::Choseong(l);
+                }
+                true
+            }
+            HangulState::Complete(l, v, t) => {
+                if let Some((t_head, _)) = split_composite_jongseong(t) {
+                    self.state = HangulState::Complete(l, v, t_head);
+                } else {
+                    self.state = HangulState::ChoseongJungseong(l, v);
+                }
+                true
+            }
+        }
+    }
+
+    fn result(&self) -> String {
+        let mut output = self.committed.clone();
+        if let Some(preedit) = self.preedit() {
+            output.push(preedit);
+        }
+        output
     }
 }
 
-fn find_next_inline_marker(text: &str) -> usize {
-    ['`', '[', '*', '_']
-        .iter()
-        .filter_map(|marker| text.find(*marker))
-        .min()
-        .unwrap_or(text.len())
+#[derive(Debug, Clone, Copy)]
+enum Jamo {
+    Choseong(u32),
+    Jungseong(u32),
 }
 
-fn parse_markdown_link(text: &str) -> Option<(usize, Vec<(Style, String)>)> {
-    if !text.starts_with('[') {
-        return None;
-    }
+fn qwerty_to_jamo(ch: char) -> Option<Jamo> {
+    match ch {
+        'r' => Some(Jamo::Choseong(0)),
+        'R' => Some(Jamo::Choseong(1)),
+        's' => Some(Jamo::Choseong(2)),
+        'e' => Some(Jamo::Choseong(3)),
+        'E' => Some(Jamo::Choseong(4)),
+        'f' => Some(Jamo::Choseong(5)),
+        'a' => Some(Jamo::Choseong(6)),
+        'q' => Some(Jamo::Choseong(7)),
+        'Q' => Some(Jamo::Choseong(8)),
+        't' => Some(Jamo::Choseong(9)),
+        'T' => Some(Jamo::Choseong(10)),
+        'd' => Some(Jamo::Choseong(11)),
+        'w' => Some(Jamo::Choseong(12)),
+        'W' => Some(Jamo::Choseong(13)),
+        'c' => Some(Jamo::Choseong(14)),
+        'z' => Some(Jamo::Choseong(15)),
+        'x' => Some(Jamo::Choseong(16)),
+        'v' => Some(Jamo::Choseong(17)),
+        'g' => Some(Jamo::Choseong(18)),
 
-    let label_end = text.find("](")?;
-    let target_start = label_end + 2;
-    let target_end = text[target_start..].find(')')? + target_start;
-    let label = &text[1..label_end];
-    let target = &text[target_start..target_end];
-    let target_style = if looks_like_path_token(target) {
-        Style::default().fg(PATH)
+        'k' => Some(Jamo::Jungseong(0)),
+        'o' => Some(Jamo::Jungseong(1)),
+        'i' => Some(Jamo::Jungseong(2)),
+        'O' => Some(Jamo::Jungseong(3)),
+        'j' => Some(Jamo::Jungseong(4)),
+        'p' => Some(Jamo::Jungseong(5)),
+        'u' => Some(Jamo::Jungseong(6)),
+        'P' => Some(Jamo::Jungseong(7)),
+        'h' => Some(Jamo::Jungseong(8)),
+        'y' => Some(Jamo::Jungseong(12)),
+        'n' => Some(Jamo::Jungseong(13)),
+        'b' => Some(Jamo::Jungseong(17)),
+        'm' => Some(Jamo::Jungseong(18)),
+        'l' => Some(Jamo::Jungseong(20)),
+        _ => None,
+    }
+}
+
+fn choseong_to_jongseong(l: u32) -> Option<u32> {
+    match l {
+        0 => Some(1),
+        2 => Some(4),
+        3 => Some(7),
+        5 => Some(8),
+        6 => Some(16),
+        7 => Some(17),
+        9 => Some(19),
+        10 => Some(20),
+        11 => Some(21),
+        12 => Some(22),
+        14 => Some(23),
+        15 => Some(24),
+        16 => Some(25),
+        17 => Some(26),
+        18 => Some(27),
+        _ => None,
+    }
+}
+
+fn jongseong_to_choseong(t: u32) -> Option<u32> {
+    match t {
+        1 => Some(0),
+        4 => Some(2),
+        7 => Some(3),
+        8 => Some(5),
+        16 => Some(6),
+        17 => Some(7),
+        19 => Some(9),
+        20 => Some(10),
+        21 => Some(11),
+        22 => Some(12),
+        23 => Some(14),
+        24 => Some(15),
+        25 => Some(16),
+        26 => Some(17),
+        27 => Some(18),
+        _ => None,
+    }
+}
+
+fn try_combine_jongseong(t1: u32, l: u32) -> Option<u32> {
+    match (t1, l) {
+        (1, 9) => Some(3),
+        (4, 12) => Some(5),
+        (4, 18) => Some(6),
+        (8, 0) => Some(9),
+        (8, 6) => Some(10),
+        (8, 7) => Some(11),
+        (8, 9) => Some(12),
+        (8, 16) => Some(13),
+        (8, 17) => Some(14),
+        (8, 18) => Some(15),
+        (17, 9) => Some(18),
+        _ => None,
+    }
+}
+
+fn split_composite_jongseong(t: u32) -> Option<(u32, u32)> {
+    match t {
+        3 => Some((1, 9)),
+        5 => Some((4, 12)),
+        6 => Some((4, 18)),
+        9 => Some((8, 0)),
+        10 => Some((8, 6)),
+        11 => Some((8, 7)),
+        12 => Some((8, 9)),
+        13 => Some((8, 16)),
+        14 => Some((8, 17)),
+        15 => Some((8, 18)),
+        18 => Some((17, 9)),
+        _ => None,
+    }
+}
+
+fn try_combine_vowel(v1: u32, v2: u32) -> Option<u32> {
+    match (v1, v2) {
+        (8, 0) => Some(9),
+        (8, 1) => Some(10),
+        (8, 20) => Some(11),
+        (13, 4) => Some(14),
+        (13, 5) => Some(15),
+        (13, 20) => Some(16),
+        (18, 20) => Some(19),
+        _ => None,
+    }
+}
+
+fn split_composite_vowel(v: u32) -> Option<(u32, u32)> {
+    match v {
+        9 => Some((8, 0)),
+        10 => Some((8, 1)),
+        11 => Some((8, 20)),
+        14 => Some((13, 4)),
+        15 => Some((13, 5)),
+        16 => Some((13, 20)),
+        19 => Some((18, 20)),
+        _ => None,
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{truncated}…")
+}
+
+fn render_app(ui: &mut slt::Context, app: &mut App) {
+    let show_sidebar = ui.width() >= 88;
+    let sidebar_width = if ui.width() >= 124 {
+        44
+    } else if ui.width() >= 104 {
+        40
     } else {
-        Style::default().fg(LINK).add_modifier(Modifier::UNDERLINED)
+        34
     };
 
-    let mut runs = Vec::new();
-    push_plain_runs(&mut runs, label, target_style.add_modifier(Modifier::BOLD));
-    if !target.is_empty() && target != label {
-        push_run(&mut runs, Style::default().fg(MUTED), " ");
-        push_run(&mut runs, target_style, "<");
-        push_run(&mut runs, target_style, target);
-        push_run(&mut runs, target_style, ">");
-    }
+    ui.container().bg(BG).w_pct(100).h_pct(100).row(|ui| {
+        ui.container().grow(1).bg(BG).col(|ui| {
+            ui.error_boundary(|ui| {
+                render_transcript(ui, app);
+            });
+            render_status_line(ui, app);
+            render_composer(ui, app);
+        });
 
-    Some((target_end + 1, runs))
+        if show_sidebar {
+            ui.container()
+                .w(sidebar_width)
+                .bg(SIDEBAR_BG)
+                .border(Border::Single)
+                .border_left(true)
+                .border_top(false)
+                .border_bottom(false)
+                .border_right(false)
+                .border_style(Style::new().fg(ACCENT_DIM))
+                .col(|ui| {
+                    render_sidebar(ui, app, (sidebar_width as usize).saturating_sub(4));
+                });
+        }
+    });
+
+    if app.state.ask_user.is_some() {
+        render_ask_user(ui, app);
+    }
+    if app.fatal_error.is_some() {
+        render_fatal_error(ui, app);
+    }
+    ui.toast(&mut app.toast);
 }
 
-fn parse_inline_markdown_runs(text: &str, base_style: Style) -> Vec<(Style, String)> {
-    let mut runs = Vec::new();
-    let mut index = 0usize;
+fn render_transcript(ui: &mut slt::Context, app: &mut App) {
+    if app.auto_scroll {
+        app.transcript_scroll.offset = usize::MAX;
+    }
 
-    while index < text.len() {
-        let slice = &text[index..];
+    let tick = ui.tick();
+    let messages = &app.state.messages;
+    let streaming = app.streaming_message_id.as_deref();
+    let scroll = &mut app.transcript_scroll;
 
-        if let Some((consumed, link_runs)) = parse_markdown_link(slice) {
-            runs.extend(link_runs);
-            index += consumed;
-            continue;
+    ui.scrollable(scroll).grow(1).p(1).col(|ui| {
+        if messages.is_empty() {
+            render_welcome(ui, &app.state);
+            return;
         }
 
-        let mut matched = false;
-        for (open, close, style) in [
-            ("**", "**", base_style.add_modifier(Modifier::BOLD)),
-            ("__", "__", base_style.add_modifier(Modifier::BOLD)),
-            ("*", "*", base_style.add_modifier(Modifier::ITALIC)),
-            ("_", "_", base_style.add_modifier(Modifier::ITALIC)),
-            ("`", "`", Style::default().fg(FG)),
-        ] {
-            if let Some(stripped) = slice.strip_prefix(open) {
-                if let Some(end) = stripped.find(close) {
-                    let inner = &stripped[..end];
-                    if open == "`" {
-                        push_run(&mut runs, style, inner);
+        for msg in messages {
+            render_message(ui, msg, tick, streaming);
+        }
+    });
+}
+
+fn render_message(
+    ui: &mut slt::Context,
+    msg: &NativeMessageState,
+    tick: u64,
+    streaming_id: Option<&str>,
+) {
+    let streaming_cursor = (tick / 30).is_multiple_of(2);
+    match msg.role.as_str() {
+        "user" => {
+            ui.container().pb(1).col(|ui| {
+                ui.styled("❯", Style::new().fg(ACCENT).bold());
+                ui.text_wrap(&msg.content).bold().fg(USER_FG);
+            });
+        }
+        "assistant" => {
+            ui.container().pb(1).col(|ui| {
+                ui.styled("▌ assistant", Style::new().fg(ACCENT).bold());
+                render_content(ui, &msg.content);
+
+                for tool in &msg.tool_calls {
+                    let icon = match tool.status.as_str() {
+                        "ok" | "done" | "success" => "✓",
+                        "error" | "failed" => "✗",
+                        _ => SPINNER_FRAMES[((tick / 6) as usize) % SPINNER_FRAMES.len()],
+                    };
+                    let color = match tool.status.as_str() {
+                        "ok" | "done" | "success" => SUCCESS,
+                        "error" | "failed" => ERROR,
+                        _ => TOOL_MUTED,
+                    };
+                    let tool_display = capitalize_tool_name(&tool.name);
+                    let detail = extract_tool_detail(&tool.summary);
+                    let label = if detail.is_empty() {
+                        tool_display
                     } else {
-                        push_plain_runs(&mut runs, inner, style);
+                        format!("{} {}", tool_display, detail)
+                    };
+                    ui.styled(
+                        truncate(&format!("  {} {}", icon, label), 70),
+                        Style::new().fg(color).dim(),
+                    );
+                }
+
+                if msg.is_thinking.unwrap_or(false) {
+                    let symbol = THINKING_FRAMES[((tick / 6) as usize) % THINKING_FRAMES.len()];
+                    if let Some(thinking) = &msg.thinking {
+                        let preview =
+                            truncate(thinking.lines().last().unwrap_or("thinking..."), 60);
+                        ui.styled(
+                            format!("{} {}", symbol, preview),
+                            Style::new().fg(ACCENT_DIM).italic(),
+                        );
+                    } else {
+                        ui.styled(
+                            format!("{} thinking...", symbol),
+                            Style::new().fg(ACCENT_DIM).italic(),
+                        );
                     }
-                    index += open.len() + end + close.len();
-                    matched = true;
+                }
+
+                if (msg.is_streaming || streaming_id == Some(msg.id.as_str())) && streaming_cursor {
+                    ui.styled("▌", Style::new().fg(ACCENT));
+                }
+            });
+        }
+        _ => {
+            ui.container().pb(1).col(|ui| {
+                ui.text_wrap(format!("⚙ {}", msg.content)).fg(MUTED).dim();
+            });
+        }
+    }
+}
+
+fn render_welcome(ui: &mut slt::Context, state: &NativeTuiState) {
+    ui.spacer();
+    let term_w = ui.width() as usize;
+    let sidebar_w = if term_w >= 124 {
+        44
+    } else if term_w >= 104 {
+        40
+    } else if term_w >= 88 {
+        34
+    } else {
+        0
+    };
+    let avail = term_w.saturating_sub(sidebar_w + 4);
+    let splash = if avail >= 102 {
+        SPLASH_FULL
+    } else if avail >= 52 {
+        SPLASH_COMPACT
+    } else {
+        &[]
+    };
+    let splash_w = splash.iter().map(|l| l.len()).max().unwrap_or(0);
+    let pad = if splash_w > 0 {
+        avail.saturating_sub(splash_w) / 2
+    } else {
+        0
+    };
+    let prefix: String = " ".repeat(pad);
+
+    if !splash.is_empty() {
+        for line in splash {
+            ui.styled(format!("{}{}", prefix, line), Style::new().fg(ACCENT_DIM));
+        }
+        ui.text("");
+    }
+
+    let ver = format!("ddudu v{}", state.version);
+    let ver_pad = " ".repeat(avail.saturating_sub(ver.len()) / 2);
+    ui.styled(
+        format!("{}{}", ver_pad, ver),
+        Style::new().fg(ACCENT).bold(),
+    );
+
+    if let Some(cwd) = state.cwd.rsplit('/').next() {
+        let cwd_str = format!("📁 {}", cwd);
+        let cwd_pad = " ".repeat(avail.saturating_sub(cwd_str.chars().count()) / 2);
+        ui.styled(
+            format!("{}{}", cwd_pad, cwd_str),
+            Style::new().fg(MUTED).dim(),
+        );
+    }
+    ui.spacer();
+}
+
+fn capitalize_tool_name(name: &str) -> String {
+    let base = name.trim_end_matches("_tool").trim_end_matches("Tool");
+    let mut chars = base.chars();
+    match chars.next() {
+        None => String::new(),
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+    }
+}
+
+fn extract_tool_detail(summary: &str) -> String {
+    let s = summary.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    for word in s.split_whitespace() {
+        if word.contains('/') || (word.contains('.') && word.len() > 2) {
+            let path = word.trim_matches(|c: char| {
+                !c.is_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+            });
+            if let Some(fname) = path.rsplit('/').next() {
+                if !fname.is_empty() {
+                    parts.push(fname.to_string());
                     break;
                 }
             }
         }
-        if matched {
-            continue;
-        }
-
-        let next_marker = find_next_inline_marker(slice);
-        let plain = &slice[..next_marker];
-        if plain.is_empty() {
-            if let Some(ch) = slice.chars().next() {
-                let mut raw = [0u8; 4];
-                push_run(&mut runs, base_style, ch.encode_utf8(&mut raw));
-                index += ch.len_utf8();
-            }
-        } else {
-            push_plain_runs(&mut runs, plain, base_style);
-            index += plain.len();
-        }
     }
-
-    runs
+    if parts.is_empty() {
+        truncate(s, 50).to_string()
+    } else {
+        parts.join(" ")
+    }
 }
 
-fn wrap_styled_runs(runs: Vec<(Style, String)>, width: usize) -> Vec<Vec<Span<'static>>> {
-    let width = width.max(1);
-    let mut lines: Vec<Vec<(Style, String)>> = vec![Vec::new()];
-    let mut current_width = 0usize;
+fn context_bar_color(pct: f64) -> Color {
+    if pct < 60.0 {
+        ACCENT_DIM
+    } else if pct < 80.0 {
+        ORANGE
+    } else {
+        ERROR
+    }
+}
 
-    for (style, text) in runs {
-        for grapheme in UnicodeSegmentation::graphemes(text.as_str(), true) {
-            if grapheme == "\n" {
-                lines.push(Vec::new());
-                current_width = 0;
-                continue;
+fn format_tokens_short(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{}", n)
+    }
+}
+
+fn shorten_model(model: &str) -> &str {
+    model
+        .rsplit_once('/')
+        .map(|(_, s)| s)
+        .or_else(|| model.rsplit_once(':').map(|(_, s)| s))
+        .unwrap_or(model)
+}
+
+fn render_status_line(ui: &mut slt::Context, app: &App) {
+    let state = &app.state;
+    let mode = current_mode_label(state);
+    let pct = state.context_percent.clamp(0.0, 100.0);
+    let bar_color = context_bar_color(pct);
+
+    ui.container().h(1).px(1).bg(BG).row(|ui| {
+        ui.styled(mode, Style::new().fg(ACCENT).bold());
+        ui.styled(" · ", Style::new().fg(MUTED));
+        ui.styled(shorten_model(&state.model), Style::new().fg(ACCENT_DIM));
+
+        if let Some(est) = &state.request_estimate {
+            let cost = est.total as f64 / 1_000_000.0 * 15.0;
+            ui.styled(" · ", Style::new().fg(MUTED));
+            ui.styled(format!("${:.2}", cost), Style::new().fg(ACCENT_DIM));
+        }
+
+        ui.styled(" · ", Style::new().fg(MUTED));
+        let filled = (pct / 10.0) as usize;
+        let bar: String = "█".repeat(filled.min(10)) + &"░".repeat(10_usize.saturating_sub(filled));
+        ui.styled(bar, Style::new().fg(bar_color));
+        ui.styled(format!("{:.0}%", pct), Style::new().fg(bar_color));
+
+        if let Some(git_state) = &state.git {
+            if let Some(branch) = &git_state.branch {
+                ui.styled(" · ", Style::new().fg(MUTED));
+                ui.styled(format!("⎇{}", branch), Style::new().fg(FG));
+                if git_state.has_uncommitted {
+                    ui.styled("●", Style::new().fg(ORANGE));
+                }
             }
+        }
 
-            let grapheme_width = UnicodeWidthStr::width(grapheme).max(1);
-            if current_width + grapheme_width > width && current_width > 0 {
-                lines.push(Vec::new());
-                current_width = 0;
+        ui.spacer();
+
+        if state.playing_with_fire {
+            ui.text("🔥").fg(ERROR);
+        } else {
+            ui.styled(
+                truncate(&state.permission_profile, 12),
+                Style::new().fg(MUTED),
+            );
+        }
+        if state.loading {
+            ui.styled(" ", Style::new());
+            ui.spinner(&app.spinner).fg(ACCENT);
+            let mut label = String::new();
+            if let Some(since) = state.loading_since {
+                let now_ms = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let elapsed_s = now_ms.saturating_sub(since) / 1000;
+                if elapsed_s >= 2 {
+                    label.push_str(&format!(" {}s", elapsed_s));
+                }
             }
+            if !state.loading_label.trim().is_empty() {
+                label.push_str(&format!(" {}", state.loading_label.trim()));
+            }
+            if !label.is_empty() {
+                ui.styled(label, Style::new().fg(ACCENT_DIM).italic());
+            }
+        }
+    });
+}
 
-            if let Some(current_line) = lines.last_mut() {
-                if let Some((last_style, last_text)) = current_line.last_mut() {
-                    if *last_style == style {
-                        last_text.push_str(grapheme);
-                    } else {
-                        current_line.push((style, grapheme.to_string()));
-                    }
+fn render_composer(ui: &mut slt::Context, app: &mut App) {
+    ui.container().bg(COMPOSER_BG).px(1).pt(1).col(|ui| {
+        if app.korean_mode {
+            // Bypass text_input: SLT couples event+render in one call, causing
+            // 1-frame raw ASCII flicker on every Korean keystroke. Instead we
+            // register_focusable() + render manually, handle keys in handle_input().
+            let focused = ui.register_focusable();
+
+            let value = &app.composer.value;
+            let cursor_pos = app.composer.cursor;
+
+            if value.is_empty() && app.hangul.preedit().is_none() {
+                if focused {
+                    ui.styled("▎", Style::new().fg(ACCENT_DIM));
                 } else {
-                    current_line.push((style, grapheme.to_string()));
+                    ui.styled(" ", Style::new());
                 }
-            }
-
-            current_width += grapheme_width;
-        }
-    }
-
-    if lines.is_empty() {
-        return vec![vec![Span::raw(String::new())]];
-    }
-
-    lines
-        .into_iter()
-        .map(|line| {
-            if line.is_empty() {
-                vec![Span::raw(String::new())]
             } else {
-                line.into_iter()
-                    .map(|(style, text)| Span::styled(text, style))
-                    .collect()
+                let before: String = value.chars().take(cursor_pos).collect();
+                let after: String = value.chars().skip(cursor_pos).collect();
+                ui.line_wrap(|ui| {
+                    if !before.is_empty() {
+                        ui.styled(before, Style::new().fg(FG));
+                    }
+                    if let Some(p) = app.hangul.preedit() {
+                        ui.styled(
+                            p.to_string(),
+                            Style::new().fg(BG).bg(ACCENT),
+                        );
+                        ui.styled("▎", Style::new().fg(COMPOSER_BG));
+                    } else if focused {
+                        ui.styled("▎", Style::new().fg(ACCENT_DIM));
+                    }
+                    if !after.is_empty() {
+                        ui.styled(after, Style::new().fg(FG));
+                    }
+                });
             }
-        })
-        .collect()
-}
-
-fn parse_ordered_list_prefix(text: &str) -> Option<(&str, &str)> {
-    let dot_index = text.find(". ")?;
-    if dot_index == 0 {
-        return None;
-    }
-
-    let marker = &text[..dot_index];
-    if marker.chars().all(|ch| ch.is_ascii_digit()) {
-        Some((marker, &text[dot_index + 2..]))
-    } else {
-        None
-    }
-}
-
-fn is_horizontal_rule(text: &str) -> bool {
-    let trimmed = text.trim();
-    if trimmed.len() < 3 {
-        return false;
-    }
-
-    trimmed.chars().all(|ch| matches!(ch, '-' | '*' | '_'))
-}
-
-#[derive(Clone, Copy)]
-enum TableAlign {
-    Left,
-    Center,
-    Right,
-}
-
-fn parse_markdown_table_cells(text: &str) -> Option<Vec<String>> {
-    let trimmed = text.trim();
-    if !trimmed.contains('|') {
-        return None;
-    }
-
-    let cells = trimmed
-        .trim_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_string())
-        .collect::<Vec<_>>();
-    if cells.len() < 2 {
-        return None;
-    }
-
-    Some(cells)
-}
-
-fn parse_markdown_table_alignments(text: &str, expected_cols: usize) -> Option<Vec<TableAlign>> {
-    let cells = parse_markdown_table_cells(text)?;
-    if cells.len() != expected_cols {
-        return None;
-    }
-
-    let mut aligns = Vec::with_capacity(expected_cols);
-    for cell in cells {
-        let compact = cell.replace(' ', "");
-        if compact.is_empty() || !compact.chars().all(|ch| matches!(ch, '-' | ':')) {
-            return None;
-        }
-
-        let align = match (compact.starts_with(':'), compact.ends_with(':')) {
-            (true, true) => TableAlign::Center,
-            (false, true) => TableAlign::Right,
-            _ => TableAlign::Left,
-        };
-        aligns.push(align);
-    }
-
-    Some(aligns)
-}
-
-fn pad_table_cell(text: &str, width: usize, align: TableAlign) -> String {
-    let clipped = preview_line(text, width.max(1));
-    let visible_width = UnicodeWidthStr::width(clipped.as_str());
-    let pad = width.saturating_sub(visible_width);
-
-    match align {
-        TableAlign::Left => format!("{clipped}{}", " ".repeat(pad)),
-        TableAlign::Right => format!("{}{}", " ".repeat(pad), clipped),
-        TableAlign::Center => {
-            let left = pad / 2;
-            let right = pad.saturating_sub(left);
-            format!("{}{}{}", " ".repeat(left), clipped, " ".repeat(right))
-        }
-    }
-}
-
-fn build_table_border(left: &str, mid: &str, right: &str, widths: &[usize]) -> String {
-    let mut out = String::from(left);
-    for (index, width) in widths.iter().enumerate() {
-        if index > 0 {
-            out.push_str(mid);
-        }
-        out.push_str(&"─".repeat(width + 2));
-    }
-    out.push_str(right);
-    out
-}
-
-fn build_table_row_spans(
-    cells: &[String],
-    widths: &[usize],
-    aligns: &[TableAlign],
-    header: bool,
-) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let border_style = Style::default().fg(ACCENT_DIM);
-    let cell_style = if header {
-        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(FG)
-    };
-
-    spans.push(Span::styled("│", border_style));
-    for (index, cell) in cells.iter().enumerate() {
-        let align = aligns.get(index).copied().unwrap_or(TableAlign::Left);
-        spans.push(Span::styled(" ", border_style));
-        spans.push(Span::styled(
-            pad_table_cell(cell, widths[index], align),
-            cell_style,
-        ));
-        spans.push(Span::styled(" ", border_style));
-        spans.push(Span::styled("│", border_style));
-    }
-    spans
-}
-
-fn render_markdown_table_block(
-    raw_lines: &[&str],
-    width: usize,
-) -> Option<(usize, Vec<Vec<Span<'static>>>)> {
-    if raw_lines.len() < 2 {
-        return None;
-    }
-
-    let header = parse_markdown_table_cells(raw_lines[0])?;
-    let aligns = parse_markdown_table_alignments(raw_lines[1], header.len())?;
-    let mut rows = vec![header];
-    let mut consumed = 2usize;
-
-    while consumed < raw_lines.len() {
-        let Some(row) = parse_markdown_table_cells(raw_lines[consumed]) else {
-            break;
-        };
-        if row.len() != rows[0].len() {
-            break;
-        }
-        rows.push(row);
-        consumed += 1;
-    }
-
-    let col_count = rows[0].len();
-    let overhead = (3 * col_count) + 1;
-    if width <= overhead + col_count {
-        return None;
-    }
-
-    let mut widths = vec![3usize; col_count];
-    for row in &rows {
-        for (index, cell) in row.iter().enumerate() {
-            widths[index] = widths[index].max(UnicodeWidthStr::width(cell.as_str()).max(1));
-        }
-    }
-
-    let max_total = width.saturating_sub(overhead);
-    while widths.iter().sum::<usize>() > max_total {
-        let Some((largest_index, largest_width)) =
-            widths.iter().enumerate().max_by_key(|(_, width)| **width)
-        else {
-            break;
-        };
-        if *largest_width <= 8 {
-            break;
-        }
-        widths[largest_index] = largest_width.saturating_sub(1);
-    }
-
-    let mut rendered = Vec::new();
-    rendered.push(vec![Span::styled(
-        build_table_border("╭", "┬", "╮", &widths),
-        Style::default().fg(ACCENT_DIM),
-    )]);
-    rendered.push(build_table_row_spans(&rows[0], &widths, &aligns, true));
-    rendered.push(vec![Span::styled(
-        build_table_border("├", "┼", "┤", &widths),
-        Style::default().fg(ACCENT_DIM),
-    )]);
-
-    for row in rows.iter().skip(1) {
-        rendered.push(build_table_row_spans(row, &widths, &aligns, false));
-    }
-
-    rendered.push(vec![Span::styled(
-        build_table_border("╰", "┴", "╯", &widths),
-        Style::default().fg(ACCENT_DIM),
-    )]);
-
-    Some((consumed, rendered))
-}
-
-fn render_assistant_markdown_line(
-    raw_line: &str,
-    width: usize,
-    in_code_block: &mut bool,
-) -> Vec<Vec<Span<'static>>> {
-    let trimmed_start = raw_line.trim_start();
-    let base = Style::default().fg(FG);
-
-    if trimmed_start.starts_with("```") {
-        *in_code_block = !*in_code_block;
-        let label = trimmed_start.trim_matches('`').trim();
-        let fence_text = if label.is_empty() {
-            "code".to_string()
         } else {
-            format!("code · {label}")
-        };
-        return vec![vec![Span::styled(
-            fence_text,
-            Style::default().fg(ACCENT_DIM),
-        )]];
-    }
+            if app.hangul_preedit_len > 0 {
+                remove_hangul_preedit(app);
+            }
+            ui.text_input(&mut app.composer);
+        }
 
-    if *in_code_block {
-        return wrap_styled_runs(vec![(Style::default().fg(FG), raw_line.to_string())], width);
-    }
-
-    if raw_line.trim().is_empty() {
-        return vec![vec![Span::raw(String::new())]];
-    }
-
-    if is_horizontal_rule(raw_line) {
-        return vec![vec![Span::styled(
-            "─".repeat(width.max(8).min(48)),
-            Style::default().fg(ACCENT_DIM),
-        )]];
-    }
-
-    if trimmed_start.starts_with("> ") {
-        let mut runs = vec![(Style::default().fg(ACCENT_DIM), "▎ ".to_string())];
-        runs.extend(parse_inline_markdown_runs(
-            trimmed_start.trim_start_matches("> ").trim_start(),
-            Style::default()
-                .fg(ACCENT_DIM)
-                .add_modifier(Modifier::ITALIC),
-        ));
-        return wrap_styled_runs(runs, width);
-    }
-
-    let heading_level = trimmed_start.chars().take_while(|ch| *ch == '#').count();
-    if heading_level > 0 && trimmed_start.chars().nth(heading_level) == Some(' ') {
-        let heading_text = trimmed_start[heading_level + 1..].trim();
-        let mut runs = vec![(
-            Style::default().fg(ACCENT_DIM),
-            format!("{} ", "•".repeat(heading_level.min(3))),
-        )];
-        runs.extend(parse_inline_markdown_runs(
-            heading_text,
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        ));
-        return wrap_styled_runs(runs, width);
-    }
-
-    if let Some(rest) = trimmed_start
-        .strip_prefix("- ")
-        .or_else(|| trimmed_start.strip_prefix("* "))
-        .or_else(|| trimmed_start.strip_prefix("+ "))
-    {
-        let mut runs = vec![(Style::default().fg(ACCENT), "• ".to_string())];
-        runs.extend(parse_inline_markdown_runs(rest, base));
-        return wrap_styled_runs(runs, width);
-    }
-
-    if let Some((marker, rest)) = parse_ordered_list_prefix(trimmed_start) {
-        let mut runs = vec![(
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-            format!("{marker}. "),
-        )];
-        runs.extend(parse_inline_markdown_runs(rest, base));
-        return wrap_styled_runs(runs, width);
-    }
-
-    if trimmed_start.starts_with('{')
-        || trimmed_start.starts_with('}')
-        || trimmed_start.starts_with('[')
-        || trimmed_start.starts_with(']')
-    {
-        return wrap_styled_runs(vec![(Style::default().fg(FG), raw_line.to_string())], width);
-    }
-
-    wrap_styled_runs(parse_inline_markdown_runs(raw_line, base), width)
-}
-
-fn append_guttered_span_lines(
-    lines: &mut Vec<Line<'static>>,
-    rendered_lines: Vec<Vec<Span<'static>>>,
-    prefix: &str,
-    prefix_style: Style,
-    first_visual_line: &mut bool,
-) {
-    let continuation = " ".repeat(prefix.width());
-    for spans in rendered_lines {
-        let gutter = if *first_visual_line {
-            prefix.to_string()
+        if !app.state.queued_prompts.is_empty() {
+            let preview = app
+                .state
+                .queued_prompts
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.styled(format!("queue: {preview}"), Style::new().fg(MUTED).dim());
+        }
+        let hint = if ui.width() >= 80 {
+            if app.korean_mode {
+                "[한] Enter submit | Esc abort/clear | Ctrl+Space EN | Shift+Tab mode | Ctrl+L clear"
+            } else {
+                "Enter submit | Esc abort/clear | Ctrl+Space 한 | Shift+Tab mode | Ctrl+L clear"
+            }
+        } else if app.korean_mode {
+            "[한] Enter ⏎ | Esc ✕ | Ctrl+Space EN"
         } else {
-            continuation.clone()
+            "Enter ⏎ | Esc ✕ | Ctrl+Space 한"
         };
-        *first_visual_line = false;
-
-        let mut full = Vec::with_capacity(spans.len() + 1);
-        full.push(Span::styled(gutter, prefix_style));
-        full.extend(spans);
-        lines.push(Line::from(full));
-    }
+        ui.styled(hint, Style::new().fg(MUTED));
+    });
 }
 
-fn build_transcript_lines(
-    messages: &[NativeMessageState],
-    width: usize,
-    fold_tool_calls: bool,
-    fold_system_messages: bool,
-    spinner_index: usize,
-    streaming_message_id: Option<&str>,
-    streaming_cursor_visible: bool,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let width = width.max(10);
-    let _ = fold_tool_calls;
+fn render_sidebar(ui: &mut slt::Context, app: &mut App, max_width: usize) {
+    let sidebar_max = max_width.max(16);
+    let pct = app.state.context_percent.clamp(0.0, 100.0);
+    let bar_w = sidebar_max.saturating_sub(8);
+    let filled = ((pct / 100.0) * bar_w as f64) as usize;
+    let bar_color = context_bar_color(pct);
 
-    for message in messages {
-        let message_start_line = lines.len();
-        let mut rendered_any = false;
-        let mut first_visual_line = true;
-        let (prefix, prefix_style, text_style) = match message.role.as_str() {
-            "user" => (
-                "› ",
-                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                Style::default().fg(USER_FG),
-            ),
-            "assistant" => (
-                "│ ",
-                Style::default().fg(ACCENT_DIM),
-                Style::default().fg(ASSISTANT_FG),
-            ),
-            "system" => (
-                "! ",
-                Style::default().fg(ERROR).add_modifier(Modifier::BOLD),
-                Style::default().fg(MUTED_LIGHT),
-            ),
-            _ => (
-                "· ",
-                Style::default().fg(MUTED),
-                Style::default().fg(MUTED_LIGHT),
-            ),
-        };
-
-        let prefix_width = prefix.width();
-        let content_width = width.saturating_sub(prefix_width);
-        let has_thinking_content = message
-            .thinking
-            .as_ref()
-            .map(|thinking| !thinking.trim().is_empty())
-            .unwrap_or(false);
-        let should_render_thinking = message.role == "assistant"
-            && (message.is_thinking.unwrap_or(false) || has_thinking_content);
-        let is_live_streaming = message.is_streaming
-            || streaming_message_id.is_some_and(|streaming_id| streaming_id == message.id.as_str());
-
-        if fold_system_messages && message.role == "system" && !message.content.trim().is_empty() {
-            let folded = preview_line(&message.content, content_width);
-            lines.push(Line::from(vec![
-                Span::styled(prefix.to_string(), prefix_style),
-                Span::styled(
-                    format!("{folded}  [folded]"),
-                    Style::default().fg(TOOL_MUTED),
+    let scroll = &mut app.sidebar_scroll;
+    ui.scrollable(scroll).p(1).col(|ui| {
+        ui.styled("• CONTEXT", Style::new().fg(ACCENT).bold());
+        let bar: String = "█".repeat(filled) + &"░".repeat(bar_w.saturating_sub(filled));
+        ui.styled(format!("  {} {:.0}%", bar, pct), Style::new().fg(bar_color));
+        ui.styled(
+            truncate(
+                &format!(
+                    "  {} / {} tokens",
+                    format_tokens_short(app.state.context_tokens),
+                    format_tokens_short(app.state.context_limit)
                 ),
-            ]));
-            rendered_any = true;
-        } else if !message.content.trim().is_empty()
-            || message.tool_calls.is_empty()
-            || should_render_thinking
-        {
-            if message.role == "assistant" {
-                let should_render_main_content =
-                    !message.content.trim().is_empty() || message.tool_calls.is_empty();
+                sidebar_max,
+            ),
+            Style::new().fg(MUTED),
+        );
+        if let Some(est) = &app.state.request_estimate {
+            ui.styled(
+                truncate(
+                    &format!(
+                        "  sys:{}  hist:{}  tools:{}",
+                        format_tokens_short(est.system),
+                        format_tokens_short(est.history),
+                        format_tokens_short(est.tools)
+                    ),
+                    sidebar_max,
+                ),
+                Style::new().fg(MUTED).dim(),
+            );
+        }
+        ui.text("");
 
-                if should_render_thinking {
-                    let thinking_label = if message.is_thinking.unwrap_or(false) {
-                        format!(
-                            "{} thinking...",
-                            THINKING_FRAMES[spinner_index % THINKING_FRAMES.len()]
-                        )
-                    } else {
-                        "thought".to_string()
-                    };
-
-                    let label_line = vec![Span::styled(
-                        thinking_label,
-                        Style::default()
-                            .fg(ACCENT_DIM)
-                            .add_modifier(Modifier::ITALIC),
-                    )];
-                    append_guttered_span_lines(
-                        &mut lines,
-                        vec![label_line],
-                        "│ ",
-                        Style::default().fg(ACCENT_DIM),
-                        &mut first_visual_line,
+        if let Some(git_state) = &app.state.git {
+            if !git_state.changed_files.is_empty() {
+                ui.styled(
+                    format!("• FILES ({})", git_state.changed_files.len()),
+                    Style::new().fg(ACCENT).bold(),
+                );
+                for (i, file) in git_state.changed_files.iter().take(8).enumerate() {
+                    let _ = i;
+                    ui.styled(
+                        truncate(&format!("  │ {}", file), sidebar_max),
+                        Style::new().fg(FG),
                     );
-
-                    let thinking_text = message.thinking.as_deref().unwrap_or("");
-                    let thinking_lines: Vec<&str> = thinking_text.lines().take(3).collect();
-                    for line in &thinking_lines {
-                        let styled = vec![Span::styled(
-                            preview_line(line, content_width),
-                            Style::default()
-                                .fg(ACCENT_DIM)
-                                .add_modifier(Modifier::ITALIC),
-                        )];
-                        append_guttered_span_lines(
-                            &mut lines,
-                            vec![styled],
-                            "│ ",
-                            Style::default().fg(ACCENT_DIM),
-                            &mut first_visual_line,
-                        );
-                    }
-
-                    let total_lines = thinking_text.lines().count();
-                    if total_lines > 3 {
-                        let more = vec![Span::styled(
-                            format!("… +{} more lines", total_lines - 3),
-                            Style::default().fg(MUTED),
-                        )];
-                        append_guttered_span_lines(
-                            &mut lines,
-                            vec![more],
-                            "│ ",
-                            Style::default().fg(ACCENT_DIM),
-                            &mut first_visual_line,
-                        );
-                    }
-
-                    if !message.content.trim().is_empty() {
-                        lines.push(Line::from(Span::raw(String::new())));
-                    }
-                    rendered_any = true;
                 }
-
-                if should_render_main_content {
-                    let mut in_code_block = false;
-                    let raw_lines = message.content.split('\n').collect::<Vec<_>>();
-                    let mut index = 0usize;
-                    while index < raw_lines.len() {
-                        let raw_line = raw_lines[index];
-                        let rendered = if !in_code_block {
-                            if let Some((consumed, table_lines)) =
-                                render_markdown_table_block(&raw_lines[index..], content_width)
-                            {
-                                index += consumed;
-                                table_lines
-                            } else {
-                                index += 1;
-                                render_assistant_markdown_line(
-                                    raw_line,
-                                    content_width,
-                                    &mut in_code_block,
-                                )
-                            }
-                        } else {
-                            index += 1;
-                            render_assistant_markdown_line(
-                                raw_line,
-                                content_width,
-                                &mut in_code_block,
-                            )
-                        };
-                        append_guttered_span_lines(
-                            &mut lines,
-                            rendered,
-                            prefix,
-                            prefix_style,
-                            &mut first_visual_line,
-                        );
-                        rendered_any = true;
-                    }
+                let remaining = git_state.changed_files.len().saturating_sub(8);
+                if remaining > 0 {
+                    ui.styled(
+                        format!("  │ +{} more", remaining),
+                        Style::new().fg(MUTED).dim(),
+                    );
                 }
-
-                if is_live_streaming && streaming_cursor_visible {
-                    if lines.len() > message_start_line {
-                        if let Some(last_line) = lines.last_mut() {
-                            last_line.spans.push(Span::styled(
-                                "▌",
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                            ));
-                        }
-                    } else {
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), prefix_style),
-                            Span::styled(
-                                "▌",
-                                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                    rendered_any = true;
-                }
-            } else {
-                for raw_line in message.content.split('\n') {
-                    let wrapped = wrap_plain(raw_line, content_width);
-                    for chunk in wrapped {
-                        let gutter = if first_visual_line {
-                            prefix.to_string()
-                        } else {
-                            " ".repeat(prefix_width)
-                        };
-                        first_visual_line = false;
-
-                        lines.push(Line::from(vec![
-                            Span::styled(gutter, prefix_style),
-                            Span::styled(chunk, text_style),
-                        ]));
-                        rendered_any = true;
-                    }
-
-                    if raw_line.is_empty() {
-                        let gutter = if first_visual_line {
-                            prefix.to_string()
-                        } else {
-                            " ".repeat(prefix_width)
-                        };
-                        first_visual_line = false;
-                        lines.push(Line::from(vec![
-                            Span::styled(gutter, prefix_style),
-                            Span::styled(String::new(), text_style),
-                        ]));
-                        rendered_any = true;
-                    }
-                }
+                ui.text("");
             }
         }
 
-        if !message.tool_calls.is_empty() {
-            for tc in &message.tool_calls {
-                let status_icon = match tc.status.as_str() {
-                    "ok" => "✓",
-                    "error" => "✗",
-                    "running" => SPINNER_FRAMES[spinner_index % SPINNER_FRAMES.len()],
+        if !app.state.todos.is_empty() {
+            ui.styled("• PLAN", Style::new().fg(ACCENT).bold());
+            for item in app.state.todos.iter().take(8) {
+                let icon = match item.status.as_str() {
+                    "completed" | "done" => "✓",
+                    "in_progress" => "▸",
+                    "cancelled" => "×",
                     _ => "·",
                 };
-                let status_color = match tc.status.as_str() {
-                    "error" => ERROR,
-                    "running" => ACCENT_DIM,
-                    _ => TOOL_MUTED,
-                };
-                let summary = preview_line(&tc.summary, content_width.saturating_sub(4));
-                let tool_line = vec![
-                    Span::styled(format!("{status_icon} "), Style::default().fg(status_color)),
-                    Span::styled(summary, Style::default().fg(TOOL_MUTED)),
-                ];
-                append_guttered_span_lines(
-                    &mut lines,
-                    vec![tool_line],
-                    "│ ",
-                    Style::default().fg(ACCENT_DIM),
-                    &mut first_visual_line,
+                ui.styled(
+                    truncate(&format!("  │ {} {}", icon, item.step), sidebar_max),
+                    Style::new().fg(FG),
                 );
             }
-            rendered_any = true;
+            ui.text("");
         }
 
-        if message.is_streaming {
-            let indicator = if message.is_thinking.unwrap_or(false) {
-                format!(
-                    "{} thinking...",
-                    THINKING_FRAMES[spinner_index % THINKING_FRAMES.len()]
-                )
-            } else {
-                format!("{} writing…", SPINNER_FRAMES[spinner_index])
-            };
-            let streaming_line = vec![Span::styled(
-                indicator,
-                Style::default()
-                    .fg(ACCENT_DIM)
-                    .add_modifier(Modifier::ITALIC),
-            )];
-            append_guttered_span_lines(
-                &mut lines,
-                vec![streaming_line],
-                "│ ",
-                Style::default().fg(ACCENT_DIM),
-                &mut first_visual_line,
+        let has_agents =
+            !app.state.agent_activities.is_empty() || !app.state.background_jobs.is_empty();
+        if has_agents {
+            ui.styled("• AGENTS", Style::new().fg(ACCENT).bold());
+            let tick = ui.tick();
+            for agent in app.state.agent_activities.iter().take(4) {
+                let icon = match agent.status.as_str() {
+                    "done" | "completed" => "✓",
+                    "running" => SPINNER_FRAMES[((tick / 6) as usize) % SPINNER_FRAMES.len()],
+                    "error" | "failed" => "✗",
+                    _ => "·",
+                };
+                ui.styled(
+                    truncate(&format!("  │ {} {}", icon, agent.label), sidebar_max),
+                    Style::new().fg(FG),
+                );
+            }
+            for job in app.state.background_jobs.iter().take(4) {
+                let icon = match job.status.as_str() {
+                    "done" => "✓",
+                    "error" => "✗",
+                    "cancelled" => "•",
+                    _ => SPINNER_FRAMES[((tick / 6) as usize) % SPINNER_FRAMES.len()],
+                };
+                ui.styled(
+                    truncate(
+                        &format!("  │ {} [{}] {}", icon, job.kind, job.label),
+                        sidebar_max,
+                    ),
+                    Style::new().fg(FG),
+                );
+            }
+            ui.text("");
+        }
+
+        ui.styled("• SYSTEMS", Style::new().fg(ACCENT).bold());
+        for provider in &app.state.providers {
+            let icon = if provider.available { "●" } else { "○" };
+            let color = if provider.available { SUCCESS } else { MUTED };
+            ui.styled(
+                truncate(&format!("  │ {} {}", icon, provider.name), sidebar_max),
+                Style::new().fg(color),
             );
-            rendered_any = true;
+        }
+        let mut sys_parts: Vec<String> = Vec::new();
+        if let Some(mcp_state) = &app.state.mcp {
+            sys_parts.push(format!(
+                "mcp {}/{}",
+                mcp_state.connected_servers, mcp_state.configured_servers
+            ));
+        }
+        if let Some(lsp_state) = &app.state.lsp {
+            sys_parts.push(format!(
+                "lsp {}/{}",
+                lsp_state.connected_servers, lsp_state.available_servers
+            ));
+        }
+        if !sys_parts.is_empty() {
+            ui.styled(
+                truncate(&format!("  │ {}", sys_parts.join(" · ")), sidebar_max),
+                Style::new().fg(FG),
+            );
+        }
+        if let Some(v) = &app.state.verification {
+            let (color, icon) = match v.status.as_str() {
+                "passed" => (SUCCESS, "✓"),
+                "failed" => (ERROR, "✗"),
+                _ => (ORANGE, "⠋"),
+            };
+            ui.styled(
+                truncate(&format!("  │ verify: {} {}", v.status, icon), sidebar_max),
+                Style::new().fg(color),
+            );
         }
 
-        if rendered_any {
-            lines.push(Line::from(Span::raw("")));
+        if let Some(strategy) = &app.state.team_run_strategy {
+            ui.text("");
+            ui.styled("• TEAM", Style::new().fg(ACCENT).bold());
+            ui.styled(
+                truncate(&format!("  │ {}", strategy), sidebar_max),
+                Style::new().fg(FG),
+            );
+            if let Some(task) = &app.state.team_run_task {
+                ui.styled(
+                    truncate(&format!("  │ {}", task), sidebar_max),
+                    Style::new().fg(MUTED),
+                );
+            }
+        }
+    });
+}
+
+fn render_ask_user(ui: &mut slt::Context, app: &mut App) {
+    let Some(prompt) = app.state.ask_user.as_ref() else {
+        return;
+    };
+
+    ui.modal(|ui| {
+        ui.container()
+            .w_pct(75)
+            .max_w(100)
+            .bg(BG)
+            .border(Border::Single)
+            .p(1)
+            .center()
+            .col(|ui| {
+                let title = match prompt.kind.as_str() {
+                    "choice" | "select" => "Choose an Option",
+                    "number" => "Enter a Number",
+                    "confirm" => "Confirm",
+                    _ => "Answer Required",
+                };
+                ui.styled(title, Style::new().fg(ACCENT).bold());
+                ui.text_wrap(prompt.question.clone());
+                if let Some(detail) = &prompt.detail {
+                    ui.text_wrap(detail.clone()).fg(MUTED).dim();
+                }
+
+                if !prompt.options.is_empty() {
+                    sync_ask_user_radio(&app.state.ask_user, &mut app.ask_user_radio);
+                    ui.radio(&mut app.ask_user_radio);
+                }
+
+                if prompt.allow_custom_answer {
+                    ui.styled("Custom answer", Style::new().fg(ACCENT_DIM));
+                    ui.text_input(&mut app.ask_user_input);
+                }
+
+                let label = prompt
+                    .submit_label
+                    .clone()
+                    .unwrap_or_else(|| "Submit".to_string());
+                ui.styled(
+                    format!("Press Enter to {label}, Esc to cancel"),
+                    Style::new().fg(MUTED).italic(),
+                );
+            });
+    });
+}
+
+fn render_fatal_error(ui: &mut slt::Context, app: &App) {
+    let Some(message) = app.fatal_error.as_ref() else {
+        return;
+    };
+    ui.modal(|ui| {
+        ui.container()
+            .w_pct(70)
+            .max_w(90)
+            .bg(BG)
+            .border(Border::Single)
+            .border_style(Style::new().fg(ERROR))
+            .p(1)
+            .center()
+            .col(|ui| {
+                ui.styled("⚠ Bridge Error", Style::new().fg(ERROR).bold());
+                ui.text("");
+                ui.text_wrap(message.clone()).fg(FG);
+                ui.text("");
+                ui.styled("Press Ctrl+C to exit", Style::new().fg(MUTED).italic());
+            });
+    });
+}
+
+fn sync_ask_user_radio(ask_user: &Option<NativeAskUserState>, radio: &mut slt::RadioState) {
+    let Some(prompt) = ask_user.as_ref() else {
+        return;
+    };
+    let items = prompt
+        .options
+        .iter()
+        .map(|opt| {
+            let mut label = opt.label.clone();
+            if opt.recommended {
+                label.push_str(" (recommended)");
+            }
+            label
+        })
+        .collect::<Vec<_>>();
+
+    if items.is_empty() {
+        return;
+    }
+    if radio.items != items {
+        *radio = slt::RadioState::new(items);
+        if let Some(default_index) = prompt.default_option_index {
+            radio.selected = default_index.min(prompt.options.len().saturating_sub(1));
         }
     }
-
-    lines
 }
 
-fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
-    let width = area.width.saturating_mul(percent_x).saturating_div(100);
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
+fn current_mode_label(state: &NativeTuiState) -> String {
+    state
+        .modes
+        .iter()
+        .find(|mode| mode.active)
+        .map(|mode| mode.label.clone())
+        .unwrap_or_else(|| state.mode.to_uppercase())
 }
 
-fn top_padded_rect(area: Rect, padding: u16) -> Rect {
-    let inset = padding.min(area.height.saturating_sub(1));
-    Rect {
-        x: area.x,
-        y: area.y + inset,
-        width: area.width,
-        height: area.height.saturating_sub(inset),
+fn ddudu_theme() -> slt::Theme {
+    slt::Theme {
+        primary: Color::Rgb(247, 167, 187),
+        secondary: Color::Rgb(160, 110, 125),
+        accent: Color::Rgb(247, 167, 187),
+        text: Color::Rgb(230, 230, 230),
+        text_dim: Color::Rgb(80, 80, 80),
+        border: Color::Rgb(40, 40, 40),
+        bg: Color::Rgb(0, 0, 0),
+        success: Color::Rgb(46, 204, 64),
+        warning: Color::Rgb(255, 165, 80),
+        error: Color::Rgb(255, 55, 55),
+        selected_bg: Color::Rgb(247, 167, 187),
+        selected_fg: Color::Rgb(0, 0, 0),
+        surface: Color::Rgb(15, 15, 15),
+        surface_hover: Color::Rgb(25, 25, 25),
+        surface_text: Color::Rgb(230, 230, 230),
     }
 }
 
@@ -5887,26 +2170,31 @@ fn parse_args() -> Result<(String, String)> {
     Ok((node_path, bridge_path))
 }
 
+const MAX_BRIDGE_EVENTS_PER_FRAME: usize = 64;
+
 fn main() -> Result<()> {
     let (node_path, bridge_path) = parse_args()?;
-    let bridge = BridgeClient::spawn(&node_path, &bridge_path)?;
+    let (mut child, mut stdin, receiver) = spawn_bridge(&node_path, &bridge_path)?;
+    let mut app = App::new();
 
-    let mut terminal = ratatui::init();
-    let _ = execute!(
-        terminal.backend_mut(),
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-    );
-    terminal.clear()?;
-
-    let outcome = {
-        let mut app = App::new(bridge);
-        app.run(&mut terminal).and_then(|_| {
-            app.bridge.shutdown();
-            Ok(())
-        })
+    let config = RunConfig {
+        tick_rate: Duration::from_millis(16),
+        mouse: true,
+        kitty_keyboard: false,
+        theme: ddudu_theme(),
+        color_depth: None,
+        max_fps: Some(60),
     };
 
-    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
-    ratatui::restore();
-    outcome
+    let run_result = slt::run_with(config, |ui| {
+        poll_bridge(&receiver, &mut app, ui);
+        render_app(ui, &mut app);
+        if let Err(error) = handle_input(ui, &mut app, &mut stdin) {
+            app.fatal_error = Some(error.to_string());
+        }
+    });
+
+    let _ = child.kill();
+    let _ = child.wait();
+    run_result.map_err(|error| anyhow!(error))
 }
