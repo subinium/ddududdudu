@@ -223,7 +223,12 @@ export class ExecutionScheduler {
         if (release) {
           try {
             release();
-          } catch {}
+          } catch (releaseErr: unknown) {
+            console.error(
+              '[scheduler] semaphore release failed:',
+              releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+            );
+          }
         }
       }
       throw error;
@@ -260,10 +265,7 @@ export const deriveExecutionSchedulerConfig = (input: {
   pollMs?: number | undefined;
   staleMs?: number | undefined;
 }): ExecutionSchedulerConfig => {
-  const capacity = Math.max(
-    1,
-    input.maxParallelWrites ?? 4,
-  );
+  const capacity = Math.max(1, input.maxParallelWrites ?? 4);
 
   return {
     providerBudgets: {

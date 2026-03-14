@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 
-import { parseArgs, type ParsedCommand } from './cli.js';
 import { discoverAllProviders } from './auth/discovery.js';
 import {
-  AUTH_PROVIDERS,
   AUTH_PROVIDER_DESCRIPTIONS,
+  AUTH_PROVIDERS,
   AUTH_SETUP_HINTS,
+  type AuthProviderName,
   buildAuthModeHighlights,
   buildGeminiLoginHelp,
   buildResolvedModeSummary,
   resolveRequestedAuthProvider,
-  type AuthProviderName,
 } from './auth/login.js';
 import { getAuthStorePath, setStoredProviderAuth } from './auth/store.js';
+import { type ParsedCommand, parseArgs } from './cli.js';
 import { initializeProject } from './core/project-init.js';
 import { DIM, GREEN, PINK, RED, RESET } from './tui/colors.js';
 import { stringifyYaml } from './utils/yaml.js';
@@ -65,10 +65,7 @@ const formatSessionLabel = (session: {
   return parts.join('  ·  ');
 };
 
-const formatProviderChoice = (
-  provider: AuthProviderName,
-  connected: boolean,
-): string => {
+const formatProviderChoice = (provider: AuthProviderName, connected: boolean): string => {
   const status = connected ? 'connected' : 'new';
   return `${provider.toUpperCase()}  ${DIM}${status}${RESET}`;
 };
@@ -232,14 +229,7 @@ const printUsage = async (topic: HelpTopic = 'global'): Promise<void> => {
       'Runs a detached background job worker for the given job id.',
       '',
     ],
-    status: [
-      '',
-      `${PL}Usage${X}`,
-      `  ${P}ddudu status${X}`,
-      '',
-      'Prints a minimal runtime status summary.',
-      '',
-    ],
+    status: ['', `${PL}Usage${X}`, `  ${P}ddudu status${X}`, '', 'Prints a minimal runtime status summary.', ''],
   };
 
   process.stdout.write(`${usageByTopic[topic].join('\n')}\n`);
@@ -391,16 +381,13 @@ const handleConfig = async (parsed: ParsedCommand): Promise<void> => {
       throw new Error('config set requires KEY and VALUE');
     }
     const { setDduduConfigValue } = await import('./core/config-editor.js');
-    const scope =
-      parsed.flags.project === true || parsed.flags.scope === 'project'
-        ? 'project'
-        : 'global';
+    const scope = parsed.flags.project === true || parsed.flags.scope === 'project' ? 'project' : 'global';
     const updatedPath = await setDduduConfigValue(process.cwd(), key, parseConfigValue(value), scope);
     process.stdout.write(`Updated ${key} (${scope})\n${updatedPath}\n`);
     return;
   }
 
-  throw new Error('Unknown config subcommand');
+  throw new Error('Unknown config subcommand. Available: show, set. Usage: ddudu config <show|set KEY VALUE>');
 };
 
 interface ProviderCheckResult {
@@ -426,7 +413,7 @@ const getProviderChecks = async (): Promise<ProviderCheckResult[]> => {
       name: provider.name,
       command: provider.command,
       available: await checkCommandAvailable(provider.command),
-    }))
+    })),
   );
 
   return checks;
@@ -454,7 +441,7 @@ const handleProvider = async (parsed: ParsedCommand): Promise<void> => {
     return;
   }
 
-  throw new Error('Unknown provider subcommand');
+  throw new Error('Unknown provider subcommand. Available: list, check. Usage: ddudu provider <list|check>');
 };
 
 const resolveSessionDir = async (): Promise<string> => {
@@ -534,7 +521,9 @@ const handleSession = async (parsed: ParsedCommand): Promise<void> => {
     return;
   }
 
-  throw new Error('Unknown session subcommand');
+  throw new Error(
+    'Unknown session subcommand. Available: list, last, pick, resume <id>. Usage: ddudu session <subcommand>',
+  );
 };
 
 const handleResume = async (parsed: ParsedCommand): Promise<void> => {
@@ -542,15 +531,8 @@ const handleResume = async (parsed: ParsedCommand): Promise<void> => {
   const synthetic: ParsedCommand = {
     command: 'session',
     subcommand:
-      !target || target.toLowerCase() === 'last'
-        ? 'last'
-        : target.toLowerCase() === 'pick'
-          ? 'pick'
-          : 'resume',
-    args:
-      !target || target.toLowerCase() === 'last' || target.toLowerCase() === 'pick'
-        ? []
-        : [target],
+      !target || target.toLowerCase() === 'last' ? 'last' : target.toLowerCase() === 'pick' ? 'pick' : 'resume',
+    args: !target || target.toLowerCase() === 'last' || target.toLowerCase() === 'pick' ? [] : [target],
     flags: parsed.flags,
   };
   await handleSession(synthetic);
@@ -558,7 +540,7 @@ const handleResume = async (parsed: ParsedCommand): Promise<void> => {
 
 const handleJob = async (parsed: ParsedCommand): Promise<void> => {
   if (parsed.subcommand !== 'run') {
-    throw new Error('Unknown job subcommand');
+    throw new Error('Unknown job subcommand. Available: run <id>. Usage: ddudu job run <job-id>');
   }
 
   const [jobId] = parsed.args;
@@ -653,137 +635,138 @@ const withRawMode = async <T>(
   }
 };
 
-const promptWithArrowPicker = async <T>(
-  title: string,
-  choices: PickerChoice<T>[],
-  footer: string,
-): Promise<T> => {
+const promptWithArrowPicker = async <T>(title: string, choices: PickerChoice<T>[], footer: string): Promise<T> => {
   if (choices.length === 0) {
     throw new Error('no choices available');
   }
 
-  return withRawMode<T>((stdin, stdout) => new Promise<T>((resolve, reject) => {
-    let activeIndex = 0;
-    let renderedLines = 0;
+  return withRawMode<T>(
+    (stdin, stdout) =>
+      new Promise<T>((resolve, reject) => {
+        let activeIndex = 0;
+        let renderedLines = 0;
 
-    const render = (): void => {
-      if (renderedLines > 0) {
-        stdout.write(`\x1b[${renderedLines}A`);
-      }
+        const render = (): void => {
+          if (renderedLines > 0) {
+            stdout.write(`\x1b[${renderedLines}A`);
+          }
 
-      const lines = [
-        `${PINK}♪ ${title}${RESET}`,
-        '',
-        ...choices.flatMap((choice, index) => {
-          const selected = index === activeIndex;
-          const marker = selected ? `${PINK}›${RESET}` : ' ';
-          const label = selected ? `${PINK}${choice.label}${RESET}` : choice.label;
-          const detail = choice.detail ? `${selected ? PINK : DIM}${choice.detail}${RESET}` : null;
-          return [
-            `  ${marker} ${label}`,
-            ...(detail ? [`      ${detail}`] : []),
+          const lines = [
+            `${PINK}♪ ${title}${RESET}`,
             '',
+            ...choices.flatMap((choice, index) => {
+              const selected = index === activeIndex;
+              const marker = selected ? `${PINK}›${RESET}` : ' ';
+              const label = selected ? `${PINK}${choice.label}${RESET}` : choice.label;
+              const detail = choice.detail ? `${selected ? PINK : DIM}${choice.detail}${RESET}` : null;
+              return [`  ${marker} ${label}`, ...(detail ? [`      ${detail}`] : []), ''];
+            }),
+            '',
+            `${DIM}${footer}${RESET}`,
           ];
-        }),
-        '',
-        `${DIM}${footer}${RESET}`,
-      ];
 
-      stdout.write(lines.map((line) => `\x1b[2K${line}`).join('\n'));
-      stdout.write('\n');
-      renderedLines = lines.length;
-    };
+          stdout.write(lines.map((line) => `\x1b[2K${line}`).join('\n'));
+          stdout.write('\n');
+          renderedLines = lines.length;
+        };
 
-    const cleanup = (): void => {
-      stdin.off('keypress', onKeypress);
-      stdout.write('\x1b[?25h');
-    };
+        const cleanup = (): void => {
+          stdin.off('keypress', onKeypress);
+          stdout.write('\x1b[?25h');
+        };
 
-    const finish = (value: T): void => {
-      cleanup();
-      resolve(value);
-    };
+        const finish = (value: T): void => {
+          cleanup();
+          resolve(value);
+        };
 
-    const fail = (error: Error): void => {
-      cleanup();
-      reject(error);
-    };
+        const fail = (error: Error): void => {
+          cleanup();
+          reject(error);
+        };
 
-    const onKeypress = (_str: string, key: { name?: string; ctrl?: boolean; meta?: boolean; sequence?: string }): void => {
-      if (key.ctrl && key.name === 'c') {
-        fail(new Error('cancelled'));
-        return;
-      }
+        const onKeypress = (
+          _str: string,
+          key: { name?: string; ctrl?: boolean; meta?: boolean; sequence?: string },
+        ): void => {
+          if (key.ctrl && key.name === 'c') {
+            fail(new Error('cancelled'));
+            return;
+          }
 
-      if (key.name === 'escape') {
-        fail(new Error('cancelled'));
-        return;
-      }
+          if (key.name === 'escape') {
+            fail(new Error('cancelled'));
+            return;
+          }
 
-      if (key.name === 'up' || key.name === 'k') {
-        activeIndex = activeIndex === 0 ? choices.length - 1 : activeIndex - 1;
+          if (key.name === 'up' || key.name === 'k') {
+            activeIndex = activeIndex === 0 ? choices.length - 1 : activeIndex - 1;
+            render();
+            return;
+          }
+
+          if (key.name === 'down' || key.name === 'j') {
+            activeIndex = activeIndex === choices.length - 1 ? 0 : activeIndex + 1;
+            render();
+            return;
+          }
+
+          if (key.name === 'return' || key.name === 'enter') {
+            finish(choices[activeIndex]!.value);
+          }
+        };
+
+        stdout.write('\x1b[?25l');
         render();
-        return;
-      }
-
-      if (key.name === 'down' || key.name === 'j') {
-        activeIndex = activeIndex === choices.length - 1 ? 0 : activeIndex + 1;
-        render();
-        return;
-      }
-
-      if (key.name === 'return' || key.name === 'enter') {
-        finish(choices[activeIndex]!.value);
-      }
-    };
-
-    stdout.write('\x1b[?25l');
-    render();
-    stdin.on('keypress', onKeypress);
-  }));
+        stdin.on('keypress', onKeypress);
+      }),
+  );
 };
 
 const promptForSecret = async (label: string): Promise<string> => {
-  return withRawMode<string>((stdin, stdout) => new Promise<string>((resolve, reject) => {
-    let value = '';
+  return withRawMode<string>(
+    (stdin, stdout) =>
+      new Promise<string>((resolve, reject) => {
+        let value = '';
 
-    const cleanup = (): void => {
-      stdin.off('keypress', onKeypress);
-      stdout.write('\x1b[?25h');
-    };
+        const cleanup = (): void => {
+          stdin.off('keypress', onKeypress);
+          stdout.write('\x1b[?25h');
+        };
 
-    const onKeypress = (chunk: string, key: { name?: string; ctrl?: boolean; sequence?: string }): void => {
-      if (key.ctrl && key.name === 'c') {
-        cleanup();
-        reject(new Error('cancelled'));
-        return;
-      }
+        const onKeypress = (chunk: string, key: { name?: string; ctrl?: boolean; sequence?: string }): void => {
+          if (key.ctrl && key.name === 'c') {
+            cleanup();
+            reject(new Error('cancelled'));
+            return;
+          }
 
-      if (key.name === 'return' || key.name === 'enter') {
-        cleanup();
-        stdout.write('\n');
-        resolve(value.trim());
-        return;
-      }
+          if (key.name === 'return' || key.name === 'enter') {
+            cleanup();
+            stdout.write('\n');
+            resolve(value.trim());
+            return;
+          }
 
-      if (key.name === 'backspace') {
-        if (value.length > 0) {
-          value = value.slice(0, -1);
-          stdout.write('\b \b');
-        }
-        return;
-      }
+          if (key.name === 'backspace') {
+            if (value.length > 0) {
+              value = value.slice(0, -1);
+              stdout.write('\b \b');
+            }
+            return;
+          }
 
-      if (typeof chunk === 'string' && chunk.length > 0 && !key.ctrl) {
-        value += chunk;
-        stdout.write('*');
-      }
-    };
+          if (typeof chunk === 'string' && chunk.length > 0 && !key.ctrl) {
+            value += chunk;
+            stdout.write('*');
+          }
+        };
 
-    stdout.write('\x1b[?25l');
-    stdout.write(`${PINK}♪ ${label}${RESET}: `);
-    stdin.on('keypress', onKeypress);
-  }));
+        stdout.write('\x1b[?25l');
+        stdout.write(`${PINK}♪ ${label}${RESET}: `);
+        stdin.on('keypress', onKeypress);
+      }),
+  );
 };
 
 const promptForAuthProvider = async (): Promise<AuthProviderName> => {
@@ -845,7 +828,7 @@ const resolveRequestedAuthMethod = (
 const promptForAuthMethod = async (provider: AuthProviderName): Promise<AuthLoginMethod> => {
   const choices: PickerChoice<AuthLoginMethod>[] =
     provider === 'claude'
-        ? [
+      ? [
           {
             value: 'vendor',
             label: 'Claude Code login',
@@ -892,11 +875,7 @@ const promptForAuthMethod = async (provider: AuthProviderName): Promise<AuthLogi
 
 const registerApiKey = async (provider: AuthProviderName): Promise<void> => {
   const secretLabel =
-    provider === 'claude'
-      ? 'Anthropic API key'
-      : provider === 'codex'
-        ? 'OpenAI API key'
-        : 'Gemini API key';
+    provider === 'claude' ? 'Anthropic API key' : provider === 'codex' ? 'OpenAI API key' : 'Gemini API key';
   const token = await promptForSecret(secretLabel);
   if (!token) {
     throw new Error('empty API key');
@@ -911,13 +890,9 @@ const registerApiKey = async (provider: AuthProviderName): Promise<void> => {
   process.stdout.write(`\nStored ${provider} API key in ${path}\n`);
 };
 
-const completeAuthLogin = async (
-  provider: AuthProviderName,
-  method: AuthLoginMethod | null = null,
-): Promise<void> => {
+const completeAuthLogin = async (provider: AuthProviderName, method: AuthLoginMethod | null = null): Promise<void> => {
   const selectedMethod =
-    method ??
-    (process.stdin.isTTY && process.stdout.isTTY ? await promptForAuthMethod(provider) : 'vendor');
+    method ?? (process.stdin.isTTY && process.stdout.isTTY ? await promptForAuthMethod(provider) : 'vendor');
 
   if (selectedMethod === 'apikey') {
     if (!(process.stdin.isTTY ?? false) || !(process.stdout.isTTY ?? false)) {
@@ -947,7 +922,9 @@ const completeAuthLogin = async (
   const auth = discovered.get(provider);
   if (!auth) {
     if (provider === 'gemini' && selectedMethod === 'local') {
-      throw new Error('No local Gemini credentials found yet. Set GEMINI_API_KEY or configure ~/.gemini/oauth_creds.json.');
+      throw new Error(
+        'No local Gemini credentials found yet. Set GEMINI_API_KEY or configure ~/.gemini/oauth_creds.json.',
+      );
     }
     throw new Error(`${provider} login completed, but ddudu could not rediscover credentials yet.`);
   }
@@ -981,7 +958,8 @@ const handleAuth = async (parsed: ParsedCommand): Promise<void> => {
 
   if (parsed.subcommand === 'login') {
     const requested = resolveRequestedAuthProvider(parsed.args, parsed.flags);
-    const requestedMethod = requested && requested !== 'all' ? resolveRequestedAuthMethod(requested, parsed.flags) : null;
+    const requestedMethod =
+      requested && requested !== 'all' ? resolveRequestedAuthMethod(requested, parsed.flags) : null;
     if (requested === 'all') {
       for (const provider of AUTH_PROVIDERS) {
         await completeAuthLogin(provider);
@@ -1010,7 +988,7 @@ const handleAuth = async (parsed: ParsedCommand): Promise<void> => {
     return;
   }
 
-  throw new Error('Unknown auth subcommand');
+  throw new Error('Unknown auth subcommand. Available: login, status. Usage: ddudu auth <login|status>');
 };
 
 const handleDoctor = async (): Promise<void> => {

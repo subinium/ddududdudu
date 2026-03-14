@@ -277,6 +277,7 @@ class JsonRpcClient {
   private readonly rootPath: string;
   private readonly spec: LspServerSpec;
   private readonly openedDocuments = new Map<string, { version: number; text: string }>();
+  private readonly syncLocks = new Map<string, Promise<void>>();
   private readonly pending = new Map<
     number,
     {
@@ -450,6 +451,16 @@ class JsonRpcClient {
   }
 
   private async syncDocument(filePath: string, uri: string): Promise<void> {
+    const prev = this.syncLocks.get(uri) ?? Promise.resolve();
+    const next = prev.then(() => this.doSyncDocument(filePath, uri));
+    this.syncLocks.set(
+      uri,
+      next.catch(() => {}),
+    );
+    return next;
+  }
+
+  private async doSyncDocument(filePath: string, uri: string): Promise<void> {
     const text = await readFile(filePath, 'utf8');
     const current = this.openedDocuments.get(uri);
     if (!current) {

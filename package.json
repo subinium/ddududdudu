@@ -1,6 +1,6 @@
 {
   "name": "ddududdudu",
-  "version": "0.6.0",
+  "version": "0.6.2",
   "description": "AI coding harness with a native Rust TUI",
   "type": "module",
   "engines": {

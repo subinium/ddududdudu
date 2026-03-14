@@ -222,14 +222,16 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
   });
 
   let persistChain = Promise.resolve();
+  let persistErrorCount = 0;
   const queuePersist = (patch: Partial<BackgroundJobRecord>): void => {
     persistChain = persistChain
       .then(async () => {
         current = await store.update(job.id, patch);
       })
       .catch((err: unknown) => {
+        persistErrorCount++;
         const msg = err instanceof Error ? err.message : String(err);
-        console.error(`[background-job] persist failed for ${job.id}: ${msg}`);
+        console.error(`[background-job] persist failed for ${job.id} (count=${persistErrorCount}): ${msg}`);
       });
   };
 
@@ -801,6 +803,11 @@ export const runDetachedBackgroundJob = async (jobId: string): Promise<void> => 
     }
 
     await persistChain;
+    if (persistErrorCount > 0) {
+      console.error(
+        `[background-job] ${job.id} completed with ${persistErrorCount} persist error(s) — state may be stale`,
+      );
+    }
   } catch (error: unknown) {
     const detail = abortController.signal.aborted
       ? (current.detail ?? 'background job aborted')

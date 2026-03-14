@@ -3,18 +3,18 @@ import { createClient } from '../api/client-factory.js';
 import { formatArtifactForHandoff } from './artifacts.js';
 import { ExecutionScheduler, type ExecutionSchedulerConfig } from './execution-scheduler.js';
 import { resolveModeBinding } from './mode-resolution.js';
+import type { SessionManager } from './session.js';
 import { buildSpecialistPrompt, type SpecialistRole } from './specialist-roles.js';
-import { SessionManager } from './session.js';
 import type { NamedMode, SessionEntry } from './types.js';
 import type { VerificationMode, VerificationSummary } from './verifier.js';
 import { VerificationRunner } from './verifier.js';
+import type { WorkflowArtifact, WorkflowArtifactKind } from './workflow-state.js';
 import type {
   IsolatedWorkspace,
   WorkspaceApplyResult,
   WorkspaceCleanupResult,
+  WorktreeManager,
 } from './worktree-manager.js';
-import { WorktreeManager } from './worktree-manager.js';
-import type { WorkflowArtifact, WorkflowArtifactKind } from './workflow-state.js';
 
 export interface DelegationCredentials {
   token: string;
@@ -22,14 +22,7 @@ export interface DelegationCredentials {
   source: string;
 }
 
-export type DelegationPurpose =
-  | 'general'
-  | 'execution'
-  | 'planning'
-  | 'research'
-  | 'review'
-  | 'design'
-  | 'oracle';
+export type DelegationPurpose = 'general' | 'execution' | 'planning' | 'research' | 'review' | 'design' | 'oracle';
 
 export interface DelegationRequest {
   prompt: string;
@@ -119,6 +112,7 @@ interface DelegationRuntimeConfig {
   resolveModel?: (mode: NamedMode) => string;
   worktreeManager?: WorktreeManager | null;
   executionSchedulerConfig?: Partial<ExecutionSchedulerConfig>;
+  defaultMaxTokens?: number;
 }
 
 const MODE_PROFILES: Record<NamedMode, DelegationModeProfile> = {
@@ -142,7 +136,7 @@ const MODE_PROFILES: Record<NamedMode, DelegationModeProfile> = {
       'Run verification after edits but keep the feedback loop tight — fix failures immediately rather than reporting them for later.',
     ].join(' '),
   },
-  'rosé': {
+  rosé: {
     mode: 'rosé',
     systemPrompt: [
       'You are ROSÉ inside ddudu — the planning and architecture specialist.',
@@ -174,9 +168,7 @@ const PURPOSE_FALLBACKS: Record<DelegationPurpose, NamedMode[]> = {
   oracle: ['jennie', 'rosé', 'lisa'],
 };
 
-const normalizeProviderMap = (
-  providers: Map<string, DelegationCredentials>,
-): Map<string, DelegationCredentials> => {
+const normalizeProviderMap = (providers: Map<string, DelegationCredentials>): Map<string, DelegationCredentials> => {
   const normalized = new Map(providers);
   const claude = normalized.get('claude');
   if (claude && !normalized.has('anthropic')) {
@@ -193,9 +185,7 @@ const normalizeProviderMap = (
 
 const inferPurposeFromPrompt = (prompt: string): DelegationPurpose => {
   const lower = prompt.toLowerCase();
-  if (
-    /\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color)\b/.test(lower)
-  ) {
+  if (/\b(ui|ux|design|layout|spacing|typography|visual|a11y|accessibility|color)\b/.test(lower)) {
     return 'design';
   }
 
@@ -226,10 +216,7 @@ const serializeError = (error: unknown): string => {
   return String(error);
 };
 
-const buildSessionEntry = (
-  request: DelegationRequest,
-  result: DelegationResult,
-): SessionEntry => {
+const buildSessionEntry = (request: DelegationRequest, result: DelegationResult): SessionEntry => {
   return {
     type: 'message',
     timestamp: new Date().toISOString(),
@@ -268,10 +255,7 @@ const buildSessionEntry = (
   };
 };
 
-const buildDelegationPrompt = (
-  request: DelegationRequest,
-  purpose: DelegationPurpose,
-): string => {
+const buildDelegationPrompt = (request: DelegationRequest, purpose: DelegationPurpose): string => {
   const sections: string[] = [`Task purpose: ${purpose}`];
 
   if (request.roleProfile) {
@@ -342,10 +326,7 @@ export class DelegationRuntime {
     });
   }
 
-  public async run(
-    request: DelegationRequest,
-    handlers: DelegationHandlers = {},
-  ): Promise<DelegationResult> {
+  public async run(request: DelegationRequest, handlers: DelegationHandlers = {}): Promise<DelegationResult> {
     const purpose = request.purpose ?? inferPurposeFromPrompt(request.prompt);
     const mode = this.resolveMode(request.preferredMode, purpose);
     const profile = MODE_PROFILES[mode];
@@ -357,7 +338,10 @@ export class DelegationRuntime {
     const auth = this.providers.get(provider);
 
     if (!auth) {
-      throw new Error(`No auth available for delegated mode ${mode} (${provider}).`);
+      throw new Error(
+        `No auth available for delegated mode ${mode} (${provider}). ` +
+          `Run 'ddudu auth login ${provider === 'anthropic' ? 'claude' : provider === 'openai' ? 'codex' : provider}' to authenticate.`,
+      );
     }
 
     const model = request.preferredModel ?? this.config.resolveModel?.(mode) ?? binding.model;
@@ -367,9 +351,7 @@ export class DelegationRuntime {
       provider,
       purpose,
       baseCwd,
-      label:
-        request.isolatedLabel ??
-        [mode, purpose, request.parentSessionId?.slice(0, 8)].filter(Boolean).join('-'),
+      label: request.isolatedLabel ?? [mode, purpose, request.parentSessionId?.slice(0, 8)].filter(Boolean).join('-'),
       forceIsolation: request.forceIsolation ?? false,
       readOnly: request.readOnly ?? false,
     });
@@ -410,7 +392,9 @@ export class DelegationRuntime {
       const messages: ApiMessage[] = [{ role: 'user', content: buildDelegationPrompt(request, purpose) }];
       const combinedSystemPrompt = [
         profile.systemPrompt,
-        request.roleProfile ? buildSpecialistPrompt(request.roleProfile, request.taskLabel, request.successCriteria) : null,
+        request.roleProfile
+          ? buildSpecialistPrompt(request.roleProfile, request.taskLabel, request.successCriteria)
+          : null,
         request.systemPrompt,
         request.contextSnapshot,
       ]
@@ -434,7 +418,7 @@ export class DelegationRuntime {
         for await (const event of client.stream(messages, {
           systemPrompt: combinedSystemPrompt,
           model,
-          maxTokens: request.maxTokens ?? 8192,
+          maxTokens: request.maxTokens ?? this.config.defaultMaxTokens ?? 8192,
           signal: handlers.signal,
           cwd: effectiveCwd,
         })) {
@@ -493,15 +477,13 @@ export class DelegationRuntime {
         workspace &&
         (verification === undefined || verification.status === 'passed' || verification.status === 'skipped')
       ) {
-        workspaceApply = await this.config.worktreeManager?.applyToBase(workspace) ?? null;
+        workspaceApply = (await this.config.worktreeManager?.applyToBase(workspace)) ?? null;
       }
 
       if (workspace && this.config.worktreeManager) {
         const inspection = await this.config.worktreeManager.inspect(workspace);
         const shouldCleanup =
-          workspaceApply?.applied === true ||
-          workspaceApply?.empty === true ||
-          !inspection.hasChanges;
+          workspaceApply?.applied === true || workspaceApply?.empty === true || !inspection.hasChanges;
         if (shouldCleanup) {
           workspaceCleanup = await this.config.worktreeManager.cleanup(workspace);
         }
@@ -634,7 +616,10 @@ export class DelegationRuntime {
       return await manager.create(options.label, {
         baseCwd: options.baseCwd,
       });
-    } catch {
+    } catch (err: unknown) {
+      console.error(
+        `[delegation] workspace isolation failed for ${options.label}: ${err instanceof Error ? err.message : String(err)}`,
+      );
       return null;
     }
   }
