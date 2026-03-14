@@ -1780,28 +1780,34 @@ fn render_status_line(ui: &mut slt::Context, app: &App) {
 fn render_composer(ui: &mut slt::Context, app: &mut App) {
     ui.container().bg(COMPOSER_BG).px(1).pt(1).col(|ui| {
         if app.korean_mode {
-            remove_hangul_preedit(app);
-
-            let clean_value = app.composer.value.clone();
-            let clean_cursor = app.composer.cursor;
+            // Preedit stays in value so text_input renders it (visible to user).
+            // Save state WITH preedit before text_input processes events.
+            let prev_value = app.composer.value.clone();
+            let prev_cursor = app.composer.cursor;
+            let prev_preedit = app.hangul_preedit_len;
 
             ui.text_input(&mut app.composer);
 
             let post_value = app.composer.value.clone();
             let post_cursor = app.composer.cursor;
-            let clean_len = clean_value.chars().count();
+            let prev_len = prev_value.chars().count();
             let post_len = post_value.chars().count();
 
-            if post_len > clean_len && post_cursor >= clean_cursor {
-                let inserted_count = post_len - clean_len;
+            if post_len > prev_len {
+                // text_input inserted char(s) at prev_cursor (before preedit).
+                let num_inserted = post_len - prev_len;
                 let inserted: Vec<char> = post_value
                     .chars()
-                    .skip(clean_cursor)
-                    .take(inserted_count)
+                    .skip(prev_cursor)
+                    .take(num_inserted)
                     .collect();
 
-                app.composer.value = clean_value;
-                app.composer.cursor = clean_cursor;
+                // Restore clean value: strip both inserted chars and old preedit.
+                let before: String = prev_value.chars().take(prev_cursor).collect();
+                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
+                app.composer.value = format!("{}{}", before, after);
+                app.composer.cursor = prev_cursor;
+                app.hangul_preedit_len = 0;
 
                 for ch in inserted {
                     if let Some(jamo) = qwerty_to_jamo(ch) {
@@ -1812,33 +1818,60 @@ fn render_composer(ui: &mut slt::Context, app: &mut App) {
                         insert_char_at_cursor(&mut app.composer, ch);
                     }
                 }
-
                 flush_hangul_committed(app);
-            } else if post_len < clean_len {
-                let removed_count = clean_len - post_len;
+            } else if post_len < prev_len {
+                // Backspace or Delete.
+                let before: String = prev_value.chars().take(prev_cursor).collect();
+                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
+                app.composer.value = format!("{}{}", before, after);
+                app.composer.cursor = prev_cursor;
+                app.hangul_preedit_len = 0;
 
-                app.composer.value = clean_value;
-                app.composer.cursor = clean_cursor;
-
-                if post_cursor < clean_cursor {
-                    for _ in 0..removed_count {
-                        if !app.hangul.backspace() {
-                            delete_char_before_cursor(&mut app.composer);
-                        }
+                if post_cursor < prev_cursor {
+                    if !app.hangul.backspace() {
+                        delete_char_before_cursor(&mut app.composer);
                     }
+                }
+            } else if post_cursor != prev_cursor {
+                // Cursor moved (arrow/Home/End) — commit composition.
+                let before: String = prev_value.chars().take(prev_cursor).collect();
+                let after: String = prev_value.chars().skip(prev_cursor + prev_preedit).collect();
+                app.composer.value = format!("{}{}", before, after);
+                app.composer.cursor = prev_cursor;
+                app.hangul_preedit_len = 0;
+
+                app.hangul.commit_current();
+                flush_hangul_committed(app);
+                app.hangul.reset();
+
+                let clean_len = app.composer.value.chars().count();
+                if post_cursor > prev_cursor {
+                    app.composer.cursor = (app.composer.cursor + 1).min(clean_len);
                 } else {
-                    app.composer.value = post_value;
-                    app.composer.cursor = post_cursor;
+                    app.composer.cursor = app.composer.cursor.saturating_sub(1);
+                }
+            } else {
+                // No change — strip old preedit for clean reinsertion.
+                if prev_preedit > 0 {
+                    let before: String = prev_value.chars().take(prev_cursor).collect();
+                    let after: String =
+                        prev_value.chars().skip(prev_cursor + prev_preedit).collect();
+                    app.composer.value = format!("{}{}", before, after);
+                    app.hangul_preedit_len = 0;
                 }
             }
 
-            if let Some(preedit) = app.hangul.preedit() {
+            // Re-insert current preedit at cursor.
+            app.hangul_preedit_len = 0;
+            if let Some(p) = app.hangul.preedit() {
                 let byte_pos = char_to_byte_index(&app.composer.value, app.composer.cursor);
-                app.composer.value.insert(byte_pos, preedit);
+                app.composer.value.insert(byte_pos, p);
                 app.hangul_preedit_len = 1;
             }
         } else {
-            remove_hangul_preedit(app);
+            if app.hangul_preedit_len > 0 {
+                remove_hangul_preedit(app);
+            }
             ui.text_input(&mut app.composer);
         }
 
@@ -1859,12 +1892,10 @@ fn render_composer(ui: &mut slt::Context, app: &mut App) {
             } else {
                 "Enter submit | Esc abort/clear | Ctrl+Space 한 | Shift+Tab mode | Ctrl+L clear"
             }
+        } else if app.korean_mode {
+            "[한] Enter ⏎ | Esc ✕ | Ctrl+Space EN"
         } else {
-            if app.korean_mode {
-                "[한] Enter ⏎ | Esc ✕ | Ctrl+Space EN"
-            } else {
-                "Enter ⏎ | Esc ✕ | Ctrl+Space 한"
-            }
+            "Enter ⏎ | Esc ✕ | Ctrl+Space 한"
         };
         ui.styled(hint, Style::new().fg(MUTED));
     });
