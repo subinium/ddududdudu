@@ -80,6 +80,11 @@ The current `ddudu` implementation is especially shaped by a few practical choic
 - result augmentation injects behavioral nudges after tool calls (verification reminders, diagnostic hints) so the model self-corrects without operator intervention
 - API calls now have automatic retry with exponential backoff and jitter for transient provider errors, with error classification that separates retryable failures from auth and fatal errors
 - the composer supports prompt history recall (Arrow-Up/Down) with deduplication and draft stash, making repeated workflows fast
+- boot initialization is parallelized into two `Promise.all` phases (config/providers/toolbox/hooks, then systemPrompt/epistemicState/backgroundJobs/MCP) with per-operation error resilience so a single failure cannot block the boot
+- post-response verification now runs as a non-blocking background operation so the composer is released immediately after streaming completes, instead of blocking on lint/test/build before the operator can type
+- vague research prompts are intercepted by a specificity heuristic and routed through a structured clarification interview before fan-out, reducing wasted parallel workers on under-specified queries
+- file tool operations enforce a working-directory boundary to prevent path traversal outside the project root
+- delegation runtime exposes a configurable `defaultMaxTokens` so token budget is no longer hardcoded per delegation call
 
 ## What These Docs Are Not
 
