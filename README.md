@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://img.shields.io/badge/ddududdudu-v0.6.0-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
+  <img src="https://img.shields.io/badge/ddududdudu-v0.6.2-f7a7bb?style=for-the-badge&labelColor=000000" alt="version" />
   <img src="https://img.shields.io/badge/node-%3E%3D20-f7a7bb?style=for-the-badge&labelColor=000000&logo=node.js&logoColor=f7a7bb" alt="node" />
   <img src="https://img.shields.io/badge/rust-stable-f7a7bb?style=for-the-badge&labelColor=000000&logo=rust&logoColor=f7a7bb" alt="rust" />
   <img src="https://img.shields.io/badge/license-MIT-f7a7bb?style=for-the-badge&labelColor=000000" alt="license" />
@@ -39,6 +39,10 @@
 - Per-session cost budget tracking with configurable warning thresholds and hard-stop enforcement
 - Scored memory promotion pipeline with confidence metadata, Jaccard dedupe, and merge
 - Parallel benchmarking with multi-model comparison, failure categorization, and cost tracking
+- Parallelized boot sequence with two-phase `Promise.all` initialization and resilient error handling per phase
+- Research clarification interview that detects vague prompts and asks scoping questions before fan-out
+- Non-blocking post-response verification that releases the composer immediately after streaming completes
+- Path traversal protection in file tools with working-directory boundary enforcement
 
 ## Design Notes
 
