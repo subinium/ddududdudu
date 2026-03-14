@@ -1120,10 +1120,12 @@ fn render_welcome(ui: &mut slt::Context, state: &NativeTuiState) {
         &[]
     };
     ui.container().center().col(|ui| {
-        for line in splash {
-            ui.styled((*line).to_string(), Style::new().fg(ACCENT_DIM));
-        }
         if !splash.is_empty() {
+            ui.col(|ui| {
+                for line in splash {
+                    ui.styled((*line).to_string(), Style::new().fg(ACCENT_DIM));
+                }
+            });
             ui.text("");
         }
         ui.styled(
