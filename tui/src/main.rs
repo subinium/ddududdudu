@@ -1112,9 +1112,20 @@ fn render_message(
 
 fn render_welcome(ui: &mut slt::Context, state: &NativeTuiState) {
     ui.spacer();
-    let splash = if ui.width() >= 100 {
+    let term_w = ui.width() as usize;
+    let sidebar_w = if term_w >= 124 {
+        44
+    } else if term_w >= 104 {
+        40
+    } else if term_w >= 88 {
+        34
+    } else {
+        0
+    };
+    let avail = term_w.saturating_sub(sidebar_w + 2);
+    let splash = if avail >= 100 {
         SPLASH_FULL
-    } else if ui.width() >= 56 {
+    } else if avail >= 50 {
         SPLASH_COMPACT
     } else {
         &[]
