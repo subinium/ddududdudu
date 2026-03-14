@@ -215,7 +215,7 @@ const MAX_TOOL_TURNS_FALLBACK = 25;
 const SYSTEM_PROMPT_CACHE_TTL_MS = 30_000;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.5.0';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.2';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
@@ -1042,9 +1042,15 @@ export class NativeBridgeController {
     }
 
     await Promise.all([
-      this.refreshSystemPrompt(),
-      this.restoreEpistemicState(),
-      this.pollBackgroundJobs(),
+      this.refreshSystemPrompt().catch((error: unknown) => {
+        this.appendSystemMessage(`[boot] system prompt: ${serializeError(error)}`);
+      }),
+      this.restoreEpistemicState().catch((error: unknown) => {
+        this.appendSystemMessage(`[boot] epistemic state: ${serializeError(error)}`);
+      }),
+      this.pollBackgroundJobs().catch((error: unknown) => {
+        this.appendSystemMessage(`[boot] background jobs: ${serializeError(error)}`);
+      }),
       this.initializeMcpTools().catch((error: unknown) => {
         this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
       }),
