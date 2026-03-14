@@ -1188,31 +1188,26 @@ fn render_status_line(ui: &mut slt::Context, app: &App) {
 }
 
 fn render_composer(ui: &mut slt::Context, app: &mut App) {
-    ui.container()
-        .h(5)
-        .bg(COMPOSER_BG)
-        .border(Border::Rounded)
-        .p(1)
-        .col(|ui| {
-            ui.text_input(&mut app.composer);
-            if !app.state.queued_prompts.is_empty() {
-                let preview = app
-                    .state
-                    .queued_prompts
-                    .iter()
-                    .take(3)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                ui.styled(format!("queue: {preview}"), Style::new().fg(MUTED).dim());
-            }
-            let hint = if ui.width() >= 80 {
-                "Enter submit | Esc abort/clear | Shift+Tab mode | Ctrl+L clear"
-            } else {
-                "Enter ⏎ | Esc ✕ | ⇧Tab mode"
-            };
-            ui.styled(hint, Style::new().fg(MUTED));
-        });
+    ui.container().bg(COMPOSER_BG).px(1).pt(1).col(|ui| {
+        ui.text_input(&mut app.composer);
+        if !app.state.queued_prompts.is_empty() {
+            let preview = app
+                .state
+                .queued_prompts
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(" · ");
+            ui.styled(format!("queue: {preview}"), Style::new().fg(MUTED).dim());
+        }
+        let hint = if ui.width() >= 80 {
+            "Enter submit | Esc abort/clear | Shift+Tab mode | Ctrl+L clear"
+        } else {
+            "Enter ⏎ | Esc ✕ | ⇧Tab mode"
+        };
+        ui.styled(hint, Style::new().fg(MUTED));
+    });
 }
 
 fn render_sidebar(ui: &mut slt::Context, app: &mut App, max_width: usize) {
@@ -1609,10 +1604,15 @@ fn main() -> Result<()> {
 
     let run_result = slt::run_with(config, |ui| {
         poll_bridge(&receiver, &mut app, ui);
+        // Render first so text_input processes Char events before handle_input
+        // checks Enter. This prevents the IME race condition where a composed
+        // CJK character and Enter arrive in the same frame — text_input inserts
+        // the character into the value first, then handle_input submits the
+        // updated value.
+        render_app(ui, &mut app);
         if let Err(error) = handle_input(ui, &mut app, &mut stdin) {
             app.fatal_error = Some(error.to_string());
         }
-        render_app(ui, &mut app);
     });
 
     let _ = child.kill();
