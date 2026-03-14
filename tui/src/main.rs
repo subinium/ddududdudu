@@ -14,18 +14,18 @@ use slt::{
     TextInputState, ToastState,
 };
 
-const BG: Color = Color::Rgb(18, 18, 24);
-const SIDEBAR_BG: Color = Color::Rgb(14, 14, 20);
-const COMPOSER_BG: Color = Color::Rgb(22, 22, 30);
-const FG: Color = Color::Rgb(248, 248, 242);
+const BG: Color = Color::Rgb(0, 0, 0);
+const SIDEBAR_BG: Color = Color::Rgb(15, 15, 15);
+const COMPOSER_BG: Color = Color::Rgb(10, 10, 10);
+const FG: Color = Color::Rgb(230, 230, 230);
 const USER_FG: Color = Color::Rgb(255, 255, 255);
-const ACCENT: Color = Color::Rgb(247, 167, 187);
-const ACCENT_DIM: Color = Color::Rgb(160, 110, 125);
-const SUCCESS: Color = Color::Rgb(80, 250, 123);
-const ERROR: Color = Color::Rgb(255, 85, 85);
-const MUTED: Color = Color::Rgb(110, 100, 105);
-const TOOL_MUTED: Color = Color::Rgb(90, 82, 88);
-const ORANGE: Color = Color::Rgb(255, 184, 108);
+const ACCENT: Color = Color::Rgb(247, 37, 133);
+const ACCENT_DIM: Color = Color::Rgb(170, 50, 100);
+const SUCCESS: Color = Color::Rgb(46, 204, 64);
+const ERROR: Color = Color::Rgb(255, 55, 55);
+const MUTED: Color = Color::Rgb(80, 80, 80);
+const TOOL_MUTED: Color = Color::Rgb(60, 60, 60);
+const ORANGE: Color = Color::Rgb(255, 165, 80);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const THINKING_FRAMES: &[&str] = &["◉", "◎", "○", "◎"];
 const BRIDGE_EVENT_PREFIX: &str = "__DDUDU_BRIDGE__ ";
@@ -1554,21 +1554,21 @@ fn current_mode_label(state: &NativeTuiState) -> String {
 
 fn ddudu_theme() -> slt::Theme {
     slt::Theme {
-        primary: Color::Rgb(247, 167, 187),
-        secondary: Color::Rgb(160, 110, 125),
-        accent: Color::Rgb(247, 167, 187),
-        text: Color::Rgb(248, 248, 242),
-        text_dim: Color::Rgb(110, 100, 105),
-        border: Color::Rgb(110, 100, 105),
-        bg: Color::Rgb(18, 18, 24),
-        success: Color::Rgb(80, 250, 123),
-        warning: Color::Rgb(255, 184, 108),
-        error: Color::Rgb(255, 85, 85),
-        selected_bg: Color::Rgb(247, 167, 187),
-        selected_fg: Color::Rgb(18, 18, 24),
-        surface: Color::Rgb(22, 22, 30),
-        surface_hover: Color::Rgb(30, 30, 40),
-        surface_text: Color::Rgb(248, 248, 242),
+        primary: Color::Rgb(247, 37, 133),
+        secondary: Color::Rgb(170, 50, 100),
+        accent: Color::Rgb(247, 37, 133),
+        text: Color::Rgb(230, 230, 230),
+        text_dim: Color::Rgb(80, 80, 80),
+        border: Color::Rgb(40, 40, 40),
+        bg: Color::Rgb(0, 0, 0),
+        success: Color::Rgb(46, 204, 64),
+        warning: Color::Rgb(255, 165, 80),
+        error: Color::Rgb(255, 55, 55),
+        selected_bg: Color::Rgb(247, 37, 133),
+        selected_fg: Color::Rgb(0, 0, 0),
+        surface: Color::Rgb(15, 15, 15),
+        surface_hover: Color::Rgb(25, 25, 25),
+        surface_text: Color::Rgb(230, 230, 230),
     }
 }
 
