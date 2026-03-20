@@ -34,15 +34,17 @@ import { CompactionEngine, type CompactionMessage } from '../../core/compaction.
 import { loadConfig } from '../../core/config.js';
 import { deleteDduduConfigValue, setDduduConfigValue } from '../../core/config-editor.js';
 import { type ContextProfile, deriveContextProfile } from '../../core/context-profile.js';
-import { DEFAULT_SYSTEM_PROMPT } from '../../core/default-prompts.js';
+import { getDefaultSystemPrompt } from '../../core/default-prompts.js';
 import { type DelegationPurpose, DelegationRuntime } from '../../core/delegation.js';
 import { getDduduPaths } from '../../core/dirs.js';
 import { DriftDetector } from '../../core/drift-detector.js';
 import { EpistemicStateManager } from '../../core/epistemic-state.js';
+import { EventBus } from '../../core/event-bus.js';
 import { ExecutionScheduler, type ExecutionSchedulerConfig } from '../../core/execution-scheduler.js';
 import { GitCheckpoint } from '../../core/git-checkpoint.js';
 import { loadHookFiles } from '../../core/hook-loader.js';
 import { HookRegistry } from '../../core/hooks.js';
+import { LoopDetector } from '../../core/loop-detector.js';
 import { LspManager } from '../../core/lsp-manager.js';
 import { clearMemory, loadMemory, loadSelectedMemory, type MemoryScope, saveMemory } from '../../core/memory.js';
 import { getMemoryBackend } from '../../core/memory-backends.js';
@@ -53,7 +55,7 @@ import {
   type PromotionCandidate,
   scoreCandidate,
 } from '../../core/memory-promotion.js';
-import { type HarnessProviderName, resolveModeBinding } from '../../core/mode-resolution.js';
+import { getModeBindingCandidates, type HarnessProviderName, resolveModeBinding } from '../../core/mode-resolution.js';
 import { initializeProject } from '../../core/project-init.js';
 import { loadOrchestratorPrompt, loadSystemPrompt } from '../../core/prompts.js';
 import { SessionManager } from '../../core/session.js';
@@ -131,6 +133,10 @@ import {
   runTodoCommand as runTodoCommandCommand,
   runUndoCommand as runUndoCommandCommand,
 } from './commands/index.js';
+import {
+  type ContextSnapshotOptions as BuilderContextSnapshotOptions,
+  buildPromptContextSnapshot as buildPromptContextSnapshotWithDeps,
+} from './context-builder.js';
 import { buildDelegationHookContext, formatAgentActivityHeartbeat } from './controller-support.js';
 import type {
   NativeBridgeEvent,
@@ -144,6 +150,13 @@ import type {
   NativeVerificationState,
   NativeWorkspaceState,
 } from './protocol.js';
+import {
+  getNextFallbackRuntime as getNextFallbackRuntimeFromManager,
+  getProviderCapabilitiesFor,
+  getResolvedModeRuntime as getResolvedModeRuntimeFromManager,
+  reconfigureClientState,
+  resolveCurrentProviderModels as resolveCurrentProviderModelsFromManager,
+} from './provider-manager.js';
 import { RequestEngine } from './request-engine.js';
 import { formatResearchProgress, ResearchRuntime, type ResearchShardResult } from './research-runtime.js';
 import {
@@ -161,6 +174,8 @@ import {
   countApiMessageTokens,
   createRequestEstimate,
 } from './session-support.js';
+import { StateEmitter } from './state-emitter.js';
+import { refreshPromptPair } from './system-prompt-manager.js';
 import {
   formatTeamAgentDetail,
   formatTeamAgentLabel,
@@ -168,6 +183,15 @@ import {
   TeamExecutionCoordinator,
   teamAgentPurpose,
 } from './team-execution-coordinator.js';
+import {
+  appendLoopWarnings,
+  applyToolStatesToMessages,
+  finishMessageInState,
+  mapToolResultErrors,
+  setToolStatusInState,
+  updateMessageInState,
+} from './tool-executor.js';
+import { runVerificationWithProgress } from './verification-manager.js';
 import { type WorkflowStateSource, WorkflowStateStore } from './workflow-state-store.js';
 
 interface ProviderCredentials {
@@ -183,7 +207,7 @@ interface RequestPlan {
   remoteSessionId: string | null;
 }
 
-interface ContextSnapshotOptions {
+interface ContextSnapshotOptions extends BuilderContextSnapshotOptions {
   includeRelevantFiles?: boolean;
   includeChangedFiles?: boolean;
   includeBriefing?: boolean;
@@ -215,7 +239,7 @@ const MAX_TOOL_TURNS_FALLBACK = 25;
 const SYSTEM_PROMPT_CACHE_TTL_MS = 30_000;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.4';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.5';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
@@ -325,12 +349,28 @@ const buildFallbackSystemPrompt = (mode: NamedMode, model?: string, provider?: s
   const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
   const cwd = process.cwd();
   const projectName = basename(cwd) || 'unknown-project';
+  const promptTemplate = getDefaultSystemPrompt(provider ?? modeConfig.provider);
 
-  return DEFAULT_SYSTEM_PROMPT.replace(/\$\{model\}/g, model ?? modeConfig.model)
+  return promptTemplate
+    .replace(/\$\{model\}/g, model ?? modeConfig.model)
     .replace(/\$\{provider\}/g, provider ?? modeConfig.provider)
     .replace(/\$\{cwd\}/g, cwd)
     .replace(/\$\{projectName\}/g, projectName)
     .replace(/\$\{userInstructions\}/g, modeConfig.promptAddition.trim());
+};
+
+const isTransientProviderFailure = (error: unknown): boolean => {
+  const message = serializeError(error).toLowerCase();
+  return (
+    message.includes('rate limit') ||
+    message.includes('429') ||
+    message.includes('timeout') ||
+    message.includes('timed out') ||
+    message.includes('econnreset') ||
+    message.includes('temporarily unavailable') ||
+    message.includes('overloaded') ||
+    message.includes('5xx')
+  );
 };
 
 const clampMode = (mode: string): NamedMode => {
@@ -938,12 +978,14 @@ export class NativeBridgeController {
   private activeOperation: 'request' | 'team' | null = null;
   private activeAssistantMessageId: string | null = null;
   private queuedPrompts: string[] = [];
+  private readonly steeringQueue: ApiMessage[] = [];
   private pendingAskUser: AskUserResolver | null = null;
   private flushTimer: NodeJS.Timeout | null = null;
   private stateVersion = 0;
   private lastEmittedStateVersion = -1;
   private backgroundJobPollTimer: NodeJS.Timeout | null = null;
   private idleWarmupTimer: NodeJS.Timeout | null = null;
+  private deferredBootTimer: NodeJS.Timeout | null = null;
   private teamRunSince: number | null = null;
   private teamRunStrategy: 'parallel' | 'sequential' | 'delegate' | null = null;
   private teamRunTask: string | null = null;
@@ -955,6 +997,14 @@ export class NativeBridgeController {
   private readonly backgroundCoordinator = new BackgroundCoordinator({
     previewText,
     formatChecklistLinkedDetail,
+  });
+  private readonly loopDetector = new LoopDetector();
+  private readonly eventBus = new EventBus();
+  private readonly stateEmitter = new StateEmitter({
+    emit: (event) => this.emit(event),
+    getState: () => this.state,
+    syncUsageState: () => this.syncUsageState(),
+    syncLspState: () => this.syncLspState(),
   });
   private readonly verificationRepairFingerprints = new Map<string, number>();
   private readonly memoryPromotionFingerprints = new Set<string>();
@@ -980,6 +1030,9 @@ export class NativeBridgeController {
   }
 
   public async boot(): Promise<void> {
+    this.state.loading = true;
+    this.state.loadingLabel = 'boot · config + providers';
+    this.emitStateNow();
     const [config, providers, toolboxResult] = await Promise.all([
       loadConfig(),
       discoverAllProviders(),
@@ -1041,7 +1094,10 @@ export class NativeBridgeController {
       this.appendSystemMessage(`[session] ${serializeError(error)}`);
     }
 
-    await Promise.all([
+    this.state.loadingLabel = 'boot · prompts + memory';
+    this.emitStateNow();
+
+    const bootTasks: Array<Promise<void>> = [
       this.refreshSystemPrompt().catch((error: unknown) => {
         this.appendSystemMessage(`[boot] system prompt: ${serializeError(error)}`);
       }),
@@ -1051,16 +1107,25 @@ export class NativeBridgeController {
       this.pollBackgroundJobs().catch((error: unknown) => {
         this.appendSystemMessage(`[boot] background jobs: ${serializeError(error)}`);
       }),
-      this.initializeMcpTools().catch((error: unknown) => {
-        this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
-      }),
-    ]);
+    ];
+    const deferMcpConnect = this.config.mcp.defer_connect_until_ready || this.config.mcp.lazy_connect;
+    if (!deferMcpConnect) {
+      bootTasks.push(
+        this.initializeMcpTools().catch((error: unknown) => {
+          this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
+        }),
+      );
+    }
+    await Promise.all(bootTasks);
     this.syncMcpState();
     this.reconfigureClient();
     this.startBackgroundJobPolling();
     this.scheduleIdleWarmup();
     this.state.ready = true;
+    this.state.loading = false;
+    this.state.loadingLabel = '';
     this.emitStateNow();
+    this.scheduleDeferredBootTasks();
     void this.refreshLspInBackground();
   }
 
@@ -1072,6 +1137,10 @@ export class NativeBridgeController {
     if (this.idleWarmupTimer) {
       clearTimeout(this.idleWarmupTimer);
       this.idleWarmupTimer = null;
+    }
+    if (this.deferredBootTimer) {
+      clearTimeout(this.deferredBootTimer);
+      this.deferredBootTimer = null;
     }
 
     if (this.state.sessionId) {
@@ -1088,6 +1157,22 @@ export class NativeBridgeController {
     this.mcpManager?.disconnectAll();
     void this.lspManager.shutdown();
     this.abortCurrentRequest();
+  }
+
+  private scheduleDeferredBootTasks(): void {
+    if (!(this.config?.mcp.defer_connect_until_ready || this.config?.mcp.lazy_connect)) {
+      return;
+    }
+    if (this.deferredBootTimer) {
+      clearTimeout(this.deferredBootTimer);
+    }
+    this.deferredBootTimer = setTimeout(() => {
+      this.deferredBootTimer = null;
+      this.appendSystemMessage('[boot] deferred MCP initialization');
+      void this.initializeMcpTools().catch((error: unknown) => {
+        this.appendSystemMessage(`[mcp] ${serializeError(error)}`);
+      });
+    }, 50);
   }
 
   private startBackgroundJobPolling(): void {
@@ -1432,6 +1517,18 @@ export class NativeBridgeController {
     this.scheduleStatePush();
   }
 
+  public steer(content: string, role: 'user' | 'system' = 'user'): void {
+    const trimmed = content.trim();
+    if (!trimmed) {
+      return;
+    }
+    this.steeringQueue.push({
+      role: 'user',
+      content: role === 'system' ? `[system steering]\n${trimmed}` : trimmed,
+    });
+    this.appendSystemMessage(`[steer] queued ${role} guidance for the next request turn`);
+  }
+
   public clearMessages(): void {
     this.state.messages = [];
     this.remoteSessions.clear();
@@ -1472,6 +1569,7 @@ export class NativeBridgeController {
       runHookCommand: (args) => this.runHookCommand(args),
       runTeamCommand: (args) => this.runTeamCommand(args),
       runInitSummary: () => this.runInitSummary(),
+      steer: (content, role) => this.steer(content, role),
       models: this.state.models,
     });
   }
@@ -1589,15 +1687,44 @@ export class NativeBridgeController {
     }
 
     this.resetEphemeralAgentActivities();
+    this.loopDetector.reset();
     this.scheduleIdleWarmup(trimmedContent);
 
     this.state.loading = true;
     this.state.loadingLabel = 'preparing context…';
     this.state.loadingSince = Date.now();
+    const userMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'user',
+      content: trimmedContent,
+      timestamp: Date.now(),
+    };
+    this.state.messages.push(userMessage);
     this.scheduleStatePush();
 
     const mode = this.currentMode;
     const model = this.getCurrentModel();
+    this.eventBus.emit({
+      type: 'request_start',
+      provider: this.getCurrentProvider(),
+      model,
+      mode,
+    });
+    if (await this.maybeHandleJennieAutoRoute(userMessage, trimmedContent)) {
+      return;
+    }
+
+    const assistantMessage: NativeMessageState = {
+      id: randomUUID(),
+      role: 'assistant',
+      content: '',
+      timestamp: Date.now(),
+      isStreaming: true,
+    };
+    this.state.messages.push(assistantMessage);
+    this.activeAssistantMessageId = assistantMessage.id;
+    this.scheduleStatePush();
+
     const directPurpose = this.inferPromptPurpose(trimmedContent);
 
     const [, requestContextSnapshot] = await Promise.all([
@@ -1609,10 +1736,6 @@ export class NativeBridgeController {
       ),
     ]);
 
-    if (await this.maybeHandleJennieAutoRoute(trimmedContent)) {
-      return;
-    }
-
     const requestSystemPrompt = requestContextSnapshot
       ? `${this.systemPrompt}\n\n${requestContextSnapshot}`
       : this.systemPrompt;
@@ -1622,20 +1745,6 @@ export class NativeBridgeController {
     this.state.loadingLabel = 'compacting…';
     this.scheduleStatePush();
     await this.maybeAutoCompact(trimmedContent);
-
-    const userMessage: NativeMessageState = {
-      id: randomUUID(),
-      role: 'user',
-      content: trimmedContent,
-      timestamp: Date.now(),
-    };
-    const assistantMessage: NativeMessageState = {
-      id: randomUUID(),
-      role: 'assistant',
-      content: '',
-      timestamp: Date.now(),
-      isStreaming: true,
-    };
 
     this.state.loadingLabel = `sending to ${model}…`;
     this.scheduleStatePush();
@@ -1652,10 +1761,7 @@ export class NativeBridgeController {
       }),
     ]);
 
-    this.state.messages.push(userMessage);
-    this.state.messages.push(assistantMessage);
     this.state.requestEstimate = this.estimateRequestForPlan(requestPlan);
-    this.activeAssistantMessageId = assistantMessage.id;
     this.state.loadingLabel = `waiting for ${model}…`;
     this.scheduleStatePush();
 
@@ -1718,9 +1824,17 @@ export class NativeBridgeController {
           signal: controller.signal,
         },
         {
+          drainSteeringMessages: () => this.drainSteeringMessages(),
           beforeApiCall: async (input) => {
             this.state.loadingLabel =
               input.toolTurn > 0 ? `tool round ${input.toolTurn} · ${model}` : `streaming · ${model}`;
+            this.eventBus.emit({
+              type: 'request_phase',
+              label: this.state.loadingLabel,
+              provider: input.provider,
+              model: input.model,
+              toolTurn: input.toolTurn,
+            });
             this.scheduleStatePush();
             await this.hookRegistry.emit('beforeApiCall', input);
           },
@@ -1825,6 +1939,21 @@ export class NativeBridgeController {
         if (clientCapabilities.supportsRemoteSession) {
           this.invalidateRemoteSession(this.getCurrentProvider());
         }
+        const fallbackRuntime = isTransientProviderFailure(error)
+          ? this.getNextFallbackRuntime(mode, this.getCurrentProvider(), model)
+          : null;
+        if (fallbackRuntime) {
+          this.appendSystemMessage(
+            `[fallback] ${this.getCurrentProvider()}:${model} failed, retrying with ${fallbackRuntime.provider}:${fallbackRuntime.model}`,
+          );
+          this.selectedModels[mode] = fallbackRuntime.model;
+          this.reconfigureClient();
+          if (this.activeAssistantMessageId === assistantMessage.id) {
+            this.activeAssistantMessageId = null;
+          }
+          await this.submit(trimmedContent);
+          return;
+        }
         await this.hookRegistry.emit('onError', {
           provider: this.getCurrentProvider(),
           model,
@@ -1862,6 +1991,13 @@ export class NativeBridgeController {
         await this.submit(nextPrompt);
       }
     }
+  }
+
+  private drainSteeringMessages(): ApiMessage[] {
+    if (this.steeringQueue.length === 0) {
+      return [];
+    }
+    return this.steeringQueue.splice(0, this.steeringQueue.length);
   }
 
   private classifyJennieAutoRoute(prompt: string): AutoRouteDecision {
@@ -2034,7 +2170,7 @@ export class NativeBridgeController {
     return true;
   }
 
-  private async maybeHandleJennieAutoRoute(trimmedContent: string): Promise<boolean> {
+  private async maybeHandleJennieAutoRoute(userMessage: NativeMessageState, trimmedContent: string): Promise<boolean> {
     if (this.currentMode !== 'jennie') {
       return false;
     }
@@ -2055,15 +2191,6 @@ export class NativeBridgeController {
         timestamp: Date.now(),
       });
     }
-
-    const userMessage: NativeMessageState = {
-      id: randomUUID(),
-      role: 'user',
-      content: trimmedContent,
-      timestamp: Date.now(),
-    };
-
-    this.state.messages.push(userMessage);
 
     if (decision.kind === 'team') {
       if (decision.executionClass === 'research_fast') {
@@ -3146,12 +3273,20 @@ export class NativeBridgeController {
         const toolNames = toolUseBlocks.map((b) => (b as ToolUseBlock).name);
         this.state.loadingLabel =
           toolNames.length === 1 ? `executing ${toolNames[0]}` : `executing ${toolNames.length} tools`;
+        this.eventBus.emit({ type: 'tool_execution', names: toolNames, count: toolNames.length });
         this.scheduleStatePush();
 
         const results = await this.executeToolCalls(toolUseBlocks as ToolUseBlock[], {
           assistantMessageId: context.assistantMessageId,
           signal: context.signal,
         });
+
+        const loopWarnings = mapToolResultErrors(
+          toolUseBlocks as Array<{ name: string; input: Record<string, unknown> }>,
+          results,
+        )
+          .map((item) => this.loopDetector.record(item))
+          .filter((warning): warning is NonNullable<typeof warning> => Boolean(warning));
 
         context.apiMessages.push({
           role: 'assistant',
@@ -3161,6 +3296,22 @@ export class NativeBridgeController {
           role: 'user',
           content: toToolResultContent(results),
         });
+
+        const warningText = appendLoopWarnings(
+          context.apiMessages as Array<{ role: 'user' | 'assistant'; content: unknown }>,
+          loopWarnings,
+        );
+        if (warningText) {
+          for (const warning of loopWarnings) {
+            this.eventBus.emit({
+              type: 'loop_detected',
+              name: warning.name,
+              count: warning.count,
+              message: warning.message,
+            });
+          }
+          this.appendSystemMessage(`[loop] ${warningText}`);
+        }
 
         continueWithTools = true;
         break;
@@ -3755,39 +3906,28 @@ export class NativeBridgeController {
     const model = runtime.model;
     const provider = runtime.provider;
     const modeConfig = HARNESS_MODES[mode] ?? HARNESS_MODES.jennie;
-    const cwd = process.cwd();
-    const projectName = basename(cwd) || 'unknown-project';
     const loadedSkills = Array.from(this.loadedSkills.values());
 
     try {
-      const promptContext = {
-        model,
-        provider,
-        cwd,
-        projectName,
-        version: PROMPT_VERSION,
-        timestamp: new Date().toISOString(),
-        rules: [],
-        skills: loadedSkills.map((skill) => skill.name),
-        userInstructions: modeConfig.promptAddition.trim(),
-      };
-      let prompt = await loadSystemPrompt(promptContext);
-      this.orchestratorPrompt = await loadOrchestratorPrompt(promptContext);
-
-      if (loadedSkills.length > 0) {
-        prompt += `\n\n${loadedSkills
-          .map((skill) => `<skill name="${skill.name}">\n${skill.content.trim()}\n</skill>`)
-          .join('\n\n')}`;
-      }
-
+      let selectedMemory = '';
       try {
-        const memory = await this.getCachedSelectedMemory(this.getSystemMemoryScopes(mode), 360);
-        if (hasMeaningfulMemory(memory)) {
-          prompt += `\n\n<stable_memory>\n${memory}\n</stable_memory>`;
-        }
+        selectedMemory = await this.getCachedSelectedMemory(this.getSystemMemoryScopes(mode), 360);
       } catch {
         // Memory is optional; keep prompt generation resilient.
       }
+
+      let prompt = '';
+      const refreshed = await refreshPromptPair({
+        model,
+        provider,
+        promptVersion: PROMPT_VERSION,
+        userInstructions: modeConfig.promptAddition.trim(),
+        loadedSkills,
+        selectedMemory,
+        hasMeaningfulMemory,
+      });
+      prompt = refreshed.systemPrompt;
+      this.orchestratorPrompt = refreshed.orchestratorPrompt;
 
       prompt += `\n\n<workflow>\npermission_profile: ${this.permissionProfile}\n${this.buildSlimWorkflowSummary()}\n</workflow>`;
       this.state.contextPreview = null;
@@ -4321,26 +4461,30 @@ export class NativeBridgeController {
     provider: string;
     model: string;
   } {
-    const binding = this.getModeBinding(mode);
-    const selected = this.selectedModels[mode];
-    const providerName = resolveProviderConfigName(binding.provider);
-    const providerConfig = this.config?.providers[providerName];
-    const availableModels = providerConfig?.models.map((candidate) => candidate.id) ?? [];
+    return getResolvedModeRuntimeFromManager(this.config, mode, this.selectedModels, (provider) =>
+      this.hasResolvedProvider(provider),
+    );
+  }
 
-    return {
-      mode,
-      provider: binding.provider,
-      model: selected && availableModels.includes(selected) ? selected : binding.model,
-    };
+  private getConfiguredFallbackRuntimes(mode: NamedMode): Array<{ provider: string; model: string }> {
+    return [];
+  }
+
+  private getNextFallbackRuntime(
+    mode: NamedMode,
+    currentProvider: string,
+    currentModel: string,
+  ): {
+    provider: string;
+    model: string;
+  } | null {
+    return getNextFallbackRuntimeFromManager(this.config, mode, currentProvider, currentModel, (provider) =>
+      this.hasResolvedProvider(provider),
+    );
   }
 
   private getProviderCapabilities(provider: string): ApiClientCapabilities | null {
-    const auth = this.availableProviders.get(provider);
-    if (!auth) {
-      return null;
-    }
-
-    return getClientCapabilities(provider, auth.tokenType);
+    return getProviderCapabilitiesFor(provider, this.availableProviders);
   }
 
   private getCurrentProvider(): string {
@@ -4352,53 +4496,35 @@ export class NativeBridgeController {
   }
 
   private resolveCurrentProviderModels(): string[] {
-    if (!this.config) {
-      return [];
-    }
-
-    const providerName = resolveProviderConfigName(this.getResolvedModeRuntime().provider);
-    const providerConfig = this.config.providers[providerName];
-    return providerConfig?.models.map((model) => model.id) ?? [];
+    return resolveCurrentProviderModelsFromManager(this.config, this.getResolvedModeRuntime().provider);
   }
 
   private reconfigureClient(): void {
-    const runtime = this.getResolvedModeRuntime();
-    const provider = runtime.provider;
-    const model = runtime.model;
-
-    this.state.provider = provider;
-    this.state.model = model;
-    this.state.models = this.resolveCurrentProviderModels();
-    this.state.modes = MODE_ORDER.map((modeName) => {
-      const modeEntry = HARNESS_MODES[modeName];
-      const modeRuntime = this.getResolvedModeRuntime(modeName);
-      return {
-        name: modeName,
-        label: modeEntry.label,
-        tagline: modeEntry.tagline,
-        provider: modeRuntime.provider,
-        model: modeRuntime.model,
-        active: modeName === this.currentMode,
-      };
+    const next = reconfigureClientState({
+      config: this.config,
+      currentMode: this.currentMode,
+      selectedModels: this.selectedModels,
+      availableProviders: this.availableProviders,
+      permissionProfile: this.permissionProfile,
+      hasProvider: (provider) => this.hasResolvedProvider(provider),
     });
-    this.tokenCounter.setModel(model);
 
-    const providerAuth = this.availableProviders.get(provider);
-    this.state.authType = providerAuth?.tokenType ?? null;
-    this.state.authSource = providerAuth?.source ?? null;
+    this.state.provider = next.provider;
+    this.state.model = next.model;
+    this.state.models = next.models;
+    this.state.modes = next.modes;
+    this.tokenCounter.setModel(next.model);
+
+    this.state.authType = next.authType;
+    this.state.authSource = next.authSource;
     this.state.permissionProfile = this.permissionProfile;
     this.state.playingWithFire = this.permissionProfile === 'permissionless';
     this.state.todos = this.todos.map((item) => ({ ...item }));
 
-    if (providerAuth) {
-      this.activeClient = createClient(provider, providerAuth.token, providerAuth.tokenType);
-      this.state.error = null;
-    } else {
-      this.activeClient = null;
-      this.state.error = `No auth found for ${provider}. Run: ddudu auth login`;
-    }
+    this.activeClient = next.activeClient;
+    this.state.error = next.error;
 
-    this.systemPrompt = buildFallbackSystemPrompt(this.currentMode, model, provider);
+    this.systemPrompt = buildFallbackSystemPrompt(this.currentMode, next.model, next.provider);
 
     this.updateRemoteSessionState();
     this.syncUsageState();
@@ -4984,132 +5110,39 @@ export class NativeBridgeController {
     purpose?: DelegationPurpose | 'general',
     options: ContextSnapshotOptions = {},
   ): Promise<string> {
-    const parts: string[] = [];
-    const effectivePurpose = purpose ?? (prompt ? this.inferPromptPurpose(prompt) : 'general');
-    const snapshotOptions: Required<ContextSnapshotOptions> = {
-      includeRelevantFiles: options.includeRelevantFiles ?? true,
-      includeChangedFiles: options.includeChangedFiles ?? true,
-      includeBriefing: options.includeBriefing ?? true,
-      includePlan: options.includePlan ?? true,
-      includeUncertainties:
-        options.includeUncertainties ??
-        (effectivePurpose === 'planning' || effectivePurpose === 'research' || effectivePurpose === 'review'),
-      includeOperationalState:
-        options.includeOperationalState ?? (effectivePurpose === 'planning' || effectivePurpose === 'general'),
-      includeMemory: options.includeMemory ?? true,
-      memoryScopes: options.memoryScopes ?? this.getRequestMemoryScopes(effectivePurpose),
-      maxArtifacts: options.maxArtifacts ?? (effectivePurpose === 'planning' || effectivePurpose === 'review' ? 4 : 3),
-    };
-    const cacheKey = this.buildPromptContextCacheKey(prompt, effectivePurpose, snapshotOptions);
-    const cached = this.promptContextCache.get(cacheKey);
-    if (cached && cached.expiresAt > Date.now()) {
-      return cached.value;
-    }
-    if (prompt) {
-      parts.push(`request_focus: ${effectivePurpose}`);
-      if (snapshotOptions.includeRelevantFiles) {
-        const relevantFiles = await this.getRelevantFilesForPrompt(prompt, effectivePurpose, 5);
-        if (relevantFiles.length > 0) {
-          parts.push('relevant_files:', ...relevantFiles.map((filePath) => `- ${filePath}`));
-        }
-      }
-    }
-    const relevantArtifacts = this.getArtifactsForPurpose(effectivePurpose, snapshotOptions.maxArtifacts);
-    if (relevantArtifacts.length > 0) {
-      parts.push(
-        ...relevantArtifacts.map((artifact) => {
-          const mode = artifact.mode ? ` · ${HARNESS_MODES[artifact.mode].label}` : '';
-          return `artifact: ${formatArtifactContextLine(artifact, 140)}${mode ? mode : ''}`;
-        }),
-      );
-    }
-    if (snapshotOptions.includeMemory) {
-      try {
-        const selectedMemory = await this.getCachedSelectedMemory(snapshotOptions.memoryScopes, 320);
-        if (hasMeaningfulMemory(selectedMemory)) {
-          parts.push('<memory_selection>', selectedMemory, '</memory_selection>');
-        }
-      } catch {
-        // Selected memory is optional.
-      }
-    }
-
-    if (snapshotOptions.includeChangedFiles) {
-      const changedFiles = await this.getChangedFiles(8);
-      if (changedFiles.length > 0) {
-        parts.push('changed_files:', ...changedFiles.map((filePath) => `- ${filePath}`));
-      }
-    }
-
-    if (snapshotOptions.includeBriefing) {
-      const briefing = await this.getBriefingSummary();
-      if (briefing) {
-        parts.push(
-          `briefing_summary: ${briefing.summary}`,
-          ...briefing.nextSteps.slice(0, 4).map((step) => `next_step: ${previewText(step, 180)}`),
-        );
-      }
-    }
-
-    if (snapshotOptions.includePlan && this.todos.length > 0) {
-      parts.push(
-        ...this.todos
-          .filter((item) => effectivePurpose === 'planning' || item.status !== 'completed')
-          .slice(0, 5)
-          .map((item) => `plan_item: [${item.status}] ${previewText(item.step, 180)}`),
-      );
-    }
-
-    if (snapshotOptions.includeUncertainties) {
-      const uncertainties = this.epistemicState
-        .getState()
-        .activeUncertainties.slice(0, 3)
-        .map((item) => item.content)
-        .filter((item) => item.trim().length > 0);
-      if (uncertainties.length > 0) {
-        parts.push(...uncertainties.map((item) => `uncertainty: ${previewText(item, 180)}`));
-      }
-    }
-
-    if (snapshotOptions.includeOperationalState) {
-      const activeAgents = this.agentActivities
-        .filter((item) => item.status === 'running' || item.status === 'verifying' || item.status === 'queued')
-        .slice(0, 2);
-      if (activeAgents.length > 0) {
-        parts.push(
-          ...activeAgents.map((item) => {
-            const scope = [item.mode ? HARNESS_MODES[item.mode].label : item.label, item.purpose]
-              .filter((part): part is string => Boolean(part))
-              .join(' · ');
-            const detail = item.detail ? ` · ${previewText(item.detail, 100)}` : '';
-            return `active_agent: ${scope} · ${item.status}${detail}`;
-          }),
-        );
-      }
-
-      const activeBackgroundJobs = this.backgroundJobs.filter((job) => job.status === 'running').slice(0, 2);
-      if (activeBackgroundJobs.length > 0) {
-        parts.push(
-          ...activeBackgroundJobs.map((job) => {
-            const detail = job.detail ? ` · ${previewText(job.detail, 100)}` : '';
-            return `background_job: ${job.label} · ${job.kind}${detail}`;
-          }),
-        );
-      }
-    }
-
-    if (this.state.workspace?.path) {
-      parts.push(`workspace: ${this.state.workspace.path}`);
-    }
-
-    if (parts.length === 0) {
-      return '';
-    }
-
-    const snapshot = `<context_snapshot>\n${parts.join('\n')}\n</context_snapshot>`;
-    this.promptContextCache.set(cacheKey, this.writeTimedCache(snapshot, 1200));
-    this.trimTimedMap(this.promptContextCache, 48);
-    return snapshot;
+    return buildPromptContextSnapshotWithDeps(
+      {
+        currentMode: this.currentMode,
+        provider: this.getCurrentProvider(),
+        model: this.getCurrentModel(),
+        permissionProfile: this.permissionProfile,
+        workspacePath: this.state.workspace?.path ?? null,
+        sessionId: this.state.sessionId,
+        uncertainties: this.epistemicState.getStats().uncertainties,
+        getRelevantFilesForPrompt: (inputPrompt, inputPurpose, limit) =>
+          this.getRelevantFilesForPrompt(inputPrompt, inputPurpose, limit),
+        getArtifactsForPurpose: (inputPurpose, maxArtifacts) => this.getArtifactsForPurpose(inputPurpose, maxArtifacts),
+        getCachedSelectedMemory: (scopes, maxChars) => this.getCachedSelectedMemory(scopes, maxChars),
+        hasMeaningfulMemory,
+        getChangedFiles: (limit) => this.getChangedFiles(limit),
+        getBriefingSummary: () => this.getBriefingSummary(),
+        todos: this.todos,
+        activeUncertainties: this.epistemicState
+          .getState()
+          .activeUncertainties.map((item) => item.content)
+          .filter((item) => item.trim().length > 0),
+        activeAgents: this.agentActivities,
+        runningBackgroundJobs: this.backgroundJobs.filter((job) => job.status === 'running'),
+        previewText,
+        getRequestMemoryScopes: (inputPurpose) => this.getRequestMemoryScopes(inputPurpose),
+        writeTimedCache: (value, ttlMs) => this.writeTimedCache(value, ttlMs),
+        trimTimedMap: (map, maxEntries) => this.trimTimedMap(map, maxEntries),
+      },
+      this.promptContextCache,
+      prompt,
+      purpose,
+      options,
+    );
   }
 
   private async formatContextSummary(): Promise<string> {
@@ -5961,7 +5994,7 @@ export class NativeBridgeController {
     mode: NamedMode;
   }): Promise<void> {
     try {
-      const verification = await this.runAutoVerification(process.cwd(), 'full');
+      const verification = await this.runAutoVerification(process.cwd(), 'checks');
       if (verification.status !== 'skipped') {
         this.appendSystemMessage(`[verify] ${verification.summary}`);
       }
@@ -6001,7 +6034,26 @@ export class NativeBridgeController {
     try {
       summary = await this.runWithExecutionLease({
         resource: 'verification',
-        operation: () => new VerificationRunner(cwd).run(mode),
+        operation: () =>
+          runVerificationWithProgress(cwd, mode, (progress) => {
+            const label =
+              progress.phase === 'review'
+                ? `verifying · ${progress.label}`
+                : `verifying · ${progress.label} (${progress.completed}/${progress.total})`;
+            this.state.loadingLabel = label;
+            this.eventBus.emit({
+              type: 'verification_progress',
+              label: progress.label,
+              completed: progress.completed,
+              total: progress.total,
+            });
+            this.setVerificationState({
+              status: 'running',
+              summary: progress.label,
+              cwd,
+            });
+            this.scheduleStatePush();
+          }),
       });
     } catch (err: unknown) {
       this.setVerificationState(null);
@@ -6011,6 +6063,11 @@ export class NativeBridgeController {
       status: summary.status,
       summary: summary.summary,
       cwd: summary.cwd,
+    });
+    this.eventBus.emit({
+      type: 'verification_complete',
+      status: summary.status,
+      summary: summary.summary,
     });
 
     return summary;
@@ -7041,55 +7098,23 @@ export class NativeBridgeController {
       result?: string;
     }>,
   ): void {
-    if (states.length === 0) {
-      return;
-    }
-
-    const message = this.state.messages.find((entry) => entry.id === messageId);
-    const existing = new Map((message?.toolCalls ?? []).map((tool) => [tool.id, tool]));
-
-    for (const state of states) {
-      const current = existing.get(state.id);
-      existing.set(state.id, {
-        id: state.id,
-        name: state.name,
-        args: state.input ? JSON.stringify(state.input) : (current?.args ?? '{}'),
-        summary: current?.summary ?? summarizeToolInput(state.name, state.input ?? {}),
-        status: state.status,
-        result: state.result ? summarizeToolResult(state.result) : current?.result,
-      });
-    }
-
-    this.updateMessage(messageId, message?.content ?? '', Array.from(existing.values()));
+    this.state.messages = applyToolStatesToMessages(
+      this.state.messages,
+      messageId,
+      states,
+      (name, input) => summarizeToolInput(name, input ?? {}),
+      summarizeToolResult,
+    );
+    this.scheduleStatePush();
   }
 
   private updateMessage(id: string, content: string, toolCalls?: NativeToolCallState[]): void {
-    this.state.messages = this.state.messages.map((message) => {
-      if (message.id !== id) {
-        return message;
-      }
-
-      return {
-        ...message,
-        content,
-        toolCalls: toolCalls ?? message.toolCalls,
-      };
-    });
+    this.state.messages = updateMessageInState(this.state.messages, id, content, toolCalls);
     this.scheduleStatePush();
   }
 
   private finishMessage(id: string, content: string): void {
-    this.state.messages = this.state.messages.map((message) => {
-      if (message.id !== id) {
-        return message;
-      }
-
-      return {
-        ...message,
-        content,
-        isStreaming: false,
-      };
-    });
+    this.state.messages = finishMessageInState(this.state.messages, id, content);
     this.scheduleStatePush();
   }
 
@@ -7099,96 +7124,15 @@ export class NativeBridgeController {
     status: NativeToolCallState['status'],
     result?: string,
   ): void {
-    this.state.messages = this.state.messages.map((message) => {
-      if (message.id !== messageId || !message.toolCalls) {
-        return message;
-      }
-
-      return {
-        ...message,
-        toolCalls: message.toolCalls.map((toolCall) => {
-          if (toolCall.id !== toolId) {
-            return toolCall;
-          }
-
-          return {
-            ...toolCall,
-            status,
-            result: result ?? toolCall.result,
-          };
-        }),
-      };
-    });
+    this.state.messages = setToolStatusInState(this.state.messages, messageId, toolId, status, result);
     this.scheduleStatePush();
   }
 
   private emitStateNow(): void {
-    if (this.stateVersion === this.lastEmittedStateVersion) {
-      return;
-    }
-
-    this.syncUsageState();
-    this.syncLspState();
-
-    if (this.flushTimer) {
-      clearTimeout(this.flushTimer);
-      this.flushTimer = null;
-    }
-
-    const nextState = {
-      ...this.state,
-      requestEstimate: this.state.requestEstimate ? { ...this.state.requestEstimate } : null,
-      queuedPrompts: [...this.state.queuedPrompts],
-      messages: this.state.messages.map((message) => ({
-        ...message,
-        toolCalls: message.toolCalls ? [...message.toolCalls] : undefined,
-      })),
-      providers: this.state.providers.map((provider) => ({ ...provider })),
-      mcp: this.state.mcp
-        ? {
-            ...this.state.mcp,
-            serverNames: [...this.state.mcp.serverNames],
-            connectedNames: [...this.state.mcp.connectedNames],
-          }
-        : null,
-      lsp: this.state.lsp
-        ? {
-            ...this.state.lsp,
-            serverLabels: [...this.state.lsp.serverLabels],
-            connectedLabels: [...this.state.lsp.connectedLabels],
-          }
-        : null,
-      modes: this.state.modes.map((mode) => ({ ...mode })),
-      slashCommands: this.state.slashCommands.map((command) => ({ ...command })),
-      todos: this.state.todos.map((item) => ({ ...item })),
-      backgroundJobs: this.state.backgroundJobs.map((job) => ({ ...job })),
-      artifacts: this.state.artifacts.map((artifact) => ({ ...artifact })),
-      askUser: this.state.askUser
-        ? {
-            ...this.state.askUser,
-            validation: this.state.askUser.validation ? { ...this.state.askUser.validation } : null,
-            options: this.state.askUser.options.map((option) => ({ ...option })),
-          }
-        : null,
-    };
-
-    this.lastEmittedStateVersion = this.stateVersion;
-
-    this.emit({
-      type: 'state',
-      state: nextState,
-    });
+    this.stateEmitter.emitNow();
   }
 
   private scheduleStatePush(): void {
-    this.stateVersion += 1;
-    if (this.flushTimer) {
-      return;
-    }
-
-    this.flushTimer = setTimeout(() => {
-      this.flushTimer = null;
-      this.emitStateNow();
-    }, 16);
+    this.stateEmitter.schedule();
   }
 }

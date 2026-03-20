@@ -1,26 +1,18 @@
 import { execFile } from 'node:child_process';
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 
 import type { LspDocumentSymbol, LspResolvedLocation, LspWorkspaceSymbol } from '../core/lsp-manager.js';
 import type { Tool } from './index.js';
+import { parallelMapLimit, readTextFileCached, walkFilesCached } from './search-cache.js';
 
 const execFileAsync = promisify(execFile);
+const QUERY_CACHE_TTL_MS = 2_000;
+const queryResultCache = new Map<string, { output: string; metadata?: Record<string, unknown>; expiresAt: number }>();
 
 const DEFAULT_EXCLUDES = new Set(['.git', 'node_modules', 'dist', 'coverage']);
 const CHANGE_PATTERNS = ['diff', 'status', 'modified', 'changed', 'recent', 'touched'];
-
-const isTextFile = (buffer: Buffer): boolean => {
-  const length = Math.min(512, buffer.length);
-  for (let index = 0; index < length; index += 1) {
-    if (buffer[index] === 0) {
-      return false;
-    }
-  }
-
-  return true;
-};
 
 const normalizePath = (input: string): string => {
   return input.replace(/\\/g, '/');
@@ -28,37 +20,6 @@ const normalizePath = (input: string): string => {
 
 const escapeRegExp = (value: string): string => {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-};
-
-const walkFiles = async (
-  rootPath: string,
-  excludes: Set<string>,
-): Promise<string[]> => {
-  const files: string[] = [];
-
-  const walk = async (dirPath: string): Promise<void> => {
-    const entries = await readdir(dirPath, { withFileTypes: true });
-
-    await Promise.all(entries.map(async (entry) => {
-      if (excludes.has(entry.name)) {
-        return;
-      }
-
-      const fullPath = resolve(dirPath, entry.name);
-      if (entry.isDirectory()) {
-        await walk(fullPath);
-        return;
-      }
-
-      if (entry.isFile()) {
-        files.push(fullPath);
-      }
-    }));
-  };
-
-  await walk(rootPath);
-  files.sort((a, b) => a.localeCompare(b));
-  return files;
 };
 
 const tokenizeQuery = (value: string): string[] => {
@@ -74,12 +35,7 @@ const tokenizeQuery = (value: string): string[] => {
 };
 
 const readTextFile = async (filePath: string): Promise<string | null> => {
-  const buffer = await readFile(filePath);
-  if (!isTextFile(buffer)) {
-    return null;
-  }
-
-  return buffer.toString('utf8');
+  return readTextFileCached(filePath);
 };
 
 const SYMBOL_PATTERNS = (query: string): RegExp[] => {
@@ -98,11 +54,7 @@ const SYMBOL_PATTERNS = (query: string): RegExp[] => {
   ];
 };
 
-const renderTree = async (
-  rootPath: string,
-  maxDepth: number,
-  maxEntries: number,
-): Promise<string[]> => {
+const renderTree = async (rootPath: string, maxDepth: number, maxEntries: number): Promise<string[]> => {
   const lines: string[] = [];
   let emitted = 0;
 
@@ -207,11 +159,7 @@ const symbolKindLabel = (kind: number | undefined): string => {
   }
 };
 
-const symbolMatchScore = (
-  query: string,
-  symbol: LspDocumentSymbol,
-  rootPath: string,
-): number => {
+const symbolMatchScore = (query: string, symbol: LspDocumentSymbol, rootPath: string): number => {
   const normalizedQuery = query.trim().toLowerCase();
   const normalizedName = symbol.name.toLowerCase();
   const relPath = normalizePath(relative(rootPath, symbol.filePath));
@@ -244,11 +192,7 @@ const readLineAt = async (filePath: string, zeroBasedLine: number): Promise<stri
   }
 };
 
-const withTimeout = async <T>(
-  promise: Promise<T>,
-  fallback: T,
-  timeoutMs: number = 1_500,
-): Promise<T> => {
+const withTimeout = async <T>(promise: Promise<T>, fallback: T, timeoutMs: number = 1_500): Promise<T> => {
   return Promise.race([
     promise,
     new Promise<T>((resolve) => {
@@ -290,12 +234,8 @@ const findQueryPositionsInFile = async (
   return positions;
 };
 
-const collectCandidateFilesForSymbol = async (
-  rootPath: string,
-  query: string,
-  maxFiles: number,
-): Promise<string[]> => {
-  const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+const collectCandidateFilesForSymbol = async (rootPath: string, query: string, maxFiles: number): Promise<string[]> => {
+  const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
   const patterns = SYMBOL_PATTERNS(query.trim());
   const needle = query.trim().toLowerCase();
   const matches: string[] = [];
@@ -330,7 +270,7 @@ const collectCandidateFilesForReferences = async (
   query: string,
   maxFiles: number,
 ): Promise<string[]> => {
-  const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+  const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
   const pattern = buildReferencePattern(query);
   const matches: string[] = [];
 
@@ -367,8 +307,9 @@ const tryLspDefinitionSearch = async (
     return null;
   }
 
-  const candidateFiles = (await collectCandidateFilesForSymbol(rootPath, query, Math.max(maxResults * 2, 10)))
-    .filter((filePath) => ctx.lsp?.supportsFile(filePath));
+  const candidateFiles = (await collectCandidateFilesForSymbol(rootPath, query, Math.max(maxResults * 2, 10))).filter(
+    (filePath) => ctx.lsp?.supportsFile(filePath),
+  );
   if (candidateFiles.length === 0) {
     return null;
   }
@@ -465,8 +406,9 @@ const tryLspReferenceSearch = async (
     return null;
   }
 
-  const candidateFiles = (await collectCandidateFilesForReferences(rootPath, query, 12))
-    .filter((filePath) => ctx.lsp?.supportsFile(filePath));
+  const candidateFiles = (await collectCandidateFilesForReferences(rootPath, query, 12)).filter((filePath) =>
+    ctx.lsp?.supportsFile(filePath),
+  );
   if (candidateFiles.length === 0) {
     return null;
   }
@@ -564,7 +506,7 @@ const tryLspReferenceSearch = async (
 const changedFileBoost = (queryTokens: string[], relPath: string, changedFiles: Set<string>): number => {
   let score = 0;
   if (changedFiles.has(relPath)) {
-    score += 6;
+    score += 12;
   }
 
   const lowerPath = relPath.toLowerCase();
@@ -575,7 +517,7 @@ const changedFileBoost = (queryTokens: string[], relPath: string, changedFiles: 
   }
 
   if (CHANGE_PATTERNS.some((token) => queryTokens.includes(token)) && changedFiles.has(relPath)) {
-    score += 12;
+    score += 18;
   }
 
   return score;
@@ -608,12 +550,25 @@ const renderGroupedMatches = (
     .sort((a, b) => b[1].score - a[1].score || a[0].localeCompare(b[0]))
     .slice(0, maxFiles)
     .map(([path, group]) => {
-      return [
-        `# ${path} (score ${group.score})`,
-        ...group.lines,
-      ].join('\n');
+      return [`# ${path} (score ${group.score})`, ...group.lines].join('\n');
     })
     .join('\n\n');
+};
+
+const getCachedQueryResult = (key: string): { output: string; metadata?: Record<string, unknown> } | null => {
+  const cached = queryResultCache.get(key);
+  if (!cached || cached.expiresAt <= Date.now()) {
+    return null;
+  }
+  return { output: cached.output, metadata: cached.metadata };
+};
+
+const setCachedQueryResult = (key: string, output: string, metadata?: Record<string, unknown>): void => {
+  queryResultCache.set(key, {
+    output,
+    metadata,
+    expiresAt: Date.now() + QUERY_CACHE_TTL_MS,
+  });
 };
 
 const applyRankedOutputScores = (
@@ -678,9 +633,7 @@ export const repoMapTool: Tool = {
   },
   async execute(args, ctx) {
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
     const maxDepth =
       typeof args.max_depth === 'number' && Number.isFinite(args.max_depth)
         ? Math.max(1, Math.floor(args.max_depth))
@@ -723,7 +676,8 @@ export const symbolSearchTool: Tool = {
       path: { type: 'string', description: 'Base path for searching.' },
       mode: {
         type: 'string',
-        description: 'Search mode. "scan" (default): broad regex scan for definition patterns. "resolve": precise LSP-backed lookup with changed-file bias, grouped by file.',
+        description:
+          'Search mode. "scan" (default): broad regex scan for definition patterns. "resolve": precise LSP-backed lookup with changed-file bias, grouped by file.',
         enum: ['scan', 'resolve'],
       },
       max_results: { type: 'number', description: 'Maximum results to return.' },
@@ -735,64 +689,67 @@ export const symbolSearchTool: Tool = {
     }
 
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
     const mode = args.mode === 'resolve' ? 'resolve' : 'scan';
+    const query = args.query.trim();
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
-        : mode === 'resolve' ? 8 : 60;
+        : mode === 'resolve'
+          ? 8
+          : 60;
+    const cacheKey = JSON.stringify({ tool: 'symbol_search', rootPath, mode, query, maxResults });
+    const cached = getCachedQueryResult(cacheKey);
+    if (cached) {
+      return { output: cached.output, metadata: cached.metadata };
+    }
 
     try {
-      const lspResult = await tryLspDefinitionSearch(args.query.trim(), rootPath, maxResults, ctx);
+      const lspResult = await tryLspDefinitionSearch(query, rootPath, maxResults, ctx);
 
       // --- resolve mode: grouped output with changed-file bias ---
       if (mode === 'resolve') {
         if (lspResult) {
-          return {
+          const result = {
             output: lspResult.output,
             metadata: { root: rootPath, count: lspResult.count, source: 'lsp', mode },
           };
+          setCachedQueryResult(cacheKey, result.output, result.metadata);
+          return result;
         }
 
-        const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
-        const patterns = SYMBOL_PATTERNS(args.query.trim());
+        const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
+        const patterns = SYMBOL_PATTERNS(query);
         const changedFiles = new Set(await getChangedFiles(rootPath));
-        const matches: Array<{ path: string; line: string; score: number }> = [];
-
-        for (const filePath of files) {
-          const text = await readTextFile(filePath);
-          if (!text) {
-            continue;
-          }
-
-          const relPath = normalizePath(relative(rootPath, filePath));
-          const lines = text.split('\n');
-          for (let index = 0; index < lines.length; index += 1) {
-            const line = lines[index];
-            if (!patterns.some((pattern) => pattern.test(line))) {
-              continue;
+        const matches = (
+          await parallelMapLimit(files, 12, async (filePath) => {
+            const text = await readTextFile(filePath);
+            if (!text) {
+              return [] as Array<{ path: string; line: string; score: number }>;
             }
-
-            let score = changedFiles.has(relPath) ? 8 : 3;
-            if (line.includes(args.query.trim())) {
-              score += 3;
+            const relPath = normalizePath(relative(rootPath, filePath));
+            const lines = text.split('\n');
+            const local: Array<{ path: string; line: string; score: number }> = [];
+            for (let index = 0; index < lines.length; index += 1) {
+              const line = lines[index];
+              if (!patterns.some((pattern) => pattern.test(line))) {
+                continue;
+              }
+              let score = changedFiles.has(relPath) ? 8 : 3;
+              if (line.includes(query)) {
+                score += 3;
+              }
+              if (relPath.toLowerCase().includes(query.toLowerCase())) {
+                score += 2;
+              }
+              local.push({ path: relPath, line: `${relPath}:${index + 1}: ${line.trim()}`, score });
             }
-            if (relPath.toLowerCase().includes(args.query.trim().toLowerCase())) {
-              score += 2;
-            }
-
-            matches.push({
-              path: relPath,
-              line: `${relPath}:${index + 1}: ${line.trim()}`,
-              score,
-            });
-          }
-        }
+            return local;
+          })
+        ).flat();
 
         const output = renderGroupedMatches(matches, maxResults, 3);
-        return {
+        const result = {
           output,
           metadata: {
             root: rootPath,
@@ -800,48 +757,52 @@ export const symbolSearchTool: Tool = {
             mode,
           },
         };
+        setCachedQueryResult(cacheKey, result.output, result.metadata);
+        return result;
       }
 
       // --- scan mode (default): flat list ---
       if (lspResult) {
-        return {
+        const result = {
           output: lspResult.output,
           metadata: { root: rootPath, count: lspResult.count, source: 'lsp', mode },
         };
+        setCachedQueryResult(cacheKey, result.output, result.metadata);
+        return result;
       }
 
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
-      const patterns = SYMBOL_PATTERNS(args.query.trim());
-      const results: string[] = [];
-
-      for (const filePath of files) {
-        if (results.length >= maxResults) {
-          break;
-        }
-
-        const text = await readTextFile(filePath);
-        if (!text) {
-          continue;
-        }
-
-        const relPath = normalizePath(relative(rootPath, filePath));
-        const lines = text.split('\n');
-        for (let index = 0; index < lines.length; index += 1) {
-          if (results.length >= maxResults) {
-            break;
+      const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
+      const patterns = SYMBOL_PATTERNS(query);
+      const results = (
+        await parallelMapLimit(files, 12, async (filePath) => {
+          const text = await readTextFile(filePath);
+          if (!text) {
+            return [] as string[];
           }
-
-          const line = lines[index];
-          if (patterns.some((pattern) => pattern.test(line))) {
-            results.push(`${relPath}:${index + 1}: ${line.trim()}`);
+          const relPath = normalizePath(relative(rootPath, filePath));
+          const lines = text.split('\n');
+          const local: string[] = [];
+          for (let index = 0; index < lines.length; index += 1) {
+            if (local.length >= maxResults) {
+              break;
+            }
+            const line = lines[index];
+            if (patterns.some((pattern) => pattern.test(line))) {
+              local.push(`${relPath}:${index + 1}: ${line.trim()}`);
+            }
           }
-        }
-      }
+          return local;
+        })
+      )
+        .flat()
+        .slice(0, maxResults);
 
-      return {
+      const result = {
         output: results.join('\n'),
         metadata: { root: rootPath, count: results.length, mode },
       };
+      setCachedQueryResult(cacheKey, result.output, result.metadata);
+      return result;
     } catch (error: unknown) {
       return {
         output: error instanceof Error ? error.message : String(error),
@@ -866,7 +827,8 @@ export const referenceSearchTool: Tool = {
       path: { type: 'string', description: 'Base path for searching.' },
       group_by_file: {
         type: 'boolean',
-        description: 'When true, aggregate results by file and show the top hotspot files with representative lines. Default: false.',
+        description:
+          'When true, aggregate results by file and show the top hotspot files with representative lines. Default: false.',
       },
       max_results: { type: 'number', description: 'Maximum lines (or files when group_by_file) to return.' },
     },
@@ -877,20 +839,26 @@ export const referenceSearchTool: Tool = {
     }
 
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
     const groupByFile = args.group_by_file === true;
+    const query = args.query.trim();
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
-        : groupByFile ? 8 : 80;
+        : groupByFile
+          ? 8
+          : 80;
+    const cacheKey = JSON.stringify({ tool: 'reference_search', rootPath, groupByFile, query, maxResults });
+    const cached = getCachedQueryResult(cacheKey);
+    if (cached) {
+      return { output: cached.output, metadata: cached.metadata };
+    }
 
     try {
-      const lspMatches = await tryLspReferenceSearch(args.query.trim(), rootPath, maxResults, ctx);
+      const lspMatches = await tryLspReferenceSearch(query, rootPath, maxResults, ctx);
       if (lspMatches && lspMatches.length > 0) {
         if (groupByFile) {
-          return {
+          const result = {
             output: renderGroupedMatches(lspMatches, maxResults, 3),
             metadata: {
               root: rootPath,
@@ -899,8 +867,10 @@ export const referenceSearchTool: Tool = {
               groupByFile,
             },
           };
+          setCachedQueryResult(cacheKey, result.output, result.metadata);
+          return result;
         }
-        return {
+        const result = {
           output: lspMatches.map((entry) => entry.line).join('\n'),
           metadata: {
             root: rootPath,
@@ -909,51 +879,48 @@ export const referenceSearchTool: Tool = {
             groupByFile,
           },
         };
+        setCachedQueryResult(cacheKey, result.output, result.metadata);
+        return result;
       }
 
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
-      const pattern = buildReferencePattern(args.query);
+      const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
+      const pattern = buildReferencePattern(query);
       const changedFiles = new Set(await getChangedFiles(rootPath));
-      const matches: Array<{ path: string; score: number; line: string }> = [];
-
-      for (const filePath of files) {
-        const text = await readTextFile(filePath);
-        if (!text) {
-          continue;
-        }
-
-        const relPath = normalizePath(relative(rootPath, filePath));
-        const lines = text.split('\n');
-        for (let index = 0; index < lines.length; index += 1) {
-          const line = lines[index];
-          if (!pattern.test(line)) {
-            continue;
+      const matches = (
+        await parallelMapLimit(files, 12, async (filePath) => {
+          const text = await readTextFile(filePath);
+          if (!text) {
+            return [] as Array<{ path: string; score: number; line: string }>;
           }
-
-          const skipDefinition = groupByFile && isDefinitionLine(args.query, line);
-          if (skipDefinition) {
-            continue;
+          const relPath = normalizePath(relative(rootPath, filePath));
+          const lines = text.split('\n');
+          const local: Array<{ path: string; score: number; line: string }> = [];
+          for (let index = 0; index < lines.length; index += 1) {
+            const line = lines[index];
+            pattern.lastIndex = 0;
+            if (!pattern.test(line)) {
+              continue;
+            }
+            const skipDefinition = groupByFile && isDefinitionLine(query, line);
+            if (skipDefinition) {
+              continue;
+            }
+            let score = changedFiles.has(relPath) ? (groupByFile ? 5 : 4) : groupByFile ? 2 : 0;
+            if (!groupByFile && !isDefinitionLine(query, line)) {
+              score += 3;
+            }
+            if (line.includes(query)) {
+              score += 1;
+            }
+            local.push({ path: relPath, score, line: `${relPath}:${index + 1}: ${line.trim()}` });
           }
-
-          let score = changedFiles.has(relPath) ? (groupByFile ? 5 : 4) : (groupByFile ? 2 : 0);
-          if (!groupByFile && !isDefinitionLine(args.query, line)) {
-            score += 3;
-          }
-          if (line.includes(args.query.trim())) {
-            score += 1;
-          }
-
-          matches.push({
-            path: relPath,
-            score,
-            line: `${relPath}:${index + 1}: ${line.trim()}`,
-          });
-        }
-      }
+          return local;
+        })
+      ).flat();
 
       if (groupByFile) {
         const output = renderGroupedMatches(matches, maxResults, 3);
-        return {
+        const result = {
           output,
           metadata: {
             root: rootPath,
@@ -961,12 +928,17 @@ export const referenceSearchTool: Tool = {
             groupByFile,
           },
         };
+        setCachedQueryResult(cacheKey, result.output, result.metadata);
+        return result;
       }
 
       matches.sort((a, b) => b.score - a.score || a.line.localeCompare(b.line));
-      const output = matches.slice(0, maxResults).map((entry) => entry.line).join('\n');
+      const output = matches
+        .slice(0, maxResults)
+        .map((entry) => entry.line)
+        .join('\n');
 
-      return {
+      const result = {
         output,
         metadata: {
           root: rootPath,
@@ -974,6 +946,8 @@ export const referenceSearchTool: Tool = {
           groupByFile,
         },
       };
+      setCachedQueryResult(cacheKey, result.output, result.metadata);
+      return result;
     } catch (error: unknown) {
       return {
         output: error instanceof Error ? error.message : String(error),
@@ -1021,9 +995,7 @@ export const changedFilesTool: Tool = {
   },
   async execute(args, ctx) {
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
 
     try {
       const changedFiles = await getChangedFiles(rootPath);
@@ -1063,77 +1035,70 @@ export const codebaseSearchTool: Tool = {
     }
 
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
         : 12;
     const tokens = tokenizeQuery(args.query);
+    const cacheKey = JSON.stringify({ tool: 'codebase_search', rootPath, query: args.query.trim(), maxResults });
+    const cached = getCachedQueryResult(cacheKey);
+    if (cached) {
+      return { output: cached.output, metadata: cached.metadata };
+    }
 
     if (tokens.length === 0) {
       return { output: 'Query did not contain enough searchable tokens.', isError: true };
     }
 
     try {
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+      const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
       const changedFiles = new Set(await getChangedFiles(rootPath));
-      const scored: Array<{ path: string; score: number; lines: string[] }> = [];
-
-      for (const filePath of files) {
-        const relPath = normalizePath(relative(rootPath, filePath));
-        const text = await readTextFile(filePath);
-        if (!text) {
-          continue;
-        }
-
-        const lowerPath = relPath.toLowerCase();
-        const lines = text.split('\n');
-        const matches: string[] = [];
-        let score = changedFileBoost(tokens, relPath, changedFiles);
-
-        for (const token of tokens) {
-          if (lowerPath.includes(token)) {
-            score += 3;
+      const scored = (
+        await parallelMapLimit(files, 12, async (filePath) => {
+          const relPath = normalizePath(relative(rootPath, filePath));
+          const text = await readTextFile(filePath);
+          if (!text) {
+            return null;
           }
-        }
-
-        for (let index = 0; index < lines.length; index += 1) {
-          const lowerLine = lines[index].toLowerCase();
-          let lineScore = 0;
+          const lowerPath = relPath.toLowerCase();
+          const lines = text.split('\n');
+          const matches: string[] = [];
+          let score = changedFileBoost(tokens, relPath, changedFiles);
           for (const token of tokens) {
-            if (lowerLine.includes(token)) {
-              lineScore += 1;
+            if (lowerPath.includes(token)) {
+              score += 3;
             }
           }
-
-          if (lineScore > 0) {
-            score += lineScore;
-            if (matches.length < 4) {
-              matches.push(`${relPath}:${index + 1}: ${lines[index].trim()}`);
+          for (let index = 0; index < lines.length; index += 1) {
+            const lowerLine = lines[index].toLowerCase();
+            let lineScore = 0;
+            for (const token of tokens) {
+              if (lowerLine.includes(token)) {
+                lineScore += 1;
+              }
+            }
+            if (lineScore > 0) {
+              score += lineScore;
+              if (matches.length < 4) {
+                matches.push(`${relPath}:${index + 1}: ${lines[index].trim()}`);
+              }
             }
           }
-        }
-
-        if (score > 0) {
-          scored.push({ path: relPath, score, lines: matches });
-        }
-      }
+          return score > 0 ? { path: relPath, score, lines: matches } : null;
+        })
+      ).filter((entry): entry is { path: string; score: number; lines: string[] } => Boolean(entry));
 
       scored.sort((a, b) => b.score - a.score || a.path.localeCompare(b.path));
       const top = scored.slice(0, maxResults);
       const output = top
         .map((entry) => {
           const changed = changedFiles.has(entry.path) ? ' · changed' : '';
-          return [
-            `# ${entry.path} (score ${entry.score}${changed})`,
-            ...entry.lines,
-          ].join('\n');
+          return [`# ${entry.path} (score ${entry.score}${changed})`, ...entry.lines].join('\n');
         })
         .join('\n\n');
 
-      return {
+      const result = {
         output,
         metadata: {
           root: rootPath,
@@ -1142,6 +1107,8 @@ export const codebaseSearchTool: Tool = {
           changedFiles: Array.from(changedFiles.values()),
         },
       };
+      setCachedQueryResult(cacheKey, result.output, result.metadata);
+      return result;
     } catch (error: unknown) {
       return {
         output: error instanceof Error ? error.message : String(error),
@@ -1161,7 +1128,10 @@ export const fileImportanceTool: Tool = {
     parameters: {
       query: { type: 'string', description: 'Natural-language request or keyword set.', required: true },
       path: { type: 'string', description: 'Base path for ranking.' },
-      purpose: { type: 'string', description: 'Optional request purpose such as execution, review, planning, design, or research.' },
+      purpose: {
+        type: 'string',
+        description: 'Optional request purpose such as execution, review, planning, design, or research.',
+      },
       max_results: { type: 'number', description: 'Maximum files to return.' },
     },
   },
@@ -1171,10 +1141,9 @@ export const fileImportanceTool: Tool = {
     }
 
     const rootPath =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
-    const purpose = typeof args.purpose === 'string' && args.purpose.trim().length > 0 ? args.purpose.trim() : undefined;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
+    const purpose =
+      typeof args.purpose === 'string' && args.purpose.trim().length > 0 ? args.purpose.trim() : undefined;
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
@@ -1186,7 +1155,7 @@ export const fileImportanceTool: Tool = {
     }
 
     try {
-      const files = await walkFiles(rootPath, DEFAULT_EXCLUDES);
+      const files = await walkFilesCached(rootPath, DEFAULT_EXCLUDES);
       const changedFiles = new Set(await getChangedFiles(rootPath));
       const scores = new Map<string, { score: number; reasons: Set<string>; lines: string[] }>();
       const addSignal = (filePath: string, score: number, reason: string, line?: string): void => {
@@ -1203,7 +1172,7 @@ export const fileImportanceTool: Tool = {
       };
 
       const significantTokens = tokens.filter((token) => token.length >= 3).slice(0, 4);
-      for (const filePath of files) {
+      await parallelMapLimit(files, 12, async (filePath) => {
         const relPath = normalizePath(relative(rootPath, filePath));
         const lowerPath = relPath.toLowerCase();
         const pathTokens = tokens.filter((token) => lowerPath.includes(token));
@@ -1220,7 +1189,7 @@ export const fileImportanceTool: Tool = {
 
         const text = await readTextFile(filePath);
         if (!text) {
-          continue;
+          return;
         }
         const lines = text.split('\n');
         for (let index = 0; index < lines.length; index += 1) {
@@ -1237,20 +1206,30 @@ export const fileImportanceTool: Tool = {
           if (lineScore <= 0) {
             continue;
           }
-          addSignal(relPath, lineScore, matchedToken ? `line:${matchedToken}` : 'line', `${relPath}:${index + 1}: ${rawLine.trim()}`);
+          addSignal(
+            relPath,
+            lineScore,
+            matchedToken ? `line:${matchedToken}` : 'line',
+            `${relPath}:${index + 1}: ${rawLine.trim()}`,
+          );
         }
-      }
+      });
 
       const lspTokens = significantTokens.filter((token) => !CHANGE_PATTERNS.includes(token)).slice(0, 3);
-      for (const token of lspTokens) {
-        const definitionResult = await tryLspDefinitionSearch(token, rootPath, Math.max(maxResults, 6), ctx);
-        if (definitionResult) {
-          applyRankedOutputScores(scores, definitionResult.output, 3, `definition:${token}`);
+      const lspSignals = await parallelMapLimit(lspTokens, 3, async (token) => {
+        const [definitionResult, referenceMatches] = await Promise.all([
+          tryLspDefinitionSearch(token, rootPath, Math.max(maxResults, 6), ctx),
+          tryLspReferenceSearch(token, rootPath, Math.max(maxResults, 6), ctx),
+        ]);
+        return { token, definitionResult, referenceMatches };
+      });
+      for (const signal of lspSignals) {
+        if (signal.definitionResult) {
+          applyRankedOutputScores(scores, signal.definitionResult.output, 3, `definition:${signal.token}`);
         }
-        const referenceMatches = await tryLspReferenceSearch(token, rootPath, Math.max(maxResults, 6), ctx);
-        if (referenceMatches && referenceMatches.length > 0) {
-          for (const match of referenceMatches) {
-            addSignal(match.path, match.score * 2, `references:${token}`, match.line);
+        if (signal.referenceMatches && signal.referenceMatches.length > 0) {
+          for (const match of signal.referenceMatches) {
+            addSignal(match.path, match.score * 2, `references:${signal.token}`, match.line);
           }
         }
       }

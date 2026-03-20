@@ -1,24 +1,23 @@
-import { access, readFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import { access, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 import { parseYaml } from '../utils/yaml.js';
-
-import {
-  type ChecksConfig,
-  type CostBudgetConfig,
-  type ContextBudgetConfig,
-  type DduduConfig,
-  type DduduConfigOverride,
-  type MemoryConfig,
-  type McpConfig,
-  type ModelConfig,
-  type OracleConfig,
-  type ProviderConfig,
-  type SkillsConfig,
-  type ToolsConfig,
-} from './types.js';
 import { getDduduPaths } from './dirs.js';
+import type {
+  ChecksConfig,
+  ContextBudgetConfig,
+  CostBudgetConfig,
+  DduduConfig,
+  DduduConfigOverride,
+  McpConfig,
+  MemoryConfig,
+  ModelConfig,
+  OracleConfig,
+  ProviderConfig,
+  SkillsConfig,
+  ToolsConfig,
+} from './types.js';
 
 const DDUDU_PATHS = getDduduPaths();
 
@@ -73,6 +72,12 @@ const DEFAULT_CONFIG: DduduConfig = {
     default_model: 'claude-sonnet-4-6',
     max_turns: 50,
     timeout_minutes: 30,
+    fallbacks: {
+      jennie: ['openai:gpt-5.4', 'gemini:gemini-2.5-pro'],
+      lisa: ['anthropic:claude-sonnet-4-6', 'gemini:gemini-2.5-pro'],
+      rosé: ['openai:gpt-5.4', 'gemini:gemini-2.5-pro'],
+      jisoo: ['anthropic:claude-sonnet-4-6', 'openai:gpt-5.4'],
+    },
     provider_budgets: {
       anthropic: 4,
       openai: 4,
@@ -155,9 +160,14 @@ const DEFAULT_CONFIG: DduduConfig = {
   } as ToolsConfig,
   mcp: {
     servers: {},
+    lazy_connect: true,
+    defer_connect_until_ready: true,
   } as McpConfig,
   skills: {
     dirs: [],
+    gating: true,
+    lazy_load: true,
+    preload_metadata_only: true,
   } as SkillsConfig,
   oracle: {
     model: 'claude-opus-4-5',
@@ -268,10 +278,7 @@ const normalizeProviders = (config: DduduConfig): DduduConfig => {
   };
 };
 
-export const loadConfigForCwd = async (
-  cwd: string,
-  cliOverrides: DduduConfigOverride = {},
-): Promise<DduduConfig> => {
+export const loadConfigForCwd = async (cwd: string, cliOverrides: DduduConfigOverride = {}): Promise<DduduConfig> => {
   const userConfigPath = resolve(homedir(), '.ddudu/config.yaml');
   const localConfigPath = resolve(cwd, '.ddudu/config.yaml');
 
@@ -280,24 +287,16 @@ export const loadConfigForCwd = async (
     loadYamlIfExists(localConfigPath),
   ]);
 
-  const merged = deepMerge(
-    deepMerge(deepMerge(DEFAULT_CONFIG, userConfig), localConfig),
-    interpolateEnv(cliOverrides)
-  );
+  const merged = deepMerge(deepMerge(deepMerge(DEFAULT_CONFIG, userConfig), localConfig), interpolateEnv(cliOverrides));
 
   return normalizeProviders(merged);
 };
 
-export const loadConfig = async (
-  cliOverrides: DduduConfigOverride = {},
-): Promise<DduduConfig> => {
+export const loadConfig = async (cliOverrides: DduduConfigOverride = {}): Promise<DduduConfig> => {
   return loadConfigForCwd(process.cwd(), cliOverrides);
 };
 
-export const resolvePreset = async (
-  name: string,
-  baseConfig?: DduduConfig
-): Promise<DduduConfig> => {
+export const resolvePreset = async (name: string, baseConfig?: DduduConfig): Promise<DduduConfig> => {
   const config = baseConfig ?? (await loadConfig());
   const preset = config.presets?.[name];
 

@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-import { DEFAULT_ORCHESTRATOR_PROMPT, DEFAULT_SYSTEM_PROMPT } from './default-prompts.js';
+import { DEFAULT_ORCHESTRATOR_PROMPT, getDefaultSystemPrompt } from './default-prompts.js';
 import { getDduduPaths } from './dirs.js';
 
 export interface PromptContext {
@@ -136,7 +136,7 @@ export const loadSystemPrompt = async (context: PromptContext): Promise<string> 
     loadInstructionText(context),
   ]);
 
-  const prompt = mergeSections([DEFAULT_SYSTEM_PROMPT, globalPrompt, projectPrompt]);
+  const prompt = mergeSections([getDefaultSystemPrompt(context.provider), globalPrompt, projectPrompt]);
   return interpolatePrompt(prompt, buildVariables(context, instructionText));
 };
 

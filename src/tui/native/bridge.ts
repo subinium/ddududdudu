@@ -51,6 +51,14 @@ const parseCommand = (line: string): NativeBridgeCommand | null => {
   switch (parsed.type) {
     case 'submit':
       return typeof parsed.content === 'string' ? { type: 'submit', content: parsed.content } : null;
+    case 'steer':
+      return typeof parsed.content === 'string'
+        ? {
+            type: 'steer',
+            content: parsed.content,
+            role: parsed.role === 'system' ? 'system' : 'user',
+          }
+        : null;
     case 'prefetch_context':
       return typeof parsed.content === 'string' ? { type: 'prefetch_context', content: parsed.content } : null;
     case 'abort':
@@ -111,6 +119,9 @@ export const runNativeBridge = async (): Promise<void> => {
     switch (command.type) {
       case 'submit':
         void controller.submit(command.content);
+        break;
+      case 'steer':
+        controller.steer(command.content, command.role ?? 'user');
         break;
       case 'prefetch_context':
         controller.prefetchContext(command.content);

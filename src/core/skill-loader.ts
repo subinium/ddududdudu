@@ -1,6 +1,7 @@
-import { readdir, readFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { access, readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, resolve } from 'node:path';
+import { delimiter, dirname, resolve } from 'node:path';
 import { parseYaml } from '../utils/yaml.js';
 
 import { getDduduPaths } from './dirs.js';
@@ -10,11 +11,25 @@ export interface SkillMetadata {
   description: string;
   globs?: string[];
   path: string;
+  requires?: SkillRequirements;
+  availability: SkillAvailability;
 }
 
 export interface LoadedSkill extends SkillMetadata {
   content: string;
   mcpConfig?: Record<string, unknown>;
+}
+
+export interface SkillRequirements {
+  bins?: string[];
+  env?: string[];
+  config?: string[];
+  os?: string[];
+}
+
+export interface SkillAvailability {
+  enabled: boolean;
+  reasons: string[];
 }
 
 interface ParsedMarkdown {
@@ -38,6 +53,40 @@ const toStringArray = (value: unknown): string[] | undefined => {
   });
 
   return output.length > 0 ? output : undefined;
+};
+
+const toRequirements = (value: unknown): SkillRequirements | undefined => {
+  if (!isObject(value)) {
+    return undefined;
+  }
+
+  const requirements: SkillRequirements = {
+    bins: toStringArray(value.bins),
+    env: toStringArray(value.env),
+    config: toStringArray(value.config),
+    os: toStringArray(value.os),
+  };
+
+  return requirements.bins || requirements.env || requirements.config || requirements.os ? requirements : undefined;
+};
+
+const resolveConfigPath = (cwd: string, configPath: string): string => {
+  if (configPath.startsWith('~/')) {
+    return resolve(homedir(), configPath.slice(2));
+  }
+  return resolve(cwd, configPath);
+};
+
+const hasBin = async (binName: string): Promise<boolean> => {
+  const pathValue = process.env.PATH ?? '';
+  const candidates = pathValue.split(delimiter).filter((entry) => entry.length > 0);
+  for (const directory of candidates) {
+    try {
+      await access(resolve(directory, binName), constants.X_OK);
+      return true;
+    } catch {}
+  }
+  return false;
 };
 
 const parseMarkdownFrontmatter = (content: string): ParsedMarkdown => {
@@ -169,6 +218,10 @@ export class SkillLoader {
     return Array.from(this.skills.values());
   }
 
+  public listEnabled(): SkillMetadata[] {
+    return this.list().filter((skill) => skill.availability.enabled);
+  }
+
   public get(name: string): SkillMetadata | undefined {
     return this.skills.get(name);
   }
@@ -181,6 +234,9 @@ export class SkillLoader {
 
     const metadata = this.skills.get(name);
     if (!metadata) {
+      return null;
+    }
+    if (!metadata.availability.enabled) {
       return null;
     }
 
@@ -233,9 +289,7 @@ export class SkillLoader {
   private async readSkillDirs(skillsDir: string): Promise<string[]> {
     try {
       const entries = await readdir(skillsDir, { withFileTypes: true });
-      return entries
-        .filter((entry) => entry.isDirectory())
-        .map((entry) => entry.name);
+      return entries.filter((entry) => entry.isDirectory()).map((entry) => entry.name);
     } catch {
       return [];
     }
@@ -254,17 +308,71 @@ export class SkillLoader {
     const descriptionValue = parsed.frontmatter.description;
     const globsValue = parsed.frontmatter.globs;
 
-    const name = typeof nameValue === 'string' && nameValue.trim().length > 0
-      ? nameValue.trim()
-      : fallbackName;
+    const name = typeof nameValue === 'string' && nameValue.trim().length > 0 ? nameValue.trim() : fallbackName;
 
     const description = typeof descriptionValue === 'string' ? descriptionValue.trim() : '';
+    const requires = toRequirements(parsed.frontmatter.requires);
+    const availability = await this.evaluateAvailability(requires);
 
     return {
       name,
       description,
       globs: toStringArray(globsValue),
       path: skillFilePath,
+      requires,
+      availability,
+    };
+  }
+
+  private async evaluateAvailability(requires?: SkillRequirements): Promise<SkillAvailability> {
+    if (!requires) {
+      return { enabled: true, reasons: [] };
+    }
+
+    const reasons: string[] = [];
+
+    if (requires.os && requires.os.length > 0 && !requires.os.includes(process.platform)) {
+      reasons.push(`requires os: ${requires.os.join(', ')}`);
+    }
+
+    if (requires.env) {
+      for (const envName of requires.env) {
+        if (!process.env[envName]) {
+          reasons.push(`missing env: ${envName}`);
+        }
+      }
+    }
+
+    if (requires.bins) {
+      const checks = await Promise.all(requires.bins.map(async (bin) => ({ bin, ok: await hasBin(bin) })));
+      for (const check of checks) {
+        if (!check.ok) {
+          reasons.push(`missing bin: ${check.bin}`);
+        }
+      }
+    }
+
+    if (requires.config) {
+      const checks = await Promise.all(
+        requires.config.map(async (configPath) => {
+          try {
+            await access(resolveConfigPath(this.cwd, configPath), constants.R_OK);
+            return null;
+          } catch {
+            return `missing config: ${configPath}`;
+          }
+        }),
+      );
+      for (const reason of checks) {
+        if (reason) {
+          reasons.push(reason);
+        }
+      }
+    }
+
+    return {
+      enabled: reasons.length === 0,
+      reasons,
     };
   }
 

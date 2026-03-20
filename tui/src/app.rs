@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use slt::{ScrollState, SpinnerState, TextInputState, ToastState};
+use slt::{ScrollState, SpinnerState, StreamingMarkdownState, TextInputState, ToastState};
 
 use crate::hangul::HangulComposer;
 use crate::protocol::*;
@@ -24,6 +24,7 @@ pub(crate) struct App {
     pub(crate) spinner: SpinnerState,
     pub(crate) fatal_error: Option<String>,
     pub(crate) streaming_message_id: Option<String>,
+    pub(crate) streaming_markdown: HashMap<String, StreamingMarkdownState>,
     pub(crate) prompt_history: Vec<String>,
     pub(crate) history_index: Option<usize>,
     pub(crate) history_stash: Option<String>,
@@ -51,6 +52,7 @@ impl App {
             spinner: SpinnerState::dots(),
             fatal_error: None,
             streaming_message_id: None,
+            streaming_markdown: HashMap::new(),
             prompt_history: Vec::new(),
             history_index: None,
             history_stash: None,
@@ -87,6 +89,14 @@ impl App {
                     msg.content.push_str(&delta);
                     msg.is_streaming = true;
                 }
+                let markdown = self
+                    .streaming_markdown
+                    .entry(id.clone())
+                    .or_insert_with(StreamingMarkdownState::new);
+                if markdown.content.is_empty() {
+                    markdown.start();
+                }
+                markdown.push(&delta);
                 self.streaming_message_id = Some(id);
                 if self.auto_scroll {
                     self.transcript_scroll.offset = usize::MAX;
@@ -110,6 +120,9 @@ impl App {
                 if let Some(msg) = self.state.messages.iter_mut().find(|m| m.id == id) {
                     msg.is_streaming = false;
                     msg.is_thinking = Some(false);
+                }
+                if let Some(markdown) = self.streaming_markdown.get_mut(&id) {
+                    markdown.finish();
                 }
                 self.streaming_message_id = None;
             }
@@ -169,6 +182,26 @@ impl App {
         let had_ask_user = self.state.ask_user.is_some();
         let has_ask_user = next_state.ask_user.is_some();
         self.state = next_state;
+
+        let active_streaming_ids = self
+            .state
+            .messages
+            .iter()
+            .filter(|msg| msg.is_streaming)
+            .map(|msg| msg.id.clone())
+            .collect::<Vec<_>>();
+        for msg in self.state.messages.iter().filter(|msg| msg.is_streaming) {
+            self.streaming_markdown
+                .entry(msg.id.clone())
+                .or_insert_with(|| {
+                    let mut markdown = StreamingMarkdownState::new();
+                    markdown.start();
+                    markdown.push(&msg.content);
+                    markdown
+                });
+        }
+        self.streaming_markdown
+            .retain(|id, _| active_streaming_ids.iter().any(|active| active == id));
 
         if !had_ask_user && has_ask_user {
             self.ask_user_input = TextInputState::with_placeholder(

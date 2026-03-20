@@ -1,20 +1,13 @@
-import { readdir, readFile } from 'node:fs/promises';
-import { resolve, relative } from 'node:path';
+import { execFile } from 'node:child_process';
+import { relative, resolve } from 'node:path';
+import { promisify } from 'node:util';
 
 import type { Tool } from './index.js';
+import { parallelMapLimit, readTextFileCached, walkFilesCached } from './search-cache.js';
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_EXCLUDES = new Set(['.git', 'node_modules']);
-
-const isTextFile = (buffer: Buffer): boolean => {
-  const length = Math.min(512, buffer.length);
-  for (let index = 0; index < length; index += 1) {
-    if (buffer[index] === 0) {
-      return false;
-    }
-  }
-
-  return true;
-};
 
 const normalizePath = (input: string): string => {
   return input.replace(/\\/g, '/');
@@ -64,39 +57,6 @@ const globToRegExp = (pattern: string): RegExp => {
   return new RegExp(output);
 };
 
-const walkFiles = async (
-  rootPath: string,
-  excludes: Set<string>,
-): Promise<string[]> => {
-  const files: string[] = [];
-
-  const walk = async (dirPath: string): Promise<void> => {
-    const entries = await readdir(dirPath, { withFileTypes: true });
-
-    await Promise.all(
-      entries.map(async (entry) => {
-        if (excludes.has(entry.name)) {
-          return;
-        }
-
-        const fullPath = resolve(dirPath, entry.name);
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-          return;
-        }
-
-        if (entry.isFile()) {
-          files.push(fullPath);
-        }
-      }),
-    );
-  };
-
-  await walk(rootPath);
-  files.sort((a, b) => a.localeCompare(b));
-  return files;
-};
-
 export const globTool: Tool = {
   definition: {
     name: 'glob',
@@ -117,9 +77,7 @@ export const globTool: Tool = {
     }
 
     const searchRoot =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
     const excludes = new Set(DEFAULT_EXCLUDES);
 
     if (Array.isArray(args.exclude)) {
@@ -131,7 +89,7 @@ export const globTool: Tool = {
     }
 
     try {
-      const allFiles = await walkFiles(searchRoot, excludes);
+      const allFiles = await walkFilesCached(searchRoot, excludes);
       const matcher = globToRegExp(normalizePath(args.pattern));
       const matches = allFiles
         .map((fullPath) => normalizePath(relative(searchRoot, fullPath)))
@@ -173,11 +131,8 @@ export const grepTool: Tool = {
     }
 
     const searchRoot =
-      typeof args.path === 'string' && args.path.trim().length > 0
-        ? resolve(ctx.cwd, args.path)
-        : ctx.cwd;
-    const includePattern =
-      typeof args.include === 'string' && args.include.trim().length > 0 ? args.include : '**/*';
+      typeof args.path === 'string' && args.path.trim().length > 0 ? resolve(ctx.cwd, args.path) : ctx.cwd;
+    const includePattern = typeof args.include === 'string' && args.include.trim().length > 0 ? args.include : '**/*';
     const maxResults =
       typeof args.max_results === 'number' && Number.isFinite(args.max_results)
         ? Math.max(1, Math.floor(args.max_results))
@@ -205,37 +160,62 @@ export const grepTool: Tool = {
     }
 
     try {
-      const files = await walkFiles(searchRoot, DEFAULT_EXCLUDES);
-      const results: string[] = [];
-
-      for (const filePath of files) {
-        if (results.length >= maxResults) {
-          break;
+      try {
+        const argsList = ['--line-number', '--no-heading', '--color=never', '--max-count', String(maxResults)];
+        if (includePattern && includePattern !== '**/*') {
+          argsList.push('--glob', includePattern);
         }
+        argsList.push(args.pattern, searchRoot);
+        const rg = await execFileAsync('rg', argsList, {
+          cwd: searchRoot,
+          encoding: 'utf8',
+          maxBuffer: 8 * 1024 * 1024,
+        });
+        const rgLines = rg.stdout
+          .split('\n')
+          .map((line) => line.trimEnd())
+          .filter((line) => line.length > 0)
+          .slice(0, maxResults);
+        return {
+          output: rgLines.join('\n'),
+          metadata: {
+            root: searchRoot,
+            count: rgLines.length,
+            maxResults,
+            engine: 'rg',
+          },
+        };
+      } catch {
+        // Fall back to in-process search when ripgrep is unavailable or errors.
+      }
 
+      const files = await walkFilesCached(searchRoot, DEFAULT_EXCLUDES);
+      const matchedByFile = await parallelMapLimit(files, 12, async (filePath) => {
         const relPath = normalizePath(relative(searchRoot, filePath));
         if (!includeRegex.test(relPath)) {
-          continue;
+          return [] as string[];
         }
 
-        const buffer = await readFile(filePath);
-        if (!isTextFile(buffer)) {
-          continue;
+        const text = await readTextFileCached(filePath);
+        if (!text) {
+          return [] as string[];
         }
 
-        const lines = buffer.toString('utf8').split('\n');
+        const lines = text.split('\n');
+        const localResults: string[] = [];
         for (let lineNumber = 0; lineNumber < lines.length; lineNumber += 1) {
-          if (results.length >= maxResults) {
+          if (localResults.length >= maxResults) {
             break;
           }
-
           const line = lines[lineNumber];
           regex.lastIndex = 0;
           if (regex.test(line)) {
-            results.push(`${relPath}:${lineNumber + 1}: ${line}`);
+            localResults.push(`${relPath}:${lineNumber + 1}: ${line}`);
           }
         }
-      }
+        return localResults;
+      });
+      const results = matchedByFile.flat().slice(0, maxResults);
 
       return {
         output: results.join('\n'),
@@ -243,6 +223,7 @@ export const grepTool: Tool = {
           root: searchRoot,
           count: results.length,
           maxResults,
+          engine: 'internal',
         },
       };
     } catch (err: unknown) {

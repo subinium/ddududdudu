@@ -1,6 +1,8 @@
 # Build output
 dist/
 dist */
+.dist-build-*
+.dist-prev-*
 tui/target/
 tsconfig.tsbuildinfo
 
@@ -17,6 +19,7 @@ node_modules/
 SPEC.md
 PLAN.md
 SESSION-CONTEXT.md
+CLAUDE.md
 
 # OS files
 .DS_Store

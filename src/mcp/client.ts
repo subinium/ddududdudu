@@ -260,7 +260,7 @@ export class StdioMcpClient implements McpClient {
         capabilities: {},
         clientInfo: {
           name: 'ddudu',
-          version: '0.6.4',
+          version: '0.6.5',
         },
       });
 

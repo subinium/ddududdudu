@@ -36,6 +36,7 @@ export interface RequestEngineInput {
 }
 
 export interface RequestEngineCallbacks {
+  drainSteeringMessages?: () => ApiMessage[];
   beforeApiCall?: (input: {
     provider: string;
     model: string;
@@ -92,10 +93,7 @@ export interface RequestEngineResult {
 }
 
 export class RequestEngine {
-  public async run(
-    input: RequestEngineInput,
-    callbacks: RequestEngineCallbacks,
-  ): Promise<RequestEngineResult> {
+  public async run(input: RequestEngineInput, callbacks: RequestEngineCallbacks): Promise<RequestEngineResult> {
     let currentPlan = input.plan;
     let activeRemoteSessionId = currentPlan.remoteSessionId;
     let fullText = '';
@@ -108,7 +106,6 @@ export class RequestEngine {
     let attempt = 0;
 
     while (!input.signal.aborted) {
-      const apiMessages = [...currentPlan.apiMessages];
       done = false;
       let toolTurns = 0;
 
@@ -121,6 +118,16 @@ export class RequestEngine {
             break;
           }
 
+          const steeringMessages = callbacks.drainSteeringMessages?.() ?? [];
+          if (steeringMessages.length > 0) {
+            currentPlan = {
+              ...currentPlan,
+              apiMessages: [...currentPlan.apiMessages, ...steeringMessages],
+            };
+            callbacks.onPlanUpdated?.(currentPlan);
+          }
+
+          const apiMessages = [...currentPlan.apiMessages];
           const apiCallStartedAt = Date.now();
           await callbacks.beforeApiCall?.({
             provider: input.provider,

@@ -1,10 +1,10 @@
-import { getDduduPaths } from '../../../core/dirs.js';
-import { deleteDduduConfigValue, setDduduConfigValue } from '../../../core/config-editor.js';
-import { loadConfig } from '../../../core/config.js';
-import { initializeProject } from '../../../core/project-init.js';
-import { SkillLoader, type LoadedSkill } from '../../../core/skill-loader.js';
-import { loadHookFiles } from '../../../core/hook-loader.js';
 import { formatArtifactContextLine } from '../../../core/artifacts.js';
+import { loadConfig } from '../../../core/config.js';
+import { deleteDduduConfigValue, setDduduConfigValue } from '../../../core/config-editor.js';
+import { getDduduPaths } from '../../../core/dirs.js';
+import { loadHookFiles } from '../../../core/hook-loader.js';
+import { initializeProject } from '../../../core/project-init.js';
+import { type LoadedSkill, SkillLoader } from '../../../core/skill-loader.js';
 import { HARNESS_MODES } from '../../shared/theme.js';
 
 const previewText = (value: string, maxLength: number = 96): string => {
@@ -167,7 +167,9 @@ export const formatContextSummary = async (deps: SystemCommandDeps): Promise<str
     `Changed files: ${changedFiles.length > 0 ? changedFiles.join(', ') : 'none'}`,
     `Briefing: ${briefingSummary}`,
     ...(briefingSteps.length > 0 ? ['Next steps:', ...briefingSteps.map((step) => `- ${step}`)] : ['Next steps: none']),
-    ...(activeAgents.length > 0 ? ['Recent agents:', ...activeAgents.map((entry) => `- ${entry}`)] : ['Recent agents: none']),
+    ...(activeAgents.length > 0
+      ? ['Recent agents:', ...activeAgents.map((entry) => `- ${entry}`)]
+      : ['Recent agents: none']),
     ...(backgroundJobs.length > 0
       ? ['Background jobs:', ...backgroundJobs.map((entry) => `- ${entry}`)]
       : ['Background jobs: none']),
@@ -181,15 +183,20 @@ export const formatSkillSummary = async (deps: SystemCommandDeps): Promise<strin
     const loader = new SkillLoader(process.cwd());
     await loader.scan();
     const skills = loader.list();
+    const enabledSkills = loader.listEnabled();
     if (skills.length === 0) {
       return 'No skills discovered.';
     }
 
     return [
       'Skills',
+      `enabled: ${enabledSkills.length}/${skills.length}`,
       ...skills.slice(0, 12).map((skill) => {
         const loaded = deps.loadedSkills.has(skill.name) ? 'loaded' : 'available';
-        return `${skill.name} · ${loaded} · ${skill.description}`;
+        const availability = skill.availability.enabled
+          ? loaded
+          : `disabled (${skill.availability.reasons.join(', ')})`;
+        return `${skill.name} · ${availability} · ${skill.description}`;
       }),
     ].join('\n');
   } catch (error: unknown) {
@@ -203,6 +210,10 @@ export const loadSkillSummary = async (name: string, deps: SystemCommandDeps): P
     await loader.scan();
     const skill = await loader.load(name);
     if (!skill) {
+      const unavailable = loader.get(name);
+      if (unavailable && !unavailable.availability.enabled) {
+        return `Skill unavailable: ${name} · ${unavailable.availability.reasons.join(', ')}`;
+      }
       return `Skill not found: ${name}`;
     }
 
@@ -269,7 +280,10 @@ export const runMcpCommand = async (args: string[], deps: SystemCommandDeps): Pr
   if (command === 'add') {
     const name = args[1]?.trim();
     const executable = args[2]?.trim();
-    const commandArgs = args.slice(3).map((value) => value.trim()).filter(Boolean);
+    const commandArgs = args
+      .slice(3)
+      .map((value) => value.trim())
+      .filter(Boolean);
     if (!name || !executable) {
       return 'Usage: /mcp add <name> <command> [args...]';
     }

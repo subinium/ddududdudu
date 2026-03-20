@@ -23,8 +23,8 @@ pub(crate) fn render_transcript(ui: &mut slt::Context, app: &mut App) {
     }
 
     let tick = ui.tick();
-    let messages = &app.state.messages;
-    let streaming = app.streaming_message_id.as_deref();
+    let messages = app.state.messages.clone();
+    let streaming = app.streaming_message_id.clone();
     let scroll = &mut app.transcript_scroll;
     let msg_count = messages.len();
     let md_threshold = msg_count.saturating_sub(6);
@@ -36,15 +36,17 @@ pub(crate) fn render_transcript(ui: &mut slt::Context, app: &mut App) {
         }
 
         for (i, msg) in messages.iter().enumerate() {
-            let is_streaming_msg = msg.is_streaming || streaming == Some(msg.id.as_str());
+            let is_streaming_msg =
+                msg.is_streaming || streaming.as_deref() == Some(msg.id.as_str());
             let use_markdown = i >= md_threshold && !is_streaming_msg;
-            render_message(ui, msg, tick, streaming, use_markdown);
+            render_message(ui, app, msg, tick, streaming.as_deref(), use_markdown);
         }
     });
 }
 
 pub(crate) fn render_message(
     ui: &mut slt::Context,
+    app: &mut App,
     msg: &NativeMessageState,
     tick: u64,
     streaming_id: Option<&str>,
@@ -61,7 +63,14 @@ pub(crate) fn render_message(
         "assistant" => {
             let _ = ui.container().pb(1).col(|ui| {
                 ui.styled("▌ assistant", Style::new().fg(ACCENT).bold());
-                if use_markdown {
+                let is_streaming_msg = msg.is_streaming || streaming_id == Some(msg.id.as_str());
+                if is_streaming_msg {
+                    if let Some(markdown) = app.streaming_markdown.get_mut(&msg.id) {
+                        let _ = ui.streaming_markdown(markdown);
+                    } else {
+                        render_content_plain(ui, &msg.content);
+                    }
+                } else if use_markdown {
                     render_content(ui, &msg.content);
                 } else {
                     render_content_plain(ui, &msg.content);

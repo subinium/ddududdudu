@@ -32,6 +32,7 @@ export interface SlashCommandDeps {
   runHookCommand: (args: string[]) => Promise<string>;
   runTeamCommand: (args: string[]) => Promise<string>;
   runInitSummary: () => Promise<string>;
+  steer: (content: string, role?: 'user' | 'system') => void;
   models: string[];
 }
 
@@ -73,7 +74,7 @@ export const runSlashDispatch = async (command: string, deps: SlashCommandDeps):
       return;
     case '/help':
       deps.appendSystemMessage(
-        'Available commands: /clear, /compact, /mode, /model, /plan, /todo, /permissions, /memory, /session, /resume, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
+        'Available commands: /clear, /compact, /mode, /model, /steer, /plan, /todo, /permissions, /memory, /session, /resume, /config, /help, /doctor, /context, /review, /queue, /jobs, /artifacts, /checkpoint, /undo, /handoff, /fork, /briefing, /drift, /quit, /exit, /fire, /init, /skill, /hook, /mcp, /team (/jobs inspect|logs|result|retry|promote|cancel)',
       );
       return;
     case '/plan':
@@ -152,6 +153,15 @@ export const runSlashDispatch = async (command: string, deps: SlashCommandDeps):
     case '/init':
       deps.appendSystemMessage(await deps.runInitSummary());
       return;
+    case '/steer': {
+      const payload = rest.join(' ').trim();
+      if (!payload) {
+        deps.appendSystemMessage('Use /steer <guidance>. The message will be injected before the next request turn.');
+      } else {
+        deps.steer(payload, 'user');
+      }
+      return;
+    }
     case '/quit':
     case '/exit':
       deps.appendSystemMessage('Use /quit from the native TUI directly to exit.');

@@ -2,12 +2,7 @@ export type ProviderTier = 'cheap' | 'medium' | 'expensive';
 export type TabLayout = 'single' | 'vertical' | 'horizontal' | 'grid';
 export type CompactionStrategy = 'hierarchical' | 'rolling' | 'full';
 export type SessionFormat = 'jsonl';
-export type SessionRecordType =
-  | 'header'
-  | 'message'
-  | 'tool_call'
-  | 'tool_result'
-  | 'compaction';
+export type SessionRecordType = 'header' | 'message' | 'tool_call' | 'tool_result' | 'compaction';
 export type RoutingPriority = 'cheap' | 'balanced' | 'quality';
 export type ToolPolicy = 'inherit' | 'allow' | 'ask' | 'deny';
 export type TrustTier = 'trusted' | 'ask' | 'deny';
@@ -46,6 +41,7 @@ export interface AgentConfig {
   default_model: string;
   max_turns: number;
   timeout_minutes: number;
+  fallbacks?: Partial<Record<NamedMode, string[]>>;
   provider_budgets?: Record<string, number>;
   resource_budgets?: Record<string, number>;
   max_parallel_writes?: number;
@@ -131,6 +127,7 @@ export interface AgentConfigOverride {
   default_model?: string;
   max_turns?: number;
   timeout_minutes?: number;
+  fallbacks?: Partial<Record<NamedMode, string[]>>;
   provider_budgets?: Record<string, number>;
   resource_budgets?: Record<string, number>;
   max_parallel_writes?: number;
@@ -273,17 +270,25 @@ export interface ToolsConfig {
 }
 
 export interface McpConfig {
-  servers: Record<string, {
-    command: string;
-    args?: string[];
-    env?: Record<string, string>;
-    enabled?: boolean;
-    trust?: TrustTier;
-  }>;
+  servers: Record<
+    string,
+    {
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      enabled?: boolean;
+      trust?: TrustTier;
+    }
+  >;
+  lazy_connect?: boolean;
+  defer_connect_until_ready?: boolean;
 }
 
 export interface SkillsConfig {
   dirs: string[];
+  gating?: boolean;
+  lazy_load?: boolean;
+  preload_metadata_only?: boolean;
 }
 
 export interface OracleConfig {
@@ -314,17 +319,25 @@ export interface ToolsConfigOverride {
 }
 
 export interface McpConfigOverride {
-  servers?: Record<string, {
-    command: string;
-    args?: string[];
-    env?: Record<string, string>;
-    enabled?: boolean;
-    trust?: TrustTier;
-  }>;
+  servers?: Record<
+    string,
+    {
+      command: string;
+      args?: string[];
+      env?: Record<string, string>;
+      enabled?: boolean;
+      trust?: TrustTier;
+    }
+  >;
+  lazy_connect?: boolean;
+  defer_connect_until_ready?: boolean;
 }
 
 export interface SkillsConfigOverride {
   dirs?: string[];
+  gating?: boolean;
+  lazy_load?: boolean;
+  preload_metadata_only?: boolean;
 }
 
 export interface OracleConfigOverride {

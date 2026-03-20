@@ -236,6 +236,7 @@ export type NativeBridgeEvent =
 
 export type NativeBridgeCommand =
   | { type: 'submit'; content: string }
+  | { type: 'steer'; content: string; role?: 'user' | 'system' }
   | { type: 'prefetch_context'; content: string }
   | { type: 'abort' }
   | { type: 'clear_messages' }
