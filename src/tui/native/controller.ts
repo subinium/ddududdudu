@@ -215,7 +215,7 @@ const MAX_TOOL_TURNS_FALLBACK = 25;
 const SYSTEM_PROMPT_CACHE_TTL_MS = 30_000;
 const MEMORY_SCOPES: MemoryScope[] = ['global', 'project', 'working', 'episodic', 'semantic', 'procedural'];
 const PROVIDER_NAMES = ['anthropic', 'openai', 'gemini'] as const;
-const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.3';
+const PROMPT_VERSION = process.env.DDUDU_VERSION ?? '0.6.4';
 const DEFAULT_PERMISSION_PROFILE: PermissionProfile = 'workspace-write';
 const MAX_BACKGROUND_JOBS = 4;
 const STATUS_FILE_PATTERN = /^[ MADRCU?!]{1,2}\s+(.+)$/;
@@ -1591,25 +1591,36 @@ export class NativeBridgeController {
     this.resetEphemeralAgentActivities();
     this.scheduleIdleWarmup(trimmedContent);
 
+    this.state.loading = true;
+    this.state.loadingLabel = 'preparing context…';
+    this.state.loadingSince = Date.now();
+    this.scheduleStatePush();
+
     const mode = this.currentMode;
     const model = this.getCurrentModel();
-    await this.refreshSystemPrompt();
+    const directPurpose = this.inferPromptPurpose(trimmedContent);
+
+    const [, requestContextSnapshot] = await Promise.all([
+      this.refreshSystemPrompt(),
+      this.buildPromptContextSnapshot(
+        trimmedContent,
+        directPurpose,
+        this.getPromptContextSnapshotOptions(trimmedContent, directPurpose, 'request'),
+      ),
+    ]);
 
     if (await this.maybeHandleJennieAutoRoute(trimmedContent)) {
       return;
     }
 
-    const directPurpose = this.inferPromptPurpose(trimmedContent);
-    const requestContextSnapshot = await this.buildPromptContextSnapshot(
-      trimmedContent,
-      directPurpose,
-      this.getPromptContextSnapshotOptions(trimmedContent, directPurpose, 'request'),
-    );
     const requestSystemPrompt = requestContextSnapshot
       ? `${this.systemPrompt}\n\n${requestContextSnapshot}`
       : this.systemPrompt;
     this.state.contextPreview = requestContextSnapshot || this.state.contextPreview;
     this.tokenCounter.setModel(model);
+
+    this.state.loadingLabel = 'compacting…';
+    this.scheduleStatePush();
     await this.maybeAutoCompact(trimmedContent);
 
     const userMessage: NativeMessageState = {
@@ -1626,15 +1637,26 @@ export class NativeBridgeController {
       isStreaming: true,
     };
 
-    const requestPlan = await this.prepareRequestPlan(userMessage);
+    this.state.loadingLabel = `sending to ${model}…`;
+    this.scheduleStatePush();
+
+    const [requestPlan] = await Promise.all([
+      this.prepareRequestPlan(userMessage),
+      this.hookRegistry.emit('beforeSend', {
+        provider: this.getCurrentProvider(),
+        model,
+        sessionId: this.state.sessionId,
+        remoteSessionId: null,
+        requestMode: 'full',
+        prompt: trimmedContent,
+      }),
+    ]);
 
     this.state.messages.push(userMessage);
     this.state.messages.push(assistantMessage);
-    this.state.loading = true;
-    this.state.loadingLabel = getRandomLyric();
-    this.state.loadingSince = Date.now();
     this.state.requestEstimate = this.estimateRequestForPlan(requestPlan);
     this.activeAssistantMessageId = assistantMessage.id;
+    this.state.loadingLabel = `waiting for ${model}…`;
     this.scheduleStatePush();
 
     if (!this.activeClient) {
@@ -1667,15 +1689,6 @@ export class NativeBridgeController {
     let activeRemoteSessionId = requestPlan.remoteSessionId;
 
     try {
-      await this.hookRegistry.emit('beforeSend', {
-        provider: this.getCurrentProvider(),
-        model,
-        sessionId: this.state.sessionId,
-        remoteSessionId: currentPlan.remoteSessionId,
-        requestMode: currentPlan.mode,
-        prompt: trimmedContent,
-      });
-
       const maxToolTurns = this.config?.agent.max_turns ?? MAX_TOOL_TURNS_FALLBACK;
       if (this.tokenCounter.isOverBudget()) {
         this.appendSystemMessage(
@@ -1706,6 +1719,9 @@ export class NativeBridgeController {
         },
         {
           beforeApiCall: async (input) => {
+            this.state.loadingLabel =
+              input.toolTurn > 0 ? `tool round ${input.toolTurn} · ${model}` : `streaming · ${model}`;
+            this.scheduleStatePush();
             await this.hookRegistry.emit('beforeApiCall', input);
           },
           afterApiCall: async (input) => {
@@ -3126,6 +3142,11 @@ export class NativeBridgeController {
         }));
 
         this.updateMessage(context.assistantMessageId, fullText, toolCalls);
+
+        const toolNames = toolUseBlocks.map((b) => (b as ToolUseBlock).name);
+        this.state.loadingLabel =
+          toolNames.length === 1 ? `executing ${toolNames[0]}` : `executing ${toolNames.length} tools`;
+        this.scheduleStatePush();
 
         const results = await this.executeToolCalls(toolUseBlocks as ToolUseBlock[], {
           assistantMessageId: context.assistantMessageId,
@@ -5960,6 +5981,7 @@ export class NativeBridgeController {
     } catch (err: unknown) {
       const label = err instanceof Error ? err.message : String(err);
       this.appendSystemMessage(`[verify] background verification failed: ${label}`);
+      this.setVerificationState(null);
     }
   }
 
@@ -5967,16 +5989,24 @@ export class NativeBridgeController {
     cwd: string,
     mode: Exclude<VerificationMode, 'none'> = 'full',
   ): Promise<VerificationSummary> {
+    this.state.loadingLabel = mode === 'full' ? 'verifying · review + scripts' : 'verifying · review checks';
     this.setVerificationState({
       status: 'running',
       summary: mode === 'full' ? 'running review + scripts' : 'running review checks',
       cwd,
     });
+    this.scheduleStatePush();
 
-    const summary = await this.runWithExecutionLease({
-      resource: 'verification',
-      operation: () => new VerificationRunner(cwd).run(mode),
-    });
+    let summary: VerificationSummary;
+    try {
+      summary = await this.runWithExecutionLease({
+        resource: 'verification',
+        operation: () => new VerificationRunner(cwd).run(mode),
+      });
+    } catch (err: unknown) {
+      this.setVerificationState(null);
+      throw err;
+    }
     this.setVerificationState({
       status: summary.status,
       summary: summary.summary,

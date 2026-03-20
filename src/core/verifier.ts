@@ -138,26 +138,18 @@ export class VerificationRunner {
     if (mode === 'full') {
       const scripts = await readPackageScripts(this.cwd);
       const selected = COMMAND_PRIORITIES.filter((name) => typeof scripts[name] === 'string').slice(0, 3);
-      for (const script of selected) {
-        const kind = script === 'test' ? 'test' : script === 'build' ? 'build' : 'lint';
-        commands.push(
-          toVerificationCommandResult(
-            kind,
-            await runStructuredVerifierCommand(this.cwd, {
-              kind,
-              script,
-            }),
-          ),
-        );
-      }
+      const results = await Promise.all(
+        selected.map(async (script) => {
+          const kind = script === 'test' ? 'test' : script === 'build' ? 'build' : 'lint';
+          return toVerificationCommandResult(kind, await runStructuredVerifierCommand(this.cwd, { kind, script }));
+        }),
+      );
+      commands.push(...results);
     }
 
     const failedChecks = countFailedChecks(report);
     const failedCommands = commands.filter((command) => !command.ok);
-    const status: VerificationStatus =
-      failedChecks === 0 && failedCommands.length === 0
-        ? 'passed'
-        : 'failed';
+    const status: VerificationStatus = failedChecks === 0 && failedCommands.length === 0 ? 'passed' : 'failed';
 
     const summary = [
       status,
